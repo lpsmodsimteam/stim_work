@@ -593,7 +593,9 @@ class BBCodeSimulator:
         logical_errors = np.any(predictions != observable_flips, axis=1)
         n_err = int(np.sum(logical_errors))
         ler   = n_err / shots
-        ler_se = float(np.sqrt(ler * (1.0 - ler) / shots))
+        from scipy.stats import beta as _beta
+        lo, hi = _beta.interval(0.95, n_err + 0.5, shots - n_err + 0.5)
+        ler_se = float((hi - lo) / 2)
 
         return SimulationResult(
             distance=self.params.distance,
@@ -630,9 +632,10 @@ class BBCodeSimulator:
         decoder: Optional[Decoder] = None,
         seed: Optional[int] = None,
     ) -> List[SimulationResult]:
+        from tqdm import tqdm
         return [
             self.run(error_model, rounds=r, shots=shots, decoder=decoder, seed=seed)
-            for r in round_values
+            for r in tqdm(round_values, desc="sweep_rounds", unit="round")
         ]
 
 

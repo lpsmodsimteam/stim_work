@@ -36,22 +36,31 @@ class CodeType(str, Enum):
 @dataclass
 class ErrorModel:
     """
-    Isotropic Pauli noise + measurement noise.
+    Isotropic Pauli noise + independent measurement and reset noise.
 
     p_phys : Depolarizing rate applied after every Clifford gate.
              Single-qubit gates get 1Q depolarizing; 2-qubit gates get 2Q
              depolarizing — both controlled by this single parameter
              (the "isotropic" / symmetric-Pauli assumption).
-    p_meas : Bit-flip probability applied before every measurement and
-             after every reset (measurement noise).
+    p_meas : Bit-flip probability applied before every measurement.
+    p_reset: Bit-flip probability applied after every reset (state-prep noise).
+             Defaults to None, which means "use the same value as p_meas".
     """
     p_phys: float
     p_meas: float
+    p_reset: Optional[float] = None
 
     def __post_init__(self) -> None:
         for name, val in [("p_phys", self.p_phys), ("p_meas", self.p_meas)]:
             if not (0.0 <= val <= 1.0):
                 raise ValueError(f"{name} must be in [0, 1], got {val}")
+        if self.p_reset is not None and not (0.0 <= self.p_reset <= 1.0):
+            raise ValueError(f"p_reset must be in [0, 1], got {self.p_reset}")
+
+    @property
+    def _p_reset(self) -> float:
+        """Resolved reset error rate (falls back to p_meas if not set)."""
+        return self.p_meas if self.p_reset is None else self.p_reset
 
     # ------------------------------------------------------------------
     # Convenience constructors
@@ -73,7 +82,10 @@ class ErrorModel:
         return cls(p_phys=p_meas * gate_ratio, p_meas=p_meas)
 
     def __repr__(self) -> str:
-        return f"ErrorModel(p_phys={self.p_phys:.3g}, p_meas={self.p_meas:.3g})"
+        base = f"ErrorModel(p_phys={self.p_phys:.3g}, p_meas={self.p_meas:.3g}"
+        if self.p_reset is not None:
+            base += f", p_reset={self.p_reset:.3g}"
+        return base + ")"
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +209,7 @@ class SurfaceCodeSimulator:
             rounds=rounds,
             after_clifford_depolarization=error_model.p_phys,
             before_measure_flip_probability=error_model.p_meas,
-            after_reset_flip_probability=error_model.p_meas,
+            after_reset_flip_probability=error_model._p_reset,
         )
 
     # ------------------------------------------------------------------
@@ -244,7 +256,9 @@ class SurfaceCodeSimulator:
         logical_errors_per_shot = np.any(predictions != observable_flips, axis=1)
         n_err = int(np.sum(logical_errors_per_shot))
         ler   = n_err / shots
-        ler_se = float(np.sqrt(ler * (1.0 - ler) / shots))
+        from scipy.stats import beta as _beta
+        lo, hi = _beta.interval(0.95, n_err + 0.5, shots - n_err + 0.5)
+        ler_se = float((hi - lo) / 2)
 
         return SimulationResult(
             distance=self.distance,
