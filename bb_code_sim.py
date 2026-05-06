@@ -99,13 +99,16 @@ class RelayBPDecoder(Decoder):
     def __init__(
         self,
         gamma0: float = 0.1,
-        pre_iter: int = 80,
-        num_sets: int = 100,
-        set_max_iter: int = 60,
+        pre_iter: int = 20,
+        num_sets: int = 20,
+        set_max_iter: int = 20,
         gamma_dist_interval: tuple = (-0.24, 0.66),
         stop_nconv: int = 5,
         parallel: bool = True,
     ) -> None:
+        # Default params are tuned for speed (420 iterations/shot).
+        # For accuracy use pre_iter=80, num_sets=100, set_max_iter=60
+        # (6080 iterations/shot — ~14x slower but better LER near threshold).
         self._gamma0 = gamma0
         self._pre_iter = pre_iter
         self._num_sets = num_sets
