@@ -85,14 +85,20 @@ def _parse_dem(circuit: stim.Circuit):
     return np.array(probs), np.array(det_rows, dtype=bool), np.array(obs_rows, dtype=bool)
 
 
-def _expand(probs: np.ndarray, det_mat: np.ndarray, obs_mat: np.ndarray, q_base: Optional[float]):
-    """Replicate columns so all expanded columns share a common base rate q_base."""
+def _expand(probs: np.ndarray, q_base: Optional[float]):
+    """Map expanded columns to source mechanisms so all share a common base rate q_base.
+
+    Rather than materializing a dense (N_expanded x num_detectors) matrix, we only
+    build an index array `col_to_mech` of length N_expanded that maps each expanded
+    column back to its source mechanism. Sampling then indexes the original (small)
+    mechanism matrices — identical results, but memory is O(N_expanded) ints instead
+    of O(N_expanded * num_detectors) bools.
+    """
     if q_base is None:
         q_base = float(probs.min())
     multipliers = np.maximum(np.round(probs / q_base).astype(int), 1)
-    expanded_det = np.repeat(det_mat, multipliers, axis=0)
-    expanded_obs = np.repeat(obs_mat, multipliers, axis=0)
-    return expanded_det, expanded_obs, q_base, multipliers
+    col_to_mech = np.repeat(np.arange(probs.shape[0], dtype=np.int32), multipliers)
+    return col_to_mech, q_base, multipliers
 
 
 # ---------------------------------------------------------------------------
@@ -100,16 +106,18 @@ def _expand(probs: np.ndarray, det_mat: np.ndarray, obs_mat: np.ndarray, q_base:
 # ---------------------------------------------------------------------------
 
 def _sample_failures_at_weight(
-    expanded_det: np.ndarray,
-    expanded_obs: np.ndarray,
+    det_mat: np.ndarray,
+    obs_mat: np.ndarray,
+    col_to_mech: np.ndarray,
     w: int,
     T: int,
     decoder,
     rng: np.random.Generator,
 ) -> int:
     """Sample T weight-w fault configurations, decode, return number of decoding failures."""
-    N_exp, M = expanded_det.shape
-    K = expanded_obs.shape[1]
+    N_exp = col_to_mech.shape[0]
+    M = det_mat.shape[1]
+    K = obs_mat.shape[1]
 
     if w == 0:
         # zero faults → trivially correct (decoder predicts no flip from all-zero syndrome)
@@ -118,9 +126,11 @@ def _sample_failures_at_weight(
     syndromes = np.zeros((T, M), dtype=bool)
     truths = np.zeros((T, K), dtype=bool)
     for t in range(T):
-        idxs = rng.choice(N_exp, size=w, replace=False)
-        syndromes[t] = np.bitwise_xor.reduce(expanded_det[idxs], axis=0)
-        truths[t] = np.bitwise_xor.reduce(expanded_obs[idxs], axis=0)
+        # Sample expanded columns, then map back to source mechanisms. Two expanded
+        # columns sharing a mechanism XOR to zero — identical to the dense expansion.
+        mech_idxs = col_to_mech[rng.choice(N_exp, size=w, replace=False)]
+        syndromes[t] = np.bitwise_xor.reduce(det_mat[mech_idxs], axis=0)
+        truths[t] = np.bitwise_xor.reduce(obs_mat[mech_idxs], axis=0)
 
     predictions = decoder.decode_batch(syndromes)
     failures = np.any(predictions != truths, axis=1)
@@ -165,8 +175,8 @@ def importance_sample(
     rng = np.random.default_rng(seed)
 
     probs, det_mat, obs_mat = _parse_dem(circuit)
-    expanded_det, expanded_obs, q_base, _ = _expand(probs, det_mat, obs_mat, q_base)
-    N_exp = expanded_det.shape[0]
+    col_to_mech, q_base, _ = _expand(probs, q_base)
+    N_exp = col_to_mech.shape[0]
 
     decoder.setup(circuit)
 
@@ -175,7 +185,7 @@ def importance_sample(
     weights = list(weights)
 
     failures = [
-        _sample_failures_at_weight(expanded_det, expanded_obs, w, shots_per_weight, decoder, rng)
+        _sample_failures_at_weight(det_mat, obs_mat, col_to_mech, w, shots_per_weight, decoder, rng)
         for w in weights
     ]
 
