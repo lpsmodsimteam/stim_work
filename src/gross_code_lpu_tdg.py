@@ -35,6 +35,8 @@ import stim
 
 from bb_code_sim import (
     ErrorModel,
+    RelayBPDecoder,
+    SimulationResult,
     _poly_matrix,
     _gf2_nullspace,
     _gf2_rref,
@@ -1477,7 +1479,75 @@ def build_logical_z1_circuit(
 
 
 # ---------------------------------------------------------------------------
-# Layer 9 — Demo / smoke test
+# Layer 9 — Simulation sweep API
+# ---------------------------------------------------------------------------
+
+def run_lpu(
+    error_model: ErrorModel,
+    operator: str = 'X1',
+    C: int = 10,
+    d_init: int = 12,
+    shots: int = 200,
+    decoder=None,
+    seed: Optional[int] = None,
+) -> SimulationResult:
+    """Run one LPU logical-operator measurement experiment and return the LER.
+
+    operator : 'X1' (measures X̄₁) or 'Z1' (measures Z̄₁)
+    C        : number of LPU rounds
+    d_init   : bare memory rounds before and after the LPU block
+    """
+    if operator == 'X1':
+        circuit = build_logical_x1_circuit(error_model, C=C, d_init=d_init)
+    elif operator == 'Z1':
+        circuit = build_logical_z1_circuit(error_model, C=C, d_init=d_init)
+    else:
+        raise ValueError(f"operator must be 'X1' or 'Z1', got {operator!r}")
+
+    if decoder is None:
+        decoder = RelayBPDecoder()
+    decoder.setup(circuit)
+
+    sampler = circuit.compile_detector_sampler(seed=seed)
+    detection_events, observable_flips = sampler.sample(shots, separate_observables=True)
+    predictions = decoder.decode_batch(detection_events)
+
+    logical_errors = np.any(predictions != observable_flips, axis=1)
+    n_err = int(np.sum(logical_errors))
+    ler = n_err / shots
+    from scipy.stats import beta as _beta
+    lo, hi = _beta.interval(0.95, n_err + 0.5, shots - n_err + 0.5)
+    ler_se = float((hi - lo) / 2)
+
+    return SimulationResult(
+        distance=12,
+        rounds=C,
+        error_model=error_model,
+        shots=shots,
+        num_logical_errors=n_err,
+        logical_error_rate=ler,
+        logical_error_rate_se=ler_se,
+    )
+
+
+def sweep_lpu_p(
+    p_values,
+    operator: str = 'X1',
+    C: int = 10,
+    d_init: int = 12,
+    shots: int = 200,
+    seed: Optional[int] = None,
+) -> List[SimulationResult]:
+    """Sweep physical error rate for one LPU operator measurement circuit."""
+    return [
+        run_lpu(ErrorModel.symmetric(p), operator=operator, C=C, d_init=d_init,
+                shots=shots, seed=seed)
+        for p in p_values
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Layer 10 — Demo / smoke test
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
