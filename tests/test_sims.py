@@ -9,6 +9,7 @@ from bb_code_sim import (
     build_bb_circuit, BBCodeSimulator, BPOSDDecoder
 )
 import gross_code_lpu_tdg as tdg
+from importance_sampling import importance_sample, ImportanceSamplingResult
 
 
 # --- Surface code ---
@@ -122,5 +123,59 @@ def test_tdg_z1_circuit_zero_noise():
     dets, obs = sampler.sample(50, separate_observables=True)
     assert int(dets.sum()) == 0
     assert int(obs.sum()) == 0
+
+
+# --- Importance sampling ---
+
+def test_is_returns_correct_shapes():
+    sim = SurfaceCodeSimulator(distance=3)
+    circuit = sim.build_circuit(ErrorModel.symmetric(0.01), rounds=3)
+    result = importance_sample(
+        circuit, PyMatchingDecoder(),
+        p_ref=0.01,
+        p_values=[0.001, 0.005, 0.01],
+        weights=[1, 2, 3],
+        shots_per_weight=50,
+        seed=0,
+    )
+    assert isinstance(result, ImportanceSamplingResult)
+    assert result.P_logical.shape == (3,)
+    assert result.P_logical_se.shape == (3,)
+    assert result.spectrum.weights == [1, 2, 3]
+
+
+def test_is_decreasing_with_p():
+    # Lower p should give lower P_logical
+    sim = SurfaceCodeSimulator(distance=3)
+    circuit = sim.build_circuit(ErrorModel.symmetric(0.01), rounds=3)
+    result = importance_sample(
+        circuit, PyMatchingDecoder(),
+        p_ref=0.01,
+        p_values=[0.001, 0.005, 0.01],
+        weights=list(range(1, 8)),
+        shots_per_weight=200,
+        seed=0,
+    )
+    assert result.P_logical[0] < result.P_logical[1] < result.P_logical[2]
+
+
+def test_is_matches_direct_mc():
+    # IS estimate at p_built should agree with direct MC within ~3σ
+    sim = SurfaceCodeSimulator(distance=3)
+    em = ErrorModel.symmetric(0.01)
+    direct = sim.run(em, rounds=3, shots=5000, seed=0)
+
+    circuit = sim.build_circuit(em, rounds=3)
+    result = importance_sample(
+        circuit, PyMatchingDecoder(),
+        p_ref=0.01,
+        p_values=[0.01],
+        weights=list(range(1, 10)),
+        shots_per_weight=300,
+        seed=0,
+    )
+    diff = abs(result.P_logical[0] - direct.logical_error_rate)
+    se = np.hypot(result.P_logical_se[0], direct.logical_error_rate_se)
+    assert diff < 4 * se, f"IS={result.P_logical[0]:.4f}, MC={direct.logical_error_rate:.4f}, diff/SE={diff/se:.1f}"
 
 
