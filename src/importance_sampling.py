@@ -19,11 +19,12 @@ Reweighting formula (Eq. 3 of the paper):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import stim
+from scipy.optimize import least_squares
 from scipy.special import gammaln
 
 
@@ -222,4 +223,277 @@ def importance_sample(
         P_logical=P_logical,
         P_logical_se=np.sqrt(var),
         spectrum=spectrum,
+    )
+
+
+# ===========================================================================
+# Technique I — failure-spectrum ansatz and extrapolation
+#
+# arXiv:2511.15177 Section 3. Rather than reweighting the raw sampled f(w)
+# (which needs a contiguous WEIGHTS block bracketing the dominant binomial
+# mass), we fit a smooth low-parameter ansatz to the sampled spectrum and
+# reweight the *fitted* f(w) over all weights 0..N. This removes the
+# truncation requirement and lets us extrapolate to very low p.
+# ===========================================================================
+
+# Models and their free parameters beyond the always-present (w0, f0).
+_ANSATZ_EXTRA: Dict[str, List[str]] = {
+    "f2": [],
+    "f3": ["gamma"],
+    "f5": ["gamma1", "gamma2", "wc"],
+}
+
+
+def failure_spectrum_ansatz(
+    w,
+    w0: float,
+    f0: float,
+    a: float,
+    *,
+    model: str = "f3",
+    gamma: Optional[float] = None,
+    gamma1: Optional[float] = None,
+    gamma2: Optional[float] = None,
+    wc: Optional[float] = None,
+    c: float = 2.0,
+):
+    """Failure-spectrum ansatz f(w) from Eq. (10) of arXiv:2511.15177.
+
+    All three forms share the envelope ``a * (1 - exp(-(f0/a) * power))`` and are
+    zero for ``w < w0``. ``a = 1 - 2^-K`` is the large-w saturation value (random
+    bitstrings fail with probability 1 - 2^-K). At ``w = w0`` every form gives
+    ``power = 1`` so ``f(w0) = a(1 - exp(-f0/a)) ≈ f0`` for small f0.
+
+    model:
+      "f2": power = (w/w0)**w0                              (params: w0, f0)
+      "f3": power = (w/w0)**gamma                           (+ gamma)
+      "f5": power = (w/w0)**gamma1 * S**((gamma2-gamma1)/c), (+ gamma1, gamma2, wc)
+             S = (1 + (w/wc)**c) / (1 + (w0/wc)**c)         crossover, c fixed (=2)
+    """
+    w = np.asarray(w, dtype=float)
+    ratio = np.where(w > 0, w / w0, 0.0)
+
+    if model == "f2":
+        power = ratio ** w0
+    elif model == "f3":
+        if gamma is None:
+            raise ValueError("model 'f3' requires gamma")
+        power = ratio ** gamma
+    elif model == "f5":
+        if gamma1 is None or gamma2 is None or wc is None:
+            raise ValueError("model 'f5' requires gamma1, gamma2, wc")
+        crossover = (1.0 + (w / wc) ** c) / (1.0 + (w0 / wc) ** c)
+        power = ratio ** gamma1 * crossover ** ((gamma2 - gamma1) / c)
+    else:
+        raise ValueError(f"unknown ansatz model {model!r} (use f2/f3/f5)")
+
+    val = a * (1.0 - np.exp(-(f0 / a) * power))
+    return np.where(w < w0, 0.0, val)
+
+
+@dataclass
+class AnsatzFit:
+    """A fitted failure-spectrum ansatz plus the metadata needed to reweight it."""
+    model: str
+    params: Dict[str, float]          # full param set incl. fixed w0/f0
+    free_names: List[str]
+    a: float                          # saturation 1 - 2^-K
+    param_cov: Optional[np.ndarray]   # covariance over free_names (or None)
+    n_expanded: int
+    q_base: float
+    p_ref: float
+    n_points: int                     # number of (w, f) points used in the fit
+    cost: float                       # final least-squares cost (0.5*||resid||^2)
+
+    def f(self, w):
+        return failure_spectrum_ansatz(w, a=self.a, model=self.model, **self.params)
+
+
+def fit_failure_spectrum(
+    spectrum: FailureSpectrum,
+    K: int,
+    *,
+    model: str = "f3",
+    w0: Optional[float] = None,
+    f0: Optional[float] = None,
+) -> AnsatzFit:
+    """Fit an ansatz (f2/f3/f5) to a sampled failure spectrum.
+
+    The fit is done on log f(w) (delta-method weights sigma_log = se/f) over the
+    weights with at least one observed failure, per the paper's guidance to keep
+    the wide dynamic range well conditioned. ``a = 1 - 2^-K`` with K the number of
+    logical observables. ``w0`` and/or ``f0`` may be pinned (e.g. from Technique II,
+    the min-weight analysis); otherwise they are fit.
+    """
+    if model not in _ANSATZ_EXTRA:
+        raise ValueError(f"unknown ansatz model {model!r} (use f2/f3/f5)")
+
+    a = 1.0 - 2.0 ** (-K)
+    w = np.asarray(spectrum.weights, dtype=float)
+    T = np.asarray(spectrum.trials, dtype=float)
+    F = np.asarray(spectrum.failures, dtype=float)
+
+    mask = (F > 0) & (T > 0)
+    if not mask.any():
+        raise ValueError(
+            "no sampled weight had any observed failures, so the spectrum is "
+            "all-zero and the ansatz cannot be fit. Sample more shots per weight "
+            "or include higher weights (closer to the dominant mass μ=N·q)."
+        )
+    wn, Fn, Tn = w[mask], F[mask], T[mask]
+    fhat = Fn / Tn
+    # Binomial SE, floored so saturated points (fhat≈1) keep finite weight.
+    se = np.sqrt(np.maximum(fhat * (1.0 - fhat), 1.0 / Tn) / Tn)
+    logy = np.log(fhat)
+    sigma_log = se / fhat  # Var(log f) ≈ Var(f)/f^2
+
+    # Assemble fixed vs free parameters.
+    fixed: Dict[str, float] = {}
+    if w0 is not None:
+        fixed["w0"] = float(w0)
+    if f0 is not None:
+        fixed["f0"] = float(f0)
+    free_names = [p for p in (["w0", "f0"] + _ANSATZ_EXTRA[model]) if p not in fixed]
+
+    # Initial guesses / bounds.
+    w0_init = fixed.get("w0", float(wn.min()))
+    f0_init = fixed.get("f0", float(np.clip(fhat[np.argmin(wn)], 1e-12, 0.9 * a)))
+    init = {
+        "w0": w0_init,
+        "f0": f0_init,
+        "gamma": max(w0_init, 1.0),
+        "gamma1": max(w0_init, 1.0),
+        "gamma2": 1.0,
+        "wc": max(2.0 * w0_init, float(np.median(wn))),
+    }
+    lo = {"w0": 1e-3, "f0": 1e-15, "gamma": 1e-3, "gamma1": 1e-3, "gamma2": 1e-3, "wc": 1e-3}
+    hi = {"w0": float(w.max()) + 1, "f0": a, "gamma": 1e3, "gamma1": 1e3, "gamma2": 1e3, "wc": 1e6}
+
+    if len(wn) < len(free_names) + 1:
+        raise ValueError(
+            f"too few non-zero failure points ({len(wn)}) to fit {len(free_names)} "
+            f"parameters for model {model!r}; sample more weights or pin w0/f0"
+        )
+
+    def kwargs_from(theta) -> Dict[str, float]:
+        kw = dict(fixed)
+        for name, val in zip(free_names, theta):
+            kw[name] = val
+        return kw
+
+    def residual(theta):
+        kw = kwargs_from(theta)
+        model_f = failure_spectrum_ansatz(wn, a=a, model=model, **kw)
+        model_f = np.clip(model_f, 1e-300, None)
+        return (np.log(model_f) - logy) / sigma_log
+
+    param_cov: Optional[np.ndarray] = None
+    if free_names:
+        x0 = np.array([init[n] for n in free_names], dtype=float)
+        bounds = (
+            np.array([lo[n] for n in free_names]),
+            np.array([hi[n] for n in free_names]),
+        )
+        x0 = np.clip(x0, bounds[0] + 1e-9, bounds[1] - 1e-9)
+        sol = least_squares(residual, x0, bounds=bounds, method="trf")
+        params = kwargs_from(sol.x)
+        cost = float(sol.cost)
+        # Covariance ≈ (JᵀJ)⁻¹ scaled by residual variance (Gauss-Newton approx).
+        dof = max(len(wn) - len(free_names), 1)
+        s_sq = 2.0 * sol.cost / dof
+        try:
+            param_cov = np.linalg.inv(sol.jac.T @ sol.jac) * s_sq
+        except np.linalg.LinAlgError:
+            param_cov = None
+    else:
+        params = dict(fixed)
+        cost = float(0.5 * np.sum(residual(np.array([])) ** 2))
+
+    return AnsatzFit(
+        model=model,
+        params=params,
+        free_names=free_names,
+        a=a,
+        param_cov=param_cov,
+        n_expanded=spectrum.n_expanded,
+        q_base=spectrum.q_base,
+        p_ref=spectrum.p_ref,
+        n_points=len(wn),
+        cost=cost,
+    )
+
+
+def logical_error_rate_from_ansatz(
+    fit: AnsatzFit,
+    p_values: Sequence[float],
+    b: Optional[float] = None,
+) -> np.ndarray:
+    """Extrapolated LER P(p) = T{f_ansatz}(p) summed over all weights w0..N.
+
+    Eq. (2)/(10) of arXiv:2511.15177. ``b`` is the noise scaling so q = p/b; it
+    defaults to p_ref/q_base (i.e. q(p_ref) = q_base), which equals 15 for circuit
+    noise and 1 for bit-flip noise in the expanded representation.
+    """
+    N = fit.n_expanded
+    if b is None:
+        b = fit.p_ref / fit.q_base
+
+    p_arr = np.asarray(p_values, dtype=float)
+    q = np.clip(p_arr / b, 1e-300, 1.0 - 1e-15)
+    log_q = np.log(q)
+    log_1mq = np.log(1.0 - q)
+
+    w0 = fit.params["w0"]
+    w = np.arange(int(np.ceil(w0)), N + 1, dtype=float)
+    fw = failure_spectrum_ansatz(w, a=fit.a, model=fit.model, **fit.params)
+
+    log_binom = gammaln(N + 1) - gammaln(w + 1) - gammaln(N - w + 1)
+    # term[w, p] = C(N,w) q^w (1-q)^(N-w); sum_w f(w)*term over the weight axis.
+    log_term = log_binom[:, None] + w[:, None] * log_q[None, :] + (N - w)[:, None] * log_1mq[None, :]
+    P = (fw[:, None] * np.exp(log_term)).sum(axis=0)
+    return P
+
+
+@dataclass
+class AnsatzSweepResult:
+    """Combines the raw IS estimate with the ansatz-extrapolated LER curve."""
+    p_values: np.ndarray
+    P_logical_ansatz: np.ndarray
+    fit: AnsatzFit
+    raw: ImportanceSamplingResult
+
+
+def importance_sample_with_ansatz(
+    circuit: stim.Circuit,
+    decoder,
+    p_ref: float,
+    p_values: Sequence[float],
+    *,
+    model: str = "f3",
+    w0: Optional[float] = None,
+    f0: Optional[float] = None,
+    weights: Optional[Sequence[int]] = None,
+    shots_per_weight: int = 1000,
+    q_base: Optional[float] = None,
+    seed: Optional[int] = None,
+) -> AnsatzSweepResult:
+    """Sample the failure spectrum, fit an ansatz, and return the extrapolated LER.
+
+    Unlike :func:`importance_sample`, the sampled ``weights`` need not form a
+    contiguous block up to the dominant binomial mass — they only need to
+    constrain the ansatz fit. K (for the saturation value a = 1 - 2^-K) is read
+    from the circuit's number of logical observables.
+    """
+    raw = importance_sample(
+        circuit, decoder, p_ref=p_ref, p_values=p_values,
+        weights=weights, shots_per_weight=shots_per_weight, q_base=q_base, seed=seed,
+    )
+    K = circuit.detector_error_model(decompose_errors=False).num_observables
+    fit = fit_failure_spectrum(raw.spectrum, K, model=model, w0=w0, f0=f0)
+    P = logical_error_rate_from_ansatz(fit, p_values)
+    return AnsatzSweepResult(
+        p_values=np.asarray(p_values, dtype=float),
+        P_logical_ansatz=P,
+        fit=fit,
+        raw=raw,
     )
