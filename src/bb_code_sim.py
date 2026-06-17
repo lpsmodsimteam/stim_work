@@ -365,9 +365,16 @@ def build_bb_circuit(
     params: BBCodeParams,
     error_model: ErrorModel,
     rounds: int,
+    idle_noise: bool = True,
 ) -> stim.Circuit:
     """
     Build a noisy Stim circuit for a BB code Z-memory experiment.
+
+    idle_noise: if True (default), apply DEPOLARIZE1(p) to every qubit left idle during
+        each CNOT sub-layer — the "standard circuit noise model" (idle X/Y/Z each p/3,
+        cf. arXiv:2511.15177). If False, only active gates are noisy (the older, lighter
+        model). Note: enabling idle noise changes the DEM (more fault mechanisms) and hence
+        all sampled results, including for the gross [[144,12,12]] code.
 
     Qubit layout:
       [0,       n)         — data qubits  (n = 2*l*m)
@@ -453,125 +460,127 @@ def build_bb_circuit(
     k = len(log_Z)
 
     # -----------------------------------------------------------------------
-    # Build circuit
+    # Build circuit — Bravyi et al. depth-7 syndrome schedule (arXiv:2308.07915,
+    # github.com/sbravyi/BivariateBicycleCodes). Each syndrome cycle is 8 rounds; in
+    # rounds 1-5 every qubit is busy (X-checks act on one data half, Z-checks the other),
+    # idle qubits (rounds 0/6/7) pick up DEPOLARIZE1(p) — the standard circuit noise model.
+    # x_layers[j]/z_layers[j] are already indexed by Bravyi "direction" j (0-5):
+    #   X: 0,1,2 -> data-left via A1,A2,A3;  3,4,5 -> data-right via B1,B2,B3
+    #   Z: 0,1,2 -> data-left via B1^T,..;   3,4,5 -> data-right via A1^T,..
     # -----------------------------------------------------------------------
     circuit = stim.Circuit()
+    data_all = list(range(n))
+    all_q = list(range(n + 2 * n_c))
 
-    def add_reset_data():
-        circuit.append("R", list(range(n)))
-        if pm > 0:
-            circuit.append("X_ERROR", list(range(n)), pm)
+    # Steering vectors: round -> monomial direction (0-5) or 'idle'.
+    sX = ["idle", 1, 4, 3, 5, 0, 2]
+    sZ = [3, 5, 0, 1, 2, 4, "idle"]
 
-    def add_init_ancilla():
+    # Measurement bookkeeping: absolute index of every measurement appended so far.
+    meas_count = 0
+    z_meas: List[Dict[int, int]] = []   # z_meas[c][s] = abs index of z_anc[s] in cycle c
+    x_meas: List[Dict[int, int]] = []   # x_meas[c][s] = abs index of x_anc[s] in cycle c
+    data_meas: Dict[int, int] = {}      # data_meas[q] = abs index of final data measurement
+
+    def rec(abs_idx: int):
+        return stim.target_rec(abs_idx - meas_count)
+
+    def add_idle(active: set) -> None:
+        if idle_noise and p > 0:
+            idle = [q for q in all_q if q not in active]
+            if idle:
+                circuit.append("DEPOLARIZE1", idle, p)
+
+    def add_cnots(pairs) -> set:
+        flat = [q for pair in pairs for q in pair]
+        if flat:
+            circuit.append("CX", flat)
+            if p > 0:
+                circuit.append("DEPOLARIZE2", flat, p)
+        return set(flat)
+
+    # Initial state prep: data in |0>, Z-ancillas reset (X-ancillas are prepped each round 0).
+    circuit.append("R", data_all + z_anc)
+    if pm > 0:
+        circuit.append("X_ERROR", data_all + z_anc, pm)
+    circuit.append("TICK")
+
+    for c in range(rounds):
+        zc: Dict[int, int] = {}
+        xc: Dict[int, int] = {}
+
+        # round 0 — PrepX (reset + H the X-ancillas); Z-CNOT direction sZ[0]
         circuit.append("R", x_anc)
         if pm > 0:
             circuit.append("X_ERROR", x_anc, pm)
         circuit.append("H", x_anc)
         if p > 0:
             circuit.append("DEPOLARIZE1", x_anc, p)
-        circuit.append("R", z_anc)
-        if pm > 0:
-            circuit.append("X_ERROR", z_anc, pm)
+        active = set(x_anc) | add_cnots(z_layers[sZ[0]])
+        add_idle(active)
+        circuit.append("TICK")
 
-    def add_cnot_layers():
-        for layer in x_layers:
-            targets = [q for pair in layer for q in pair]
-            circuit.append("CX", targets)
-            if p > 0:
-                circuit.append("DEPOLARIZE2", targets, p)
-        for layer in z_layers:
-            targets = [q for pair in layer for q in pair]
-            circuit.append("CX", targets)
-            if p > 0:
-                circuit.append("DEPOLARIZE2", targets, p)
+        # rounds 1-5 — X-CNOT (sX[t]) and Z-CNOT (sZ[t]) in parallel (all qubits busy)
+        for t in range(1, 6):
+            active = add_cnots(x_layers[sX[t]] + z_layers[sZ[t]])
+            add_idle(active)
+            circuit.append("TICK")
 
-    def add_measure_x_ancilla():
-        if p > 0:
-            circuit.append("H", x_anc)
-            circuit.append("DEPOLARIZE1", x_anc, p)
-        else:
-            circuit.append("H", x_anc)
-        if pm > 0:
-            circuit.append("X_ERROR", x_anc, pm)
-        circuit.append("M", x_anc)
-
-    def add_measure_z_ancilla():
+        # round 6 — measure Z-ancillas; final X-CNOT direction sX[6]
         if pm > 0:
             circuit.append("X_ERROR", z_anc, pm)
         circuit.append("M", z_anc)
+        for s in range(n_c):
+            zc[s] = meas_count + s
+        meas_count += n_c
+        z_meas.append(zc)
+        active = set(z_anc) | add_cnots(x_layers[sX[6]])
+        add_idle(active)
+        # Z-check detectors: deterministic in cycle 0 (data |0>), else XOR with previous cycle.
+        for s in range(n_c):
+            if c == 0:
+                circuit.append("DETECTOR", [rec(zc[s])], [0, s, c])
+            else:
+                circuit.append("DETECTOR", [rec(zc[s]), rec(z_meas[c - 1][s])], [0, s, c])
+        circuit.append("TICK")
 
-    def add_reset_ancilla():
-        circuit.append("R", z_anc)
-        if pm > 0:
-            circuit.append("X_ERROR", z_anc, pm)
-        circuit.append("R", x_anc)
-        if pm > 0:
-            circuit.append("X_ERROR", x_anc, pm)
+        # round 7 — measure X-ancillas; PrepZ (reset Z-ancillas); data idle
         circuit.append("H", x_anc)
         if p > 0:
             circuit.append("DEPOLARIZE1", x_anc, p)
-
-    # Init
-    add_reset_data()
-    add_init_ancilla()
-    circuit.append("TICK")
-
-    # Syndrome rounds
-    for rnd in range(rounds):
-        add_cnot_layers()
+        if pm > 0:
+            circuit.append("X_ERROR", x_anc, pm)
+        circuit.append("M", x_anc)
+        for s in range(n_c):
+            xc[s] = meas_count + s
+        meas_count += n_c
+        x_meas.append(xc)
+        circuit.append("R", z_anc)
+        if pm > 0:
+            circuit.append("X_ERROR", z_anc, pm)
+        add_idle(set(x_anc) | set(z_anc))   # all data idle
+        # X-check detectors: first cycle's X measurement is random, so compare from cycle 1 on.
+        if c > 0:
+            for s in range(n_c):
+                circuit.append("DETECTOR", [rec(xc[s]), rec(x_meas[c - 1][s])], [1, s, c])
         circuit.append("TICK")
-        add_measure_x_ancilla()
-        add_measure_z_ancilla()
-        circuit.append("TICK")
 
-        # Detectors
-        # X-check detectors: only from round 2 onwards (round 1 is random for Z-memory)
-        if rnd == 0:
-            # Z-checks are deterministic in round 1 (data starts in |0>)
-            for s in range(n_c):
-                # rec offset: z-ancilla s was measured at position -(n_c - s) in M block
-                # x_anc block: n_c measurements, then z_anc block: n_c measurements
-                # z_anc[s] is at offset -(n_c - s) from end of this tick's measurements
-                circuit.append("DETECTOR", [stim.target_rec(-(n_c - s))], [0, s, 0])
-        else:
-            # X-check detectors: current XOR previous
-            for s in range(n_c):
-                # x_anc[s] in current round: offset -(2*n_c - s) from end of M block
-                # x_anc[s] in previous round: that was 2*n_c measurements ago
-                cur = -(2 * n_c - s)
-                prev = cur - 2 * n_c
-                circuit.append("DETECTOR", [stim.target_rec(cur), stim.target_rec(prev)], [1, s, rnd])
-            # Z-check detectors
-            for s in range(n_c):
-                cur = -(n_c - s)
-                prev = cur - 2 * n_c
-                circuit.append("DETECTOR", [stim.target_rec(cur), stim.target_rec(prev)], [0, s, rnd])
-
-        if rnd < rounds - 1:
-            add_reset_ancilla()
-            circuit.append("TICK")
-
-    # Final data measurements
+    # Final transversal data measurement (Z basis).
     if pm > 0:
-        circuit.append("X_ERROR", list(range(n)), pm)
-    circuit.append("M", list(range(n)))
+        circuit.append("X_ERROR", data_all, pm)
+    circuit.append("M", data_all)
+    for q in range(n):
+        data_meas[q] = meas_count + q
+    meas_count += n
 
-    # Final detectors from data measurements (Z-checks only)
-    # Z-check s acts on data qubits z_conns[s]; H_Z row s
-    # Compare parity of those data measurements with the last Z-ancilla measurement
+    # Final Z-check detectors: reconstruct each Z-stabilizer from data, XOR last z_anc[s].
     for s in range(n_c):
-        data_qubits = z_conns[s]
-        # data qubit q was measured at offset -(n - q) from end of final M block
-        data_recs = [stim.target_rec(-(n - q)) for q in data_qubits]
-        # last Z-ancilla[s] measurement was 2*n_c + n measurements ago
-        # (after final data M block of size n, before that: x_anc n_c + z_anc n_c)
-        last_z_rec = stim.target_rec(-(n + n_c - s))
-        circuit.append("DETECTOR", data_recs + [last_z_rec], [0, s, rounds])
+        recs = [rec(data_meas[int(q)]) for q in z_conns[s]] + [rec(z_meas[rounds - 1][s])]
+        circuit.append("DETECTOR", recs, [0, s, rounds])
 
-    # Observables: logical Z operators
+    # Observables: logical Z operators read from the final data measurement.
     for i, lz in enumerate(log_Z):
-        data_qubits = list(np.where(lz)[0])
-        recs = [stim.target_rec(-(n - q)) for q in data_qubits]
+        recs = [rec(data_meas[int(q)]) for q in np.where(lz)[0]]
         circuit.append("OBSERVABLE_INCLUDE", recs, i)
 
     return circuit
