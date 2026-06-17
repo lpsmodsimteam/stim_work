@@ -135,6 +135,7 @@ class Config:
     mw_max_iter: int = 200
     mw_max_trials: int = 2000
     mw_workers: int = 1                  # >1 → run the independent BP-OSD decodes across processes
+    mw_systematic: bool = True           # enumerate all 2^K-1 syndrome classes before random trials
 
     # Technique III — splitting cross-check
     split_p_high: float = 0.006
@@ -181,7 +182,7 @@ class Config:
             relay_gamma0=0.1, relay_pre_iter=20, relay_num_sets=20,
             relay_set_max_iter=20, relay_gamma_lo=-0.24, relay_gamma_hi=0.66,
             relay_stop_nconv=5,
-            mw_max_trials=50,
+            mw_max_trials=50, mw_systematic=False,
             split_p_high=0.01, split_p_low=0.005, split_n_levels=2, split_n_seeds=2,
             split_chain_steps=30, split_burn_in=10, split_anchor_shots=80,
             split_min_weight_max_trials=20,
@@ -382,12 +383,15 @@ def run_technique_ii(cfg: Config, outdir: pathlib.Path) -> dict:
     print(f"  [II.1] D={D}, onset w0={D // 2}   ({time.perf_counter() - t0:.0f}s)", flush=True)
 
     t1 = time.perf_counter()
-    print(f"  [II.2] L(D) search: up to {cfg.mw_max_trials} trials, "
-          f"stops after 300 consecutive misses (patience) ...", flush=True)
+    K_obs = circuit.num_observables
+    n_sys = (1 << K_obs) - 1 if (cfg.mw_systematic and K_obs <= 20) else 0
+    print(f"  [II.2] L(D) search: {n_sys} systematic + up to {cfg.mw_max_trials} random trials ...",
+          flush=True)
     logicals = find_min_weight_logicals(
         circuit, D, max_trials=cfg.mw_max_trials, osd_order=cfg.mw_osd_order,
         max_iter=cfg.mw_max_iter, priors=priors, seed=cfg.seed,
-        progress_every=max(cfg.mw_max_trials // 40, 1), workers=cfg.mw_workers,
+        progress_every=max(max(n_sys, cfg.mw_max_trials) // 40, 1), workers=cfg.mw_workers,
+        systematic=cfg.mw_systematic,
     )
     print(f"  [II.2] |L(D)|={len(logicals)}   ({time.perf_counter() - t1:.0f}s)", flush=True)
 

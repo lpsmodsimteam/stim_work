@@ -103,6 +103,23 @@ def _mw_logical_trial_task(args) -> Optional[Tuple[int, tuple]]:
     return int(corr.sum()), tuple(int(x) for x in np.flatnonzero(corr))
 
 
+def _mw_systematic_task(mask: int) -> Optional[Tuple[int, tuple]]:
+    """Decode the GF(2) combination of logical generators given by bitmask.
+
+    Mask bit i set means include generator i in the combination. All 2^K − 1
+    nonzero masks cover every coset of the logical group exactly once, so this
+    fully exhausts the syndrome space for L(D) search.
+    """
+    A = _MW["A"]; K = A.shape[0]
+    coeffs = np.array([(mask >> i) & 1 for i in range(K)], dtype=np.uint8)
+    g = (coeffs @ A) % 2
+    corr = _mw_forcing_correction(g)
+    H = _MW["H"]
+    if (H @ corr % 2).any() or not (A @ corr % 2).any():
+        return None
+    return int(corr.sum()), tuple(int(x) for x in np.flatnonzero(corr))
+
+
 @dataclass
 class DistanceResult:
     distance: int
@@ -186,22 +203,20 @@ def find_min_weight_logicals(
     seed: Optional[int] = None,
     progress_every: int = 0,
     workers: int = 1,
+    systematic: bool = True,
 ) -> Set[FrozenSet[int]]:
     """Search for L(D), the set of weight-D logical bitstrings (paper §4.2).
 
-    ``progress_every`` (>0) prints a status line every that-many trials: trials done,
-    distinct logicals found so far, and the current no-new-logical streak vs patience.
+    ``systematic=True`` (default) exhaustively enumerates all 2^K − 1 nonzero GF(2)
+    combinations of the K logical generators before any random trials, fully covering
+    every syndrome class at least once. For K=12 this is 4095 extra decodes (~10 min
+    with workers=8 at ~1.2s each). Disable with ``systematic=False`` for the old
+    random-only behaviour.
 
-    Repeatedly appends a random nonzero combination of A's rows to H, decodes the
-    forcing syndrome, and keeps weight-D logicals. Stops after ``patience``
-    consecutive trials with no new logical, or ``max_trials`` total. Returns each
-    logical as a frozenset of fault indices (its support). For larger codes this
-    converges to a lower bound on |L(D)| (Fig. 6).
-
+    ``progress_every`` (>0) prints a status line every that-many trials.
     ``workers`` > 1 runs the (independent) trials across a process pool. The parallel
     path uses per-trial deterministic seeding and runs the full ``max_trials`` —
-    ``patience`` early-stop does not apply (the trials are dispatched up front), so it
-    does more decodes but they are spread across cores; net wall-time is far lower.
+    ``patience`` early-stop does not apply (the trials are dispatched up front).
     """
     H, A, _, probs = dem_check_action_matrices(circuit)
     M, N = H.shape
@@ -212,20 +227,42 @@ def find_min_weight_logicals(
         D = compute_distance(circuit, osd_order=osd_order, max_iter=max_iter,
                              priors=priors, workers=workers).distance
 
+    n_systematic = (1 << K) - 1 if (systematic and K <= 20) else 0
+
     if workers and workers > 1:
         import os
         from multiprocessing import Pool
         nproc = min(int(workers), os.cpu_count() or 1)
         base_seed = 0 if seed is None else int(seed)
-        tasks = [(t, base_seed) for t in range(max_trials)]
         found_p: Set[FrozenSet[int]] = set()
+
         with Pool(nproc, initializer=_mw_init, initargs=(H, A, priors, osd_order, max_iter)) as pool:
-            for n, res in enumerate(pool.imap_unordered(_mw_logical_trial_task, tasks, chunksize=4), 1):
-                if res is not None and res[0] == D:
-                    found_p.add(frozenset(res[1]))
-                if progress_every and n % progress_every == 0:
-                    print(f"      L(D) search [parallel x{nproc}]: {n}/{max_trials} trials, "
-                          f"|L(D)|={len(found_p)} found", flush=True)
+            # Phase 1: systematic sweep of all 2^K - 1 syndrome classes.
+            if n_systematic > 0:
+                if progress_every:
+                    print(f"      L(D) search [systematic x{nproc}]: "
+                          f"{n_systematic} syndrome classes ...", flush=True)
+                for n, res in enumerate(
+                    pool.imap_unordered(_mw_systematic_task, range(1, n_systematic + 1), chunksize=16), 1
+                ):
+                    if res is not None and res[0] == D:
+                        found_p.add(frozenset(res[1]))
+                    if progress_every and n % progress_every == 0:
+                        print(f"      L(D) systematic: {n}/{n_systematic}, "
+                              f"|L(D)|={len(found_p)}", flush=True)
+                if progress_every:
+                    print(f"      L(D) systematic done: |L(D)|={len(found_p)}", flush=True)
+
+            # Phase 2: random trials for max_trials additional attempts.
+            if max_trials > 0:
+                tasks = [(t, base_seed) for t in range(max_trials)]
+                for n, res in enumerate(pool.imap_unordered(_mw_logical_trial_task, tasks, chunksize=4), 1):
+                    if res is not None and res[0] == D:
+                        found_p.add(frozenset(res[1]))
+                    if progress_every and n % progress_every == 0:
+                        print(f"      L(D) random [parallel x{nproc}]: {n}/{max_trials}, "
+                              f"|L(D)|={len(found_p)}", flush=True)
+
         return found_p
 
     rng = np.random.default_rng(seed)
@@ -233,6 +270,23 @@ def find_min_weight_logicals(
     syndrome[M] = 1
     found: Set[FrozenSet[int]] = set()
     no_new = 0
+
+    # Systematic phase (serial).
+    if n_systematic > 0:
+        if progress_every:
+            print(f"      L(D) search [systematic]: {n_systematic} syndrome classes ...", flush=True)
+        for n, mask in enumerate(range(1, n_systematic + 1), 1):
+            coeffs = np.array([(mask >> i) & 1 for i in range(K)], dtype=np.uint8)
+            g = (coeffs @ A) % 2
+            dec = _bposd(np.vstack([H, g[None, :]]), priors, osd_order, max_iter)
+            dec.decode(syndrome)
+            corr = np.asarray(dec.osdw_decoding, dtype=np.uint8)
+            is_logical = not (H @ corr % 2).any() and (A @ corr % 2).any()
+            if is_logical and int(corr.sum()) == D:
+                found.add(frozenset(np.flatnonzero(corr).tolist()))
+            if progress_every and n % progress_every == 0:
+                print(f"      L(D) systematic: {n}/{n_systematic}, |L(D)|={len(found)}", flush=True)
+
     for trial in range(max_trials):
         if progress_every and trial > 0 and trial % progress_every == 0:
             print(f"      L(D) search: trial {trial}/{max_trials}, "
