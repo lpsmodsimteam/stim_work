@@ -86,7 +86,7 @@ exactly: `f*(D/2) = |F(D/2)| / C(N_expanded, D/2)`.
 
 | Search method | Circuit | |L(D)| | |F(D/2)| | ratio to paper |
 |---|---|---|---|---|
-| Random 2000 trials, workers=1 (this sweep) | Bravyi | 59 | — | — |
+| Random 2000 trials, workers=1 (this sweep) | Bravyi | 60 | 2.57×10⁷ | 0.067 |
 | Systematic 4095 + random 2000, workers=8 | Bravyi | **85** | **3.08×10⁷** | **0.08** |
 | Random 2000 trials, workers=8 (old session) | Sequential | 188 | 1.34×10⁷ | 0.035 |
 | Paper Table 2 | — | ≥1524 | 3.83×10⁸ | 1.000 |
@@ -118,8 +118,8 @@ is the authoritative curve for the low-`p` tail.
 | Circuit | Bravyi depth-7, standard noise | Same (corrected, was sequential) |
 | `N_expanded` | — | 68940 |
 | `D` | 6 | 6 ✓ |
-| `|L(D)|` | ≥ 1524 | ≤ 188 (random-only); ≥ TBD (systematic, ongoing) |
-| `|F(D/2)|` | 3.83×10⁸ | TBD (from systematic search) |
+| `|L(D)|` | ≥ 1524 | 60 (random-only sweep); 85 (systematic+random, workers=8) |
+| `|F(D/2)|` | 3.83×10⁸ | 2.57×10⁷ (sweep, random-only); 3.08×10⁷ (systematic+random) |
 | `f0 = f*(D/2)` | 3.83e8 / C(68940, 3) | same (Table-2 pin) |
 
 **The main remaining gap** is in `|L(D)|`. BP-OSD at `osd_order=10` with random linear
