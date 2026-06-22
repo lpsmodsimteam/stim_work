@@ -191,8 +191,11 @@ def fig_ler_vs_p(R, ax=None):
         lbl = ("Technique III: replica-exchange (3-run mean ± run-to-run spread)"
                if c["bar"] == "spread" else "Technique III: replica-exchange splitting ± SE")
         if valid.any():
-            ax.errorbar(tp[valid], tP[valid], yerr=tSE[valid], fmt="s", color="seagreen", ms=6,
-                        capsize=3, label=lbl)
+            # small marker + prominent caps so the (~4-16%) bars aren't hidden behind the squares
+            # on the ~8-decade log axis; the bars are short because the estimate is that precise.
+            ax.errorbar(tp[valid], tP[valid], yerr=tSE[valid], fmt="s", color="seagreen", ms=3.5,
+                        capsize=4, elinewidth=1.3, capthick=1.3, ecolor="darkslategray", zorder=6,
+                        label=lbl)
         if (~valid).any():
             ax.plot(tp[~valid], tP[~valid], "s", mfc="none", mec="seagreen", ms=6,
                     label="Technique III: replica-exchange (off ansatz >2x)")
