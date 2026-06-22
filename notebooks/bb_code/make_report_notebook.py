@@ -112,29 +112,41 @@ print("LER(1e-4): f3 = %.2e, f5 = %.2e   (paper Fig. 10 ~ 1e-7)"
 
 md(r"""## Technique III — Metropolis splitting cross-check (replica exchange)
 
-Splitting (`split_crosscheck.py`) runs on the **same** single-sector representation. The naive
-single-flip chain is biased: each ladder reweight term depends only on the config *weight* and is a
-decreasing function of it, so a chain trapped near its seed weight is biased — min-weight seeds
-**overshoot**, high-weight seeds **undershoot**. The cause is two-fold: (i) the uniform-column
-proposal makes weight-decrease moves O(N)-rare, so weight mixes in O(N) steps; (ii) the relevant
-failing configs at these p are *moderate* weight (~13–22), not the min-weight logicals.
+Splitting (`split_crosscheck.py`) runs on the **same** single-sector representation and walks a
+geometric ladder of physical rates from near threshold **down to deep sub-threshold (6×10⁻³ →
+10⁻⁴, 48 levels)**, estimating each rung's conditional reweight ratio so it never has to sample the
+rare onset directly — the regime where direct IS collapses (see below).
 
-The fix is **replica exchange** with a **balanced add/remove proposal** (`replica_exchange_estimate`):
-the balanced proposal mixes weight in O(steps), and swaps between adjacent rates let configs migrate
-to their equilibrium weight at each level. The result agrees with Technique I across the *whole*
-near-threshold range (not just at threshold). The two one-sided sequential runs (min-weight-seed =
-over, MC-seed = under) form a **bracket** the tempered estimate lies inside — an independent mixing
-check. (Cross-check chains use a lighter Relay decoder, num_sets=100, which near threshold tracks
-the 600-leg curve.)""")
+The naive single-flip chain is biased: each ladder reweight term depends only on the config *weight*
+and is a decreasing function of it, so a chain trapped near its seed weight is biased — min-weight
+seeds **overshoot**, high-weight seeds **undershoot**. The fix is **replica exchange** with a
+**balanced add/remove proposal** (`replica_exchange_estimate`): the balanced proposal mixes weight
+in O(steps), and swaps between adjacent rates let configs migrate to their equilibrium weight at
+each level.
+
+**Result of the deep run:** the replica-exchange estimate tracks the Technique-I ansatz at a steady
+**0.99–1.26×** across the *entire* 6×10⁻³ → 10⁻⁴ range — at 10⁻⁴ it gives **1.42×10⁻⁷** vs the
+onset-pinned ansatz **1.16×10⁻⁷**, an independent confirmation (using *no* exact-onset input) exactly
+where direct IS undershoots ~50×. The chain **mean weight descends monotonically 22 → 3.4** (mixing
+into the onset region w₀=3) with **swap acceptance 0.81–0.98**. The small steady ~1.2× offset is
+consistent with the lighter cross-check decoder (num_sets=100 vs the curve's 600 → slightly more
+failures); it is a constant offset, not a drift, so it is not a mixing artefact.
+
+The two one-sided sequential runs (min-weight-seed = over, MC-seed = under) form a **bracket** — a
+mixing check that works near threshold but **collapses below ~8×10⁻⁴** (the very trapping replica
+exchange cures), so the bracket band is shown only where it genuinely brackets.""")
 
 code("""if R["split"]:
-    print(f"{'p':>10}{'tempered (SE)':>22}{'Tech-I':>12}{'ratio':>7}   bracket[lo,hi]      regime")
-    for r in R["split"]["compare"]:
-        print(f"{r['p']:>10.2e}{r['tempered_P']:>13.2e} (±{r['tempered_SE']:.0e}){r['ansatz_P']:>12.2e}"
-              f"{r['ratio']:>7.2f}   [{r['bracket_lo']:.1e},{r['bracket_hi']:.1e}]  {r['regime']}")
+    c = bb6_report.splitting_comparison(R)   # de-aliased: ansatz evaluated at each rung's exact p
+    print(f"{'p':>10}{'tempered (SE)':>20}{'Tech-I':>11}{'ratio':>7}  agree  bracket")
+    for k in range(0, c['p'].size, 2):       # every other rung (49 total)
+        ag = ' ok ' if c['valid'][k] else '>2x '
+        br = 'inside' if c['inside_bracket'][k] else 'collapsed'
+        print(f"{c['p'][k]:>10.2e}{c['tP'][k]:>11.2e} (±{c['tSE'][k]:.0e}){c['ansatz'][k]:>11.2e}"
+              f"{c['ratio'][k]:>7.2f}  {ag}  {br}")
     sa = R["split"]["diagnostics"]["swap_accept"]; mw = R["split"]["diagnostics"]["mean_weight"]
-    print(f"\\nswap-accept {min(sa):.2f}..{max(sa):.2f}; mean weight {mw[0]:.1f} (hi-q) -> {mw[-1]:.1f} (lo-q), "
-          f"monotonic={all(mw[i]>=mw[i+1]-1 for i in range(len(mw)-1))}")""")
+    print(f"\\nratio range {c['ratio'].min():.2f}-{c['ratio'].max():.2f} over {c['p'].size} rungs; "
+          f"swap-accept {min(sa):.2f}..{max(sa):.2f}; mean weight {mw[0]:.1f} (hi-q) -> {mw[-1]:.1f} (lo-q)")""")
 
 md(r"""### Cross-check against paper Figure 9 (BB(6)-relay)
 
@@ -142,11 +154,11 @@ Figure 9 of the paper shows multi-seeded splitting for BB(6): panel **(a)** LER 
 splitting, upward splitting, and Monte Carlo) and panel **(c)** the *weight distribution of failing
 configurations* vs p. Our analogs below:
 
-- **(a)** the replica-exchange splitting points lie on the LER curve / IS points / ansatz across
-  the near-threshold range — like the paper's *downward splitting* + Monte Carlo.
-- **(c)** the failing-config weight rises from **~6 at low p to ~40 at p=10⁻²**; our chain mean
-  weights track the analytic π_q(w) median (computed from the measured f(w)) — matching the paper's
-  BB(6) weight distributions.
+- **(a)** the replica-exchange splitting points lie on the ansatz / IS curve across the **full
+  6×10⁻³ → 10⁻⁴ range** — like the paper's *downward splitting* + Monte Carlo.
+- **(c)** the failing-config weight rises from **~3.4 just above the onset (w₀=3) at p=10⁻⁴ to ~22
+  near threshold**; our chain mean weights track the analytic π_q(w) median (from the measured
+  f(w)) — matching the shape of the paper's BB(6) weight distributions.
 
 The paper's *upward/downward* splitting is our *over/under* bracket, and it explicitly notes the
 upward splitting "struggle[s] to converge or fully mix" — exactly our overshoot. The downward (our

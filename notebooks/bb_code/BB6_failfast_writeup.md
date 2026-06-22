@@ -170,19 +170,29 @@ O(N)-rare (weight mixes in O(N) steps), and the dominant failing configs at thes
 weight (~13–22), not the min-weight logicals. The fix (`replica_exchange_estimate`) is a **balanced
 add/remove proposal** (mixes weight in O(steps)) plus **replica exchange** across the ladder.
 
-**Result (`split_crosscheck.py`, ladder p=0.006→0.003, 16 levels, 8 walkers; ~23 min):** the
-tempered estimate agrees with Technique I on **all 17 rungs** (ratios 0.8–1.46, no systematic bias),
-lies inside the **under/over bracket** (the two one-sided sequential runs), and its per-level mean
-weight is monotonic 22.1→13.3, matching the analytic `π_q(w)` target. Cross-check chains use a
-lighter Relay decoder (num_sets=100), valid near threshold.
+**Result (`split_crosscheck.py`, ladder p=0.006→1e-4, 48 levels, 8 walkers; ~24 min).** The
+replica-exchange estimate tracks Technique I at a steady **0.99–1.26×** across **all 49 rungs**
+(de-aliased ratio: the ansatz is evaluated at each rung's exact p, not a coarse grid point). At the
+bottom rung it gives **LER(1e-4) = 1.42×10⁻⁷** vs the onset-pinned ansatz **1.16×10⁻⁷** — an
+independent confirmation using *no* exact-onset input, exactly where direct IS undershoots ~50×
+(see the truncation note below). Diagnostics: per-level **mean weight monotonic 22.2→3.4** (mixing
+into the onset region w₀=3), **swap acceptance 0.81–0.98**. The small, *steady* ~1.2× offset is
+consistent with the lighter cross-check decoder (num_sets=100 vs the curve's 600 → slightly more
+failures) — a constant offset, not a drift, so not a mixing artefact.
+
+The two one-sided sequential runs (min-weight-seed = over, MC-seed = under) form an **under/over
+bracket** — a mixing check that brackets the estimate near threshold but **collapses below ~8×10⁻⁴**
+(`[lo,hi]` falls to ~10⁻¹¹…10⁻¹⁸, the very sequential-chain trapping replica exchange cures), so the
+bracket band is plotted only over the rungs where it genuinely brackets.
 
 **Cross-check vs paper Figure 9 (BB(6)-relay).** Fig 9 shows BB(6) splitting: panel (a) LER vs p,
 panel (c) failing-config weight distribution. Ours match both — splitting points on the LER curve
-(`fig9a_ler_vs_p.png`), and the weight rising ~6→~40 with chain means on the analytic median
-(`fig9c_weight_dist.png`, combined `fig9_bb6.png`). The paper's *upward/downward* splitting is our
-*over/under* bracket, and it explicitly flags the upward direction "struggl[ing] to converge or
-fully mix" — exactly our overshoot. Technique I remains the authoritative low-p curve; the actual
-tempered chains here cover the near-threshold range (the weight band is analytic over the full p).
+over the full 6×10⁻³→10⁻⁴ range (`fig9a_ler_vs_p.png`), and the failing-config weight rising from
+**~3.4 (just above w₀=3) at 10⁻⁴ to ~22 near threshold**, with chain means on the analytic π_q(w)
+median (`fig9c_weight_dist.png`, combined `fig9_bb6.png`). The paper's *upward/downward* splitting is
+our *over/under* bracket, and it explicitly flags the upward direction "struggl[ing] to converge or
+fully mix" — exactly our sequential-bracket collapse. Technique I remains the authoritative low-p
+curve; Technique III now corroborates it by an independent sampling method all the way to 10⁻⁴.
 
 ## 4. Comparison with paper Table 2
 
@@ -253,8 +263,12 @@ bb6.spectrum,config}.json`, `fig_ler_vs_p.png`, `fig_failure_spectrum.png`, `bb6
 
 - **Rounds = d = 6** (fixed). The paper may use a different convention for the memory
   experiment length; verify against the Figure-10 caption if exact reproduction matters.
-- **Technique III non-mixing:** splitting estimates at `p < 0.003` are likely invalid. Only
-  interpret the splitting curve where it overlaps and agrees with Technique I.
+- **Technique III reaches deep sub-threshold via replica exchange.** With the balanced proposal +
+  parallel tempering, the splitting estimate now tracks Technique I down to **p = 1e-4** (0.99–1.26×;
+  mean weight mixes 22.2→3.4). The *naive sequential* chains still fail there — their under/over
+  bracket collapses below ~8e-4 — so trust the replica-exchange (tempered) estimate, not the
+  sequential bracket, deep sub-threshold. A small ~1.2× offset comes from the lighter cross-check
+  decoder (num_sets=100); rerun with num_sets≈600 for a tighter match.
 - **Single-sector throughout.** Technique I (IS sweep), II (min-weight), and III (splitting) all
   run on the single Z-check sector derived from the Stim circuit. The full both-sector path is
   still available via `--full-dem` (for future full-DEM work) but is not the default; no full-DEM

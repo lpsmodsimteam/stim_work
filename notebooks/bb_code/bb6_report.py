@@ -86,6 +86,52 @@ def onset_LER(p, R):
     return np.exp(logC + w0 * np.log(q) + (N - w0) * np.log1p(-q)) * f0
 
 
+def is_zero_count_upper(R, p_values=None):
+    """Rule-of-three (3/T) upper-limit contribution to the IS LER from zero-count weight bins.
+
+    The IS estimate is Σ_w C(N,w) q^w (1-q)^(N-w) f̂(w) over the *sampled* weights, with
+    f̂(w)=F(w)/T(w). A bin with F(w)=0 contributes 0 to that sum AND 0 to its binomial SE
+    (√(f̂(1-f̂)/T)=0 at f̂=0), so it is invisible to a count-based error bar even though its
+    true failure fraction is only bounded by f ≤ 3/T (the 95% rule of three). At deep
+    sub-threshold the dominant low-weight bins (w=3,4,5) are exactly these empty bins, which is
+    why the plain IS bar cannot reach the onset-pinned ansatz. This returns, for each p, the
+    extra LER those empty bins could add if each sat at its 3/T upper limit — a one-sided
+    *upper* allowance (empty bins cannot lower the estimate)."""
+    if p_values is None:
+        p_values = R["isp"]
+    w, F, T, N, w0 = R["w"].astype(float), np.asarray(R["F"]), R["T"].astype(float), R["N"], R["w0"]
+    # Only w >= w0 get an allowance: Technique-II enumeration proves f(w)=0 exactly below the
+    # onset (no logical fault of weight < w0 exists), so those empty bins are true zeros, not
+    # undersampling — they must not contribute a 3/T upper limit.
+    zero = (F == 0) & (T > 0) & (w >= w0)
+    p_arr = np.asarray(p_values, dtype=float)
+    if not zero.any():
+        return np.zeros_like(p_arr)
+    wz, f_upper = w[zero], 3.0 / T[zero]                       # rule of three at 0 counts
+    logC = gammaln(N + 1) - gammaln(wz + 1) - gammaln(N - wz + 1)
+    q = np.clip(R["q_base"] * (p_arr / R["p_ref"]), 1e-300, 1.0 - 1e-15)
+    logterm = logC[:, None] + wz[:, None] * np.log(q)[None, :] + (N - wz)[:, None] * np.log1p(-q)[None, :]
+    return (f_upper[:, None] * np.exp(logterm)).sum(axis=0)
+
+
+def splitting_comparison(R):
+    """Per-rung Technique-III (replica-exchange) vs Technique-I comparison, de-aliased.
+
+    The ansatz is evaluated at each rung's EXACT p — the ratio stored in splitting.json uses the
+    nearest *coarse* ansatz-grid point and so zig-zags. Returns arrays p, tP, tSE, ansatz, ratio,
+    valid (within 2x of the ansatz) and inside_bracket (whether the sequential under/over bracket
+    still brackets the estimate — False deep sub-threshold, where the sequential chains collapse)."""
+    s = R["split"]
+    tp = np.asarray(s["tempered"]["p_ladder"], float)
+    tP = np.asarray(s["tempered"]["P_logical"], float)
+    tSE = np.asarray(s["tempered"]["P_logical_se"], float)
+    ans = np.asarray(logical_error_rate_from_ansatz(R["fits"]["f3"], list(tp)))
+    ratio = tP / np.maximum(ans, 1e-300)
+    inb = np.array([r["inside_bracket"] for r in s["compare"]], dtype=bool)
+    return dict(p=tp, tP=tP, tSE=tSE, ansatz=ans, ratio=ratio,
+                valid=(ratio >= 0.5) & (ratio <= 2.0), inside_bracket=inb)
+
+
 def fig_ler_vs_p(R, ax=None):
     import matplotlib.pyplot as plt
     if ax is None: _, ax = plt.subplots(figsize=(8.4, 5.6))
@@ -96,8 +142,14 @@ def fig_ler_vs_p(R, ax=None):
     isL, isSE = R["isL"], R["isSE"]
     rel = isSE / np.maximum(isL, 1e-300)
     lo_err = np.where(rel < 0.5, isSE, 0.0)
-    ax.errorbar(R["isp"], isL, yerr=[lo_err, isSE], fmt="o", color="steelblue", ms=4, capsize=2,
-                lw=0.8, label="Technique I: IS reweighted (SE; upper-only where SE≳value)", zorder=4)
+    # Upper bar = statistical SE of the measured bins + rule-of-three (3/T) allowance for the
+    # zero-count weight bins the estimator silently dropped. At low p this is dominated by the
+    # empty w=3,4,5 bins and (correctly) reaches up past the ansatz — the data are consistent
+    # with it; they just can't confirm it. At high p the dominant weights have counts, so the
+    # allowance vanishes and the bar reverts to the plain SE.
+    hi_err = isSE + is_zero_count_upper(R)
+    ax.errorbar(R["isp"], isL, yerr=[lo_err, hi_err], fmt="o", color="steelblue", ms=4, capsize=2,
+                lw=0.8, label="Technique I: IS reweighted (upper bar adds 3/T limit on zero-count weights)", zorder=4)
     for model, col in (("f3", "crimson"), ("f5", "purple")):
         lo, hi = R["band"][model]
         ax.fill_between(p, lo, hi, color=col, alpha=0.15)
@@ -107,17 +159,23 @@ def fig_ler_vs_p(R, ax=None):
     # the failure-spectrum / weight-distribution figures, not on this LER-vs-p plot.
     if R["split"]:
         s = R["split"]
+        # The replica-exchange estimate is the result; the sequential under/over bracket is a
+        # near-threshold mixing check that COLLAPSES deep sub-threshold (the trapping replica
+        # exchange cures), so clip its band to the rungs where it actually brackets rather than
+        # sweeping it down to ~1e-18. Validity is de-aliased agreement with the ansatz.
+        c = splitting_comparison(R)
+        tp, tP, tSE, valid = c["p"], c["tP"], c["tSE"], c["valid"]
         bp = np.array(s["bracket"]["p_ladder"]); blo = np.array(s["bracket"]["lo"]); bhi = np.array(s["bracket"]["hi"])
-        ax.fill_between(bp, blo, bhi, color="seagreen", alpha=0.12,
-                        label="Technique III: splitting bracket (under/over seeding)")
-        tp = np.array(s["tempered"]["p_ladder"]); tP = np.array(s["tempered"]["P_logical"]); tSE = np.array(s["tempered"]["P_logical_se"])
-        reg = np.array([r["regime"] == "valid" for r in s["compare"]])
-        if reg.any():
-            ax.errorbar(tp[reg], tP[reg], yerr=tSE[reg], fmt="s", color="seagreen", ms=7, capsize=3,
-                        label="Technique III: replica-exchange (validated) ± SE")
-        if (~reg).any():
-            ax.plot(tp[~reg], tP[~reg], "s", mfc="none", mec="seagreen", ms=6,
-                    label="Technique III: replica-exchange (check)")
+        inb = c["inside_bracket"]
+        if inb.any():
+            ax.fill_between(bp[inb], blo[inb], bhi[inb], color="seagreen", alpha=0.12,
+                            label="Technique III: splitting bracket (near-threshold mixing check)")
+        if valid.any():
+            ax.errorbar(tp[valid], tP[valid], yerr=tSE[valid], fmt="s", color="seagreen", ms=6, capsize=3,
+                        label="Technique III: replica-exchange splitting ± SE")
+        if (~valid).any():
+            ax.plot(tp[~valid], tP[~valid], "s", mfc="none", mec="seagreen", ms=6,
+                    label="Technique III: replica-exchange (off ansatz >2x)")
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel(r"Physical error rate $p$"); ax.set_ylabel("Logical error rate")
     ax.set_title("BB(6) [[72,12,6]] — logical vs physical error rate (Figure 10)")

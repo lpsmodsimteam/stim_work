@@ -1,6 +1,7 @@
 """Technique-III splitting cross-check of the Figure-10 curve, on the single-sector representation.
 
-Produces three estimates over the same near-threshold ladder (p=0.006 -> 0.003):
+Produces three estimates over a ladder from near-threshold down to deep sub-threshold
+(p=0.006 -> 1e-4, 48 geometric levels):
   * tempered  — replica_exchange_estimate (balanced proposal + parallel tempering): the ACCURATE
     estimate (weight-distribution mixes correctly), agrees with Technique-I across the range.
   * over / under — the two one-sided SEQUENTIAL splitting runs (min-weight seeds overshoot,
@@ -19,7 +20,7 @@ from surface_code_sim import ErrorModel
 from min_weight import single_sector_dem, find_min_weight_logicals, build_circuit_translation_perms
 from splitting import replica_exchange_estimate, splitting_estimate
 
-P_REF, P_HIGH, P_LOW, NLEV = 0.003, 0.006, 0.003, 16
+P_REF, P_HIGH, P_LOW, NLEV = 0.003, 0.006, 1e-4, 48   # deep run: anchor at 6e-3, descend to 1e-4
 
 def _dec():  # decoder for the cross-check chains: lighter than the curve's 600 legs, which is fine
     # near threshold (validated: a num_sets=100 cross-check agrees with the 600-leg curve to ~25%).
@@ -63,11 +64,15 @@ def main():
     oP = np.asarray(over.P_logical); uP = np.asarray(under.P_logical)
     lo = np.minimum(oP, uP); hi = np.maximum(oP, uP)
     rows = []
+    # De-alias: log-log interpolate the ansatz at each rung's EXACT p (nearest-grid-point lookup
+    # zig-zags because the ansatz grid is coarser than the ladder). Validity = ansatz agreement
+    # within 2x; bracket-inside is tracked separately (it collapses deep sub-threshold).
+    asrt = np.argsort(ap); aps, aPs = ap[asrt], aP[asrt]
     print("\n  p          tempered (SE)        ansatz      ratio   bracket[lo,hi]")
     for k, pv in enumerate(pl):
-        aL = float(aP[np.argmin(abs(ap - pv))]); r = tP[k] / aL if aL > 0 else float("nan")
+        aL = float(np.exp(np.interp(np.log(pv), np.log(aps), np.log(aPs)))); r = tP[k] / aL if aL > 0 else float("nan")
         inside = lo[k] <= tP[k] <= hi[k]
-        regime = "valid" if (0.5 <= r <= 2.0 and inside) else "check"
+        regime = "valid" if 0.5 <= r <= 2.0 else "check"
         rows.append({"p": float(pv), "tempered_P": float(tP[k]), "tempered_SE": float(tSE[k]),
                      "ansatz_P": aL, "over_P": float(oP[k]), "under_P": float(uP[k]),
                      "bracket_lo": float(lo[k]), "bracket_hi": float(hi[k]),
