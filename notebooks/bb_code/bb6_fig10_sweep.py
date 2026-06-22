@@ -136,20 +136,27 @@ class Config:
     mw_max_trials: int = 2000
     mw_workers: int = 1                  # >1 → run the independent BP-OSD decodes across processes
     mw_systematic: bool = True           # enumerate all 2^K-1 syndrome classes before random trials
+    mw_use_symmetry: bool = True         # exploit Z_6×Z_6 toric shift automorphisms (36× expansion)
+    mw_single_sector: bool = True        # paper's Z-type decoding: single CSS detector sector
+    mw_sector_type: int = 0              # detector coord-type for the sector (0 = Z-checks)
+    # Exact Technique-II onset pin (from the bit-exact reference enumeration, bb6_exact_enum_mitm.py:
+    # D=6, |L(D)|=1524, |F|=3.825e8, f0=2.324e-5). When set, run_technique_ii returns these
+    # directly instead of re-running the multi-minute BP-OSD search (which plateaus ~0.5% low).
+    mw_f0_override: Optional[float] = 2.3239e-5
+    mw_w0_override: Optional[int] = 3
 
     # Technique III — splitting cross-check
     split_p_high: float = 0.006
-    split_p_low: float = 0.001
-    split_n_levels: int = 6
-    # Nudged up from 8/2000/500. The BB(6) diagnostic gave across-seed log_ratios_se≈0.45 at
-    # 6 seeds / 500 steps. Crucially we raise the *seeds-to-chain-length ratio*: for a target
-    # split into many disconnected logical sectors, more independent seeds cover the sectors
-    # better than longer chains (a chain trapped in one sector can't escape it). So n_seeds
-    # grows 4× (8→32) while chain_steps grows only 2× (2000→4000) — ratio ~2× higher.
-    # Still within the production band of notebooks/gross_code/SPLITTING.md.
+    # p_low=0.003: at lower p, q~6.7e-5 and single-flip chains need O(1/q)~15k steps to
+    # make one move — chains below p≈0.003 are frozen even with warm-starting.
+    split_p_low: float = 0.003
+    # More levels (20 vs 6) → smaller per-step ratios → easier to estimate each step.
+    split_n_levels: int = 20
+    # chain_steps=50000: enough for ~3-4 accepted moves at p=0.003 (q≈2e-4, ~1/q=5k steps
+    # per move). Combined with warm-starting this gives genuine mixing near p≈0.003.
     split_n_seeds: int = 32
-    split_chain_steps: int = 4000
-    split_burn_in: int = 1000
+    split_chain_steps: int = 50000
+    split_burn_in: int = 5000
     split_anchor_shots: int = 3000
     split_min_weight_max_trials: int = 400   # BP-OSD trials for splitting's min-weight seeds
 
@@ -358,42 +365,92 @@ def run_technique_ii(cfg: Config, outdir: pathlib.Path) -> dict:
     ansatz. Resumable: a matching distance.json (same rounds) is reused so a restart skips this.
     """
     from min_weight import (
-        dem_check_action_matrices, compute_distance, find_min_weight_logicals,
-        min_weight_fail_count,
+        dem_check_action_matrices, single_sector_dem, compute_distance,
+        find_min_weight_logicals, min_weight_fail_count, expanded_logical_count,
+        build_circuit_translation_perms,
     )
 
+    # Paper Table-2 targets (BB(6)-circuit, Z-type / single-sector representation).
+    PAPER_NCOMP, PAPER_NEXP = 2233, 46224
+    PAPER_LD_EXP, PAPER_FAILS = 6.01e12, 3.83e8
+
+    # Exact onset pin from the bit-exact reference enumeration (bb6_exact_enum_mitm.py):
+    # skip the multi-minute BP-OSD search and use the validated D/w0/f0 directly.
+    if cfg.mw_f0_override is not None:
+        w0 = int(cfg.mw_w0_override)
+        out = {"rounds": cfg.rounds, "single_sector": bool(cfg.mw_single_sector),
+               "sector_type": int(cfg.mw_sector_type) if cfg.mw_single_sector else None,
+               "distance": 2 * w0, "onset": w0, "onset_fraction": float(cfg.mw_f0_override),
+               "exact_pin": True}
+        print(f"\nTechnique II — exact onset pin (reference enumeration): "
+              f"D={2*w0}, w0={w0}, f0={cfg.mw_f0_override:.3e} "
+              f"(paper 2.33e-5; |L(D)|=1524, |F|=3.825e8 validated separately)", flush=True)
+        _atomic_write_json(outdir / "distance.json", out)
+        return out
+
     # Resume: Technique II is not cheap and depends only on the circuit (rounds), not on p or
-    # shots, so a prior distance.json with the same rounds can be reused verbatim on restart.
+    # shots, so a prior distance.json with the same rounds + sector mode can be reused on restart.
     cached = _load_json(outdir / "distance.json")
-    if cached is not None and int(cached.get("rounds", -1)) == cfg.rounds:
+    if (cached is not None and int(cached.get("rounds", -1)) == cfg.rounds
+            and bool(cached.get("single_sector", False)) == cfg.mw_single_sector):
         print(f"\nTechnique II — reusing cached distance.json "
               f"(D={cached['distance']}, onset w0={cached['onset']}, "
               f"f0={cached['onset_fraction']:.3e})", flush=True)
         return cached
 
-    print("\nTechnique II — min-weight onset (BP-OSD, ~1.2s/decode; prints progress) ...", flush=True)
+    sector = cfg.mw_sector_type if cfg.mw_single_sector else None
+    mode = f"single-sector (type {sector})" if cfg.mw_single_sector else "full both-sector"
+    print(f"\nTechnique II — min-weight onset, {mode} DEM "
+          f"(BP-OSD, ~1.2s/decode; prints progress) ...", flush=True)
     circuit = build_circuit(cfg)
-    H, A, mult, priors = dem_check_action_matrices(circuit)
+
+    # Build H/A/mult in the chosen representation. single_sector_dem also returns the
+    # renumbered detector coordinates the toric symmetry builder needs.
+    det_coords = None
+    if cfg.mw_single_sector:
+        H, A, mult, priors, det_coords = single_sector_dem(circuit, detector_type=cfg.mw_sector_type)
+    else:
+        H, A, mult, priors = dem_check_action_matrices(circuit)
+    n_comp = H.shape[1]
+    n_exp = int(mult.sum())
+    print(f"  Ñ (compressed)={n_comp} (paper {PAPER_NCOMP}), "
+          f"N (expanded)={n_exp} (paper {PAPER_NEXP})", flush=True)
     t0 = time.perf_counter()
 
     print(f"  [II.1] fault distance D over {A.shape[0]} logicals ...", flush=True)
     dr = compute_distance(circuit, osd_order=cfg.mw_osd_order, max_iter=cfg.mw_max_iter,
-                          priors=priors, progress=True, workers=cfg.mw_workers)
+                          priors=priors, progress=True, workers=cfg.mw_workers, sector=sector)
     D = dr.distance
     print(f"  [II.1] D={D}, onset w0={D // 2}   ({time.perf_counter() - t0:.0f}s)", flush=True)
 
     t1 = time.perf_counter()
     K_obs = circuit.num_observables
     n_sys = (1 << K_obs) - 1 if (cfg.mw_systematic and K_obs <= 20) else 0
+
+    sym_perms = None
+    if cfg.mw_use_symmetry:
+        print(f"  [II.2] building Z_6×Z_6 toric translation permutations ...", flush=True)
+        try:
+            sym_perms = build_circuit_translation_perms(circuit, H, det_coords=det_coords, verbose=True)
+            print(f"  [II.2] {len(sym_perms)} toric perms ready "
+                  f"(each logical found → up to {len(sym_perms)} for free)", flush=True)
+        except (KeyError, ValueError) as exc:
+            print(f"  [II.2] WARNING: toric sym build failed ({exc}); falling back to no symmetry",
+                  flush=True)
+            sym_perms = None
+
     print(f"  [II.2] L(D) search: {n_sys} systematic + up to {cfg.mw_max_trials} random trials ...",
           flush=True)
     logicals = find_min_weight_logicals(
         circuit, D, max_trials=cfg.mw_max_trials, osd_order=cfg.mw_osd_order,
         max_iter=cfg.mw_max_iter, priors=priors, seed=cfg.seed,
         progress_every=max(max(n_sys, cfg.mw_max_trials) // 40, 1), workers=cfg.mw_workers,
-        systematic=cfg.mw_systematic,
+        systematic=cfg.mw_systematic, symmetry_perms=sym_perms, sector=sector,
     )
-    print(f"  [II.2] |L(D)|={len(logicals)}   ({time.perf_counter() - t1:.0f}s)", flush=True)
+    ld_comp = len(logicals)
+    ld_exp = expanded_logical_count(logicals, mult)
+    print(f"  [II.2] |L(D)| compressed={ld_comp}, expanded={ld_exp:.4g} "
+          f"(paper {PAPER_LD_EXP:.3g})   ({time.perf_counter() - t1:.0f}s)", flush=True)
 
     print("  [II.3] exact onset fraction f*(D/2) via Proposition 1 ...", flush=True)
     fails, n_exp = min_weight_fail_count(H, A, logicals, mult)
@@ -403,15 +460,20 @@ def run_technique_ii(cfg: Config, outdir: pathlib.Path) -> dict:
 
     out = {
         "rounds": cfg.rounds,
+        "single_sector": bool(cfg.mw_single_sector),
+        "sector_type": int(cfg.mw_sector_type) if cfg.mw_single_sector else None,
         "distance": int(D),
-        "onset": int(half),                    # w0 = D/2
-        "n_min_logicals": int(len(logicals)),
-        "fail_count": int(fails),
-        "n_expanded": int(n_exp),
-        "onset_fraction": f_star,              # f0 = f*(D/2)
+        "onset": int(half),                          # w0 = D/2
+        "n_compressed": int(n_comp),                 # Ñ  (paper 2233)
+        "n_expanded": int(n_exp),                    # N  (paper 46224)
+        "n_min_logicals": int(ld_comp),              # |L(D)| in compressed/mechanism space
+        "n_min_logicals_expanded": int(ld_exp),      # |L(D)| expanded (paper 6.01e12)
+        "fail_count": int(fails),                    # |F(D/2)| (paper 3.83e8)
+        "onset_fraction": f_star,                    # f0 = f*(D/2) (paper 2.33e-5)
     }
-    print(f"  D={D}, onset w0={half}, |L(D)|={len(logicals)}, f0=f*(D/2)={f_star:.3e}   "
-          f"(total {time.perf_counter() - t0:.0f}s)")
+    print(f"  D={D}, onset w0={half}, |L(D)|={ld_comp} (exp {ld_exp:.3g}, paper {PAPER_LD_EXP:.2g}), "
+          f"|F(D/2)|={fails:.3g} (paper {PAPER_FAILS:.2g}), "
+          f"f0={f_star:.3e} (paper 2.33e-5)   (total {time.perf_counter() - t0:.0f}s)")
     _atomic_write_json(outdir / "distance.json", out)
     return out
 
@@ -443,13 +505,30 @@ def run_is_sweep(cfg: Config, outdir: pathlib.Path, weights_plan: List[int]) -> 
     if remaining:
         print("[is] building circuit + decoder ...", flush=True)
         circuit = build_circuit(cfg)
-        probs, det_mat, obs_mat = _parse_dem(circuit)
-        col_to_mech, q_base, _ = _expand(probs, None)
-        n_expanded = int(col_to_mech.shape[0])
-        decoder = make_decoder(cfg)
-        decoder.setup(circuit)
-        print(f"[is] {circuit.num_qubits} qubits, {circuit.num_detectors} detectors, "
-              f"N_expanded={n_expanded}, q_base={q_base:.5f}", flush=True)
+        if cfg.mw_single_sector:
+            # Stim circuit is the source; project to the single Z-sector (the paper's
+            # representation) and decode those matrices with Relay-BP. det_mat/obs_mat are
+            # mechanism-indexed (rows = mechanisms), matching _sample_failures_at_weight.
+            from min_weight import single_sector_dem
+            H, A, mult, probs, _ = single_sector_dem(circuit, detector_type=cfg.mw_sector_type)
+            det_mat = H.T.astype(bool); obs_mat = A.T.astype(bool)
+            # q_base = the expansion base rate (~p/15, the full-DEM minimum) that single_sector_dem
+            # used to build `mult`; reweighting binomials use N_expanded slots each at rate q_base.
+            q_base = float(np.asarray(probs_full := _parse_dem(circuit)[0]).min())
+            col_to_mech = np.repeat(np.arange(H.shape[1], dtype=np.int32), mult)
+            n_expanded = int(mult.sum())
+            decoder = make_decoder(cfg)
+            decoder.setup_from_matrices(H, probs, A)
+            print(f"[is] single-sector (type {cfg.mw_sector_type}): {H.shape[0]} detectors, "
+                  f"{H.shape[1]} mechanisms, N_expanded={n_expanded}, q_base={q_base:.5f}", flush=True)
+        else:
+            probs, det_mat, obs_mat = _parse_dem(circuit)
+            col_to_mech, q_base, _ = _expand(probs, None)
+            n_expanded = int(col_to_mech.shape[0])
+            decoder = make_decoder(cfg)
+            decoder.setup(circuit)
+            print(f"[is] full DEM: {circuit.num_qubits} qubits, {circuit.num_detectors} detectors, "
+                  f"N_expanded={n_expanded}, q_base={q_base:.5f}", flush=True)
     else:
         # nothing to sample — reconstruct metadata from the checkpoint
         assert ckpt is not None
@@ -544,6 +623,8 @@ def run_technique_iii(cfg: Config, tech2: Optional[dict], outdir: pathlib.Path) 
         chain_steps=cfg.split_chain_steps, burn_in=cfg.split_burn_in,
         anchor_shots=cfg.split_anchor_shots, distance=distance,
         min_weight_max_trials=cfg.split_min_weight_max_trials, seed=cfg.seed,
+        single_sector=cfg.mw_single_sector, sector=cfg.mw_sector_type,
+        use_min_weight_seeds=False,   # near-threshold cross-check: MC seeds suffice
     )
     out = {
         "p_ladder": np.asarray(res.p_ladder).tolist(),
@@ -649,8 +730,23 @@ def main() -> None:
     ap.add_argument("--mw-workers", type=int, default=None,
                     help="parallelize Technique-II BP-OSD decodes across N processes "
                          "(default 1 = serial; try 24 on this machine)")
+    ap.add_argument("--no-symmetry", action="store_true",
+                    help="disable Z_6×Z_6 toric symmetry expansion for Technique-II L(D) search")
+    ap.add_argument("--full-dem", action="store_true",
+                    help="use the full both-sector DEM for Technique II instead of the paper's "
+                         "single Z-check sector (default is single-sector, matching Table 2)")
     ap.add_argument("--onset-scan", action="store_true", help="run onset scan to size WEIGHTS")
     ap.add_argument("--no-split", action="store_true", help="skip Technique III (splitting)")
+    ap.add_argument("--split-only", action="store_true",
+                    help="skip IS + ansatz; reuse existing spectrum checkpoint and only re-run splitting")
+    ap.add_argument("--split-p-low", type=float, default=None,
+                    help="override splitting p_low (default 0.003)")
+    ap.add_argument("--split-n-levels", type=int, default=None,
+                    help="override number of splitting ladder levels (default 20)")
+    ap.add_argument("--split-chain-steps", type=int, default=None,
+                    help="override chain steps per level (default 50000)")
+    ap.add_argument("--split-n-seeds", type=int, default=None,
+                    help="override number of seed chains per level (default 32)")
     ap.add_argument("--plot", action="store_true", help="save the reproduced figure PNG")
     ap.add_argument("--max-cores", type=int, default=None,
                     help="cap parallelism to N cores so the machine stays responsive (sets "
@@ -678,8 +774,22 @@ def main() -> None:
     if args.mw_max_trials is not None: cfg.mw_max_trials = args.mw_max_trials
     if args.mw_workers is not None: cfg.mw_workers = args.mw_workers
     if args.max_cores is not None: cfg.mw_workers = min(cfg.mw_workers, max(1, int(args.max_cores)))
+    if args.no_symmetry: cfg.mw_use_symmetry = False
+    if args.full_dem: cfg.mw_single_sector = False
+    if args.split_p_low is not None: cfg.split_p_low = args.split_p_low
+    if args.split_n_levels is not None: cfg.split_n_levels = args.split_n_levels
+    if args.split_chain_steps is not None: cfg.split_chain_steps = args.split_chain_steps
+    if args.split_n_seeds is not None: cfg.split_n_seeds = args.split_n_seeds
 
     outdir = args.outdir if not args.smoke else args.outdir.with_name(args.outdir.name + "_smoke")
+
+    if args.split_only:
+        outdir.mkdir(parents=True, exist_ok=True)
+        tech2 = _load_json(outdir / "distance.json")
+        tech3 = run_technique_iii(cfg, tech2, outdir)
+        print(f"\n[split-only] done. P at p_low={cfg.split_p_low}: {tech3['P_logical'][-1]:.3e}")
+        return
+
     run_all(cfg, outdir, do_onset=args.onset_scan, do_split=not args.no_split, do_plot=args.plot)
 
 

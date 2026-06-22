@@ -124,9 +124,24 @@ class RelayBPDecoder(Decoder):
 
         dem = circuit.detector_error_model(flatten_loops=True)
         cm = CheckMatrices.from_dem(dem)
+        self.setup_from_matrices(cm.check_matrix, cm.error_priors, cm.observables_matrix)
+
+    def setup_from_matrices(self, check_matrix, error_priors, observables_matrix) -> None:
+        """Configure Relay-BP directly from a detector check matrix, per-mechanism priors,
+        and an observable-action matrix — bypassing the Stim DEM.
+
+        Used for the single-CSS-sector representation: the Stim circuit is still the source
+        (build it, then ``single_sector_dem`` derives H/A/probs), but decoding runs on the
+        projected sector matrices rather than the full both-sector DEM. ``check_matrix`` and
+        ``observables_matrix`` may be dense uint8 arrays or scipy sparse; converted to CSR.
+        """
+        import relay_bp
+        from scipy.sparse import csr_matrix
+        H = csr_matrix(np.asarray(check_matrix, dtype=np.uint8)) if not hasattr(check_matrix, "tocsr") else check_matrix.tocsr()
+        O = csr_matrix(np.asarray(observables_matrix, dtype=np.uint8)) if not hasattr(observables_matrix, "tocsr") else observables_matrix.tocsr()
         relay_decoder = relay_bp.RelayDecoderF64(
-            cm.check_matrix,
-            error_priors=cm.error_priors,
+            H,
+            error_priors=np.asarray(error_priors, dtype=float),
             gamma0=self._gamma0,
             pre_iter=self._pre_iter,
             num_sets=self._num_sets,
@@ -134,9 +149,7 @@ class RelayBPDecoder(Decoder):
             gamma_dist_interval=self._gamma_dist_interval,
             stop_nconv=self._stop_nconv,
         )
-        self._observable_decoder = relay_bp.ObservableDecoderRunner(
-            relay_decoder, cm.observables_matrix
-        )
+        self._observable_decoder = relay_bp.ObservableDecoderRunner(relay_decoder, O)
 
     def decode_batch(self, detection_events: np.ndarray) -> np.ndarray:
         if self._observable_decoder is None:

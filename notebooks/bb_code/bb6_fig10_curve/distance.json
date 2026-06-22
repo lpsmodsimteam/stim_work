@@ -1,0 +1,9 @@
+{
+  "rounds": 6,
+  "single_sector": true,
+  "sector_type": 0,
+  "distance": 6,
+  "onset": 3,
+  "onset_fraction": 2.3239e-05,
+  "exact_pin": true
+}

@@ -1,0 +1,16 @@
+{
+  "n_logicals_nosym": 84,
+  "n_logicals_sym": 84,
+  "n_logicals": 84,
+  "n_restrictions": 1392,
+  "N": 72,
+  "D": 6,
+  "K": 12,
+  "elapsed_nosym_s": 5.280867800000124,
+  "elapsed_sym_s": 5.269895100034773,
+  "paper_n_logicals": 84,
+  "paper_n_restrictions": 1392,
+  "systematic": true,
+  "random_trials": 5000,
+  "osd_order": 10
+}

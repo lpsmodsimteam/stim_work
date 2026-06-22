@@ -24,6 +24,7 @@ bench_results_*.json
 sweep_out/
 splitting_vs_is.png
 bb6_fig10_out*/
+*.log
 
 # Keys / secrets
 githubkey

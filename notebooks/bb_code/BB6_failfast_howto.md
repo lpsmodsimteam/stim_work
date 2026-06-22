@@ -1,4 +1,4 @@
-# Reproducing Figure 10 (BB(6) Relay-BP line) of arXiv:2511.15177
+# Running the BB(6) fail-fast pipeline (arXiv:2511.15177): Table 2, Figures 9 & 10
 
 `bb6_fig10_sweep.py` reproduces the logical-error-rate-vs-physical-error-rate curve for the
 distance-6 bivariate bicycle code **BB(6) = [[72,12,6]]** under circuit-level depolarizing

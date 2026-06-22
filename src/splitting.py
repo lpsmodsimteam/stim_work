@@ -70,18 +70,16 @@ n-seeds and watch the per-seed spread.)
 
 KNOWN LIMITATION (single-flip mixing). The proposal flips one of N_exp~2e5 expanded
 columns per step, so at low q an "add" is accepted with prob ~q/(1-q)~q. The chain
-moves only ~q per step and needs O(1/q) steps to equilibrate — the illustrative
-chain-steps above are likely orders of magnitude too short at the lower ladder
-levels. Compounding this: every level is currently seeded from the SAME fixed seed
-pool, NOT warm-started from the adjacent higher-q level's final configs as the
-paper's splitting prescribes, so lower levels start cold from too-high-weight
-configs and bias their ratios downward. Treat this as a scaffold to validate
-against IS where they overlap, not yet a converged low-p extrapolator. See
-SPLITTING.md "caveats" for recommended next steps.
+moves only ~q per step and needs O(1/q) steps to equilibrate. At p=0.001,
+q~6.7e-5, so chain_steps=4000 gives ~0.3 expected moves — essentially frozen.
+Use chain_steps >= 50_000 and keep p_low >= 0.003 for meaningful mixing.
+Warm-starting between levels (paper §5 prescription) is now implemented: each
+level's chains start from the final states of the previous level's chains.
 """
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
 
@@ -153,6 +151,8 @@ def min_weight_logical_seeds(
     distance: Optional[int] = None,
     max_trials: int = 400,
     seed: Optional[int] = None,
+    sector: Optional[int] = None,
+    supports=None,
 ) -> List[FrozenSet[int]]:
     """Technique-II min-weight logicals lifted to failing expanded-column seeds.
 
@@ -163,11 +163,11 @@ def min_weight_logical_seeds(
     only configs that actually fail under ``decoder`` (they should, being logicals,
     but BP-OSD's min-weight search is heuristic, so we verify each).
     """
-    from min_weight import find_min_weight_logicals
-
-    supports = find_min_weight_logicals(
-        circuit, distance, max_trials=max_trials, seed=seed
-    )
+    if supports is None:
+        from min_weight import find_min_weight_logicals
+        supports = find_min_weight_logicals(
+            circuit, distance, max_trials=max_trials, seed=seed, sector=sector
+        )
     m2c = _mech_to_cols(col_to_mech)
     seeds: List[FrozenSet[int]] = []
     for support in supports:
@@ -264,9 +264,13 @@ def _metropolis_chain(
     burn_in: int,
     thin: int,
     rng: np.random.Generator,
-) -> ChainResult:
+) -> Tuple[ChainResult, FrozenSet[int]]:
     """Run one failure-restricted Metropolis chain targeting π_{q_cur}, accumulating
     the reweighting term toward q_next in log-space.
+
+    Returns (ChainResult, final_config) where final_config is the chain's last state
+    (always a failing config — the chain never leaves the failing set). Pass it as
+    seed_config for the next ladder level to warm-start the chain.
 
     Proposal: pick a uniform expanded column c in {0..N_exp-1}; if c is in the
     current set, propose removing it (|x| -> |x|-1), else propose adding it
@@ -331,7 +335,7 @@ def _metropolis_chain(
         n_samples=int(log_terms_arr.size),
         log_ratio_mean=log_ratio_mean,
         log_ratio_terms=log_terms_arr,
-    )
+    ), frozenset(cur)
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +428,9 @@ def splitting_estimate(
     min_weight_max_trials: int = 400,
     distance: Optional[int] = None,
     seed: Optional[int] = None,
+    single_sector: bool = False,
+    sector: int = 0,
+    mw_supports=None,
 ) -> SplittingResult:
     """Multi-seeded Metropolis splitting estimate of P_logical from p_high to p_low.
 
@@ -457,11 +464,22 @@ def splitting_estimate(
     """
     rng = np.random.default_rng(seed)
 
-    probs, det_mat, obs_mat = _parse_dem(circuit)
-    col_to_mech, q_base, _ = _expand(probs, q_base)
+    if single_sector:
+        # Stim circuit -> single Z-sector projection (the paper's representation), decoded by
+        # Relay-BP on the projected matrices — matching the IS sweep's representation so the
+        # splitting cross-check is on the SAME N/q_base, not the full both-sector DEM.
+        from min_weight import single_sector_dem
+        H, A, mult, probs_merged, _ = single_sector_dem(circuit, detector_type=sector)
+        det_mat = H.T.astype(bool); obs_mat = A.T.astype(bool)
+        if q_base is None:
+            q_base = float(_parse_dem(circuit)[0].min())   # expansion base rate (~p/15)
+        col_to_mech = np.repeat(np.arange(H.shape[1], dtype=np.int64), mult)
+        decoder.setup_from_matrices(H, probs_merged, A)
+    else:
+        probs, det_mat, obs_mat = _parse_dem(circuit)
+        col_to_mech, q_base, _ = _expand(probs, q_base)
+        decoder.setup(circuit)
     N_exp = col_to_mech.shape[0]
-
-    decoder.setup(circuit)
 
     if n_levels < 1:
         raise ValueError("n_levels must be >= 1")
@@ -489,6 +507,8 @@ def splitting_estimate(
             circuit, col_to_mech, det_mat, obs_mat, decoder,
             distance=distance, max_trials=min_weight_max_trials,
             seed=int(rng.integers(2**31)),
+            sector=(sector if single_sector else None),
+            supports=mw_supports,
         )
 
     # Assemble the seed pool: a mix of (b) min-weight and (a) typical seeds.
@@ -512,25 +532,32 @@ def splitting_estimate(
 
     # Run a chain per (level, seed). Each level's chain targets π_{q_i} and
     # measures the reweight term toward q_{i+1}.
+    # Warm-starting: after each level the final chain states (always failing configs)
+    # become the seeds for the next level, matching the paper's prescription (§5).
     per_level_chains: List[List[ChainResult]] = []
     combined_log_ratio = np.zeros(n_levels)
     combined_log_ratio_se = np.zeros(n_levels)
+
+    level_seeds = list(chosen_seeds)  # updated after each level (warm-start)
 
     for i in range(n_levels):
         q_cur = float(q_ladder[i])
         q_next = float(q_ladder[i + 1])
         chains: List[ChainResult] = []
+        next_level_seeds: List[FrozenSet[int]] = []
         per_seed_log_ratio: List[float] = []
-        for sc in chosen_seeds:
-            cr = _metropolis_chain(
+        for sc in level_seeds:
+            cr, final_cfg = _metropolis_chain(
                 det_mat, obs_mat, col_to_mech, decoder,
                 q_cur, q_next, sc,
                 chain_steps=chain_steps, burn_in=burn_in, thin=thin,
                 rng=np.random.default_rng(int(rng.integers(2**31))),
             )
             chains.append(cr)
+            next_level_seeds.append(final_cfg)
             if np.isfinite(cr.log_ratio_mean):
                 per_seed_log_ratio.append(cr.log_ratio_mean)
+        level_seeds = next_level_seeds  # warm-start: carry final states to next level
         per_level_chains.append(chains)
 
         # Pool all per-sample terms across seeds for the combined ratio estimate.
@@ -576,6 +603,217 @@ def splitting_estimate(
         p_ref=p_ref,
         n_expanded=N_exp,
     )
+
+
+def _local_metropolis(cur, q, n_steps, det_mat, obs_mat, col_to_mech, decoder, rng):
+    """In-place Metropolis-Hastings on the failing-set-restricted target q^|x|(1-q)^(N-|x|),
+    using a **balanced** add/remove proposal so weight mixes in O(steps), not O(N).
+
+    Each step proposes (50/50) adding a uniform non-member or removing a uniform member; the
+    Hastings factor (N-|x|)/(|x|+1) [add] or |x|/(N-|x|+1) [remove] corrects the asymmetric
+    proposal. `cur` is a set of expanded columns (must already fail); returns the accept count.
+    """
+    N_exp = col_to_mech.shape[0]
+    log_odds = np.log(q) - np.log1p(-q)
+    logN = np.log(N_exp)
+    accepts = 0
+    for _ in range(n_steps):
+        nx = len(cur)
+        if nx == 0 or rng.random() < 0.5:
+            # propose ADD a uniform non-member; accept min(1, q/(1-q) * (N-nx)/(nx+1))
+            c = int(rng.integers(N_exp))
+            while c in cur:
+                c = int(rng.integers(N_exp))
+            log_acc = log_odds + np.log(N_exp - nx) - np.log(nx + 1)
+            if np.log(rng.random()) < min(0.0, log_acc):
+                cur.add(c)
+                if _config_fails(det_mat, obs_mat, col_to_mech, cur, decoder):
+                    accepts += 1
+                else:
+                    cur.discard(c)
+        else:
+            # propose REMOVE a uniform member; accept min(1, (1-q)/q * nx/(N-nx+1))
+            c = next(itertools.islice(cur, int(rng.integers(nx)), None))
+            log_acc = -log_odds + np.log(nx) - np.log(N_exp - nx + 1)
+            if np.log(rng.random()) < min(0.0, log_acc):
+                cur.discard(c)
+                if _config_fails(det_mat, obs_mat, col_to_mech, cur, decoder):
+                    accepts += 1
+                else:
+                    cur.add(c)
+    return accepts
+
+
+def replica_exchange_estimate(
+    circuit: stim.Circuit,
+    decoder,
+    *,
+    p_ref: float,
+    p_high: float,
+    p_low: float,
+    n_levels: int,
+    n_walkers: int = 12,
+    local_steps: int = 25,
+    n_sweeps: int = 400,
+    burn_in: int = 100,
+    thin: int = 1,
+    anchor_shots: int = 5000,
+    q_base: Optional[float] = None,
+    distance: Optional[int] = None,
+    seed: Optional[int] = None,
+    single_sector: bool = False,
+    sector: int = 0,
+    mw_supports=None,
+    verbose: bool = True,
+) -> Tuple[SplittingResult, dict]:
+    """Replica-exchange (parallel-tempering) splitting estimate of P_logical(p_low).
+
+    Fixes the weight-space non-mixing of :func:`splitting_estimate`: instead of independent
+    warm-started chains (which stay trapped near their seed weight), it runs ``n_walkers``
+    walkers, each holding one failing replica per ladder rate, and alternates local single-flip
+    Metropolis moves with **swaps between adjacent rates**. Swaps need no decode (both configs
+    already fail) and accept with log A = (|x_{i+1}|-|x_i|)(logodds_i - logodds_{i+1}), so
+    high-weight configs migrate up-ladder and low-weight down — equilibrating each level's weight
+    distribution `pi_{q_i}(w) ~ f(w) C(N,w) q^w (1-q)^(N-w)`, which is what the reweight ratio needs.
+
+    Returns (SplittingResult, diagnostics) where diagnostics has per-pair swap-accept rates and
+    per-level mean weights (mean weight should rise with q when mixed).
+    """
+    rng = np.random.default_rng(seed)
+
+    if single_sector:
+        from min_weight import single_sector_dem
+        H, A, mult, probs_merged, _ = single_sector_dem(circuit, detector_type=sector)
+        det_mat = H.T.astype(bool); obs_mat = A.T.astype(bool)
+        if q_base is None:
+            q_base = float(_parse_dem(circuit)[0].min())
+        col_to_mech = np.repeat(np.arange(H.shape[1], dtype=np.int64), mult)
+        decoder.setup_from_matrices(H, probs_merged, A)
+    else:
+        probs, det_mat, obs_mat = _parse_dem(circuit)
+        col_to_mech, q_base, _ = _expand(probs, q_base)
+        decoder.setup(circuit)
+    N_exp = col_to_mech.shape[0]
+    L = n_levels
+    if L < 1:
+        raise ValueError("n_levels must be >= 1")
+
+    p_ladder = np.geomspace(p_high, p_low, L + 1)
+    q_ladder = np.clip(q_base * (p_ladder / p_ref), 1e-300, 1.0 - 1e-15)
+    logodds = np.log(q_ladder) - np.log1p(-q_ladder)               # per level
+    log_r_next = np.log(q_ladder[1:]) - np.log(q_ladder[:-1])      # toward q_{i+1}
+    log_r_1m = np.log1p(-q_ladder[1:]) - np.log1p(-q_ladder[:-1])
+
+    # Anchor P(q_0) by direct MC (also harvests typical high-rate failing seeds).
+    P_high, P_high_se, mc_seeds = _direct_mc_failure_prob(
+        det_mat, obs_mat, col_to_mech, decoder, float(q_ladder[0]), anchor_shots, rng)
+    if P_high <= 0.0:
+        raise ValueError(f"direct MC at p_high={p_high:g} saw no failures; raise p_high/anchor_shots")
+
+    # Failing-config seed pool: min-weight logicals (low weight) + MC typical (high weight).
+    pool: List[FrozenSet[int]] = []
+    pool += min_weight_logical_seeds(circuit, col_to_mech, det_mat, obs_mat, decoder,
+                                     distance=distance, seed=int(rng.integers(2**31)),
+                                     sector=(sector if single_sector else None), supports=mw_supports)
+    pool += mc_seeds
+    if not pool:
+        raise ValueError("no failing seed configs found")
+
+    # Initialise walkers: each is a list of L+1 failing configs (one per rate). Seed lower rates
+    # with low-weight (min-weight) configs and higher rates with high-weight (MC) configs when
+    # available, to give tempering a head start; swaps fix any mismatch.
+    lo_pool = [s for s in pool if len(s) <= distance + 4] or pool   # low-weight (min-weight logicals)
+    hi_pool = mc_seeds or pool                                       # high-weight (typical at q_high)
+    def pick(p): return set(p[int(rng.integers(len(p)))])
+    # level 0 = highest q (seed high weight) ... level L = lowest q (seed low weight)
+    replicas = [[pick(hi_pool if i <= L // 2 else lo_pool) for i in range(L + 1)]
+                for _ in range(n_walkers)]
+
+    swap_attempts = np.zeros(L); swap_accepts = np.zeros(L)
+    walker_terms = [[[] for _ in range(L)] for _ in range(n_walkers)]
+    wsum = np.zeros(L + 1); wcount = 0
+
+    M = det_mat.shape[1]; K = obs_mat.shape[1]
+    for sweep in range(n_sweeps):
+        # (a) local moves — balanced add/remove proposal, with the failing-set indicator decoded
+        #     in ONE batch across all replicas per sub-step (failing is q-independent).
+        for _sub in range(local_steps):
+            cands = []  # (w, i, candidate_set)
+            for w in range(n_walkers):
+                for i in range(L + 1):
+                    cur = replicas[w][i]; nx = len(cur); lo = float(logodds[i])
+                    if nx == 0 or rng.random() < 0.5:
+                        c = int(rng.integers(N_exp))
+                        while c in cur:
+                            c = int(rng.integers(N_exp))
+                        log_acc = lo + np.log(N_exp - nx) - np.log(nx + 1)
+                        adding = True
+                    else:
+                        c = next(itertools.islice(cur, int(rng.integers(nx)), None))
+                        log_acc = -lo + np.log(nx) - np.log(N_exp - nx + 1)
+                        adding = False
+                    if np.log(rng.random()) < min(0.0, log_acc):
+                        cand = set(cur)
+                        cand.add(c) if adding else cand.discard(c)
+                        cands.append((w, i, cand))
+            if cands:
+                synd = np.zeros((len(cands), M), dtype=bool); truth = np.zeros((len(cands), K), dtype=bool)
+                for k, (w, i, cand) in enumerate(cands):
+                    synd[k], truth[k] = _config_syndrome_truth(det_mat, obs_mat, col_to_mech, cand)
+                preds = decoder.decode_batch(synd)
+                fails = np.any(preds != truth, axis=1)
+                for k, (w, i, cand) in enumerate(cands):
+                    if fails[k]:
+                        replicas[w][i] = cand           # accept (still failing); else keep old
+        # (b) swaps on adjacent pairs (even then odd) — no decode needed
+        for parity in (0, 1):
+            for i in range(parity, L, 2):
+                d_logodds = float(logodds[i] - logodds[i + 1])
+                for w in range(n_walkers):
+                    xi, xj = replicas[w][i], replicas[w][i + 1]
+                    swap_attempts[i] += 1
+                    logA = (len(xj) - len(xi)) * d_logodds
+                    if np.log(rng.random()) < min(0.0, logA):
+                        replicas[w][i], replicas[w][i + 1] = xj, xi
+                        swap_accepts[i] += 1
+        # (c) collect reweight terms + weights (post burn-in)
+        if sweep >= burn_in and ((sweep - burn_in) % thin == 0):
+            wcount += 1
+            for w in range(n_walkers):
+                for i in range(L + 1):
+                    wsum[i] += len(replicas[w][i])
+                for i in range(L):
+                    wt = len(replicas[w][i])
+                    walker_terms[w][i].append(wt * log_r_next[i] + (N_exp - wt) * log_r_1m[i])
+
+    # Combine: pooled logsumexp per level; SE from per-walker spread.
+    combined = np.zeros(L); combined_se = np.zeros(L)
+    for i in range(L):
+        all_terms = np.concatenate([np.asarray(walker_terms[w][i]) for w in range(n_walkers)
+                                    if walker_terms[w][i]])
+        combined[i] = float(logsumexp(all_terms) - np.log(all_terms.size)) if all_terms.size else -np.inf
+        per_w = [float(logsumexp(np.asarray(walker_terms[w][i])) - np.log(len(walker_terms[w][i])))
+                 for w in range(n_walkers) if walker_terms[w][i]]
+        combined_se[i] = float(np.std(per_w, ddof=1) / np.sqrt(len(per_w))) if len(per_w) > 1 else np.nan
+
+    log_P = np.log(max(P_high, 1e-300)) + np.concatenate([[0.0], np.cumsum(combined)])
+    P_logical = np.exp(log_P)
+    rel = np.sqrt((P_high_se / P_high if P_high > 0 else 0.0) ** 2
+                  + np.concatenate([[0.0], np.cumsum(np.nan_to_num(combined_se) ** 2)]))
+    diag = {"swap_accept": (swap_accepts / np.maximum(swap_attempts, 1)).tolist(),
+            "mean_weight": (wsum / max(wcount * n_walkers, 1)).tolist(),
+            "P_high": float(P_high), "n_pool": len(pool), "n_collect": int(wcount)}
+    if verbose:
+        print(f"  [tempering] anchor P(q0)={P_high:.3e}, pool={len(pool)}, collected {wcount} sweeps", flush=True)
+        print(f"  [tempering] swap-accept (adj pairs): "
+              f"{', '.join(f'{x:.2f}' for x in diag['swap_accept'])}", flush=True)
+        print(f"  [tempering] mean weight by level (hi-q..lo-q): "
+              f"{', '.join(f'{x:.1f}' for x in diag['mean_weight'])}", flush=True)
+    return SplittingResult(
+        q_ladder=q_ladder, p_ladder=p_ladder, P_logical=P_logical, P_logical_se=P_logical * rel,
+        log_ratios=combined, log_ratios_se=combined_se, P_high=P_high, P_high_se=P_high_se,
+        per_level_chains=[], n_seeds_used=n_walkers, q_base=q_base, p_ref=p_ref, n_expanded=N_exp,
+    ), diag
 
 
 # ---------------------------------------------------------------------------

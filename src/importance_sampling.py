@@ -20,12 +20,16 @@ Reweighting formula (Eq. 3 of the paper):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
-import stim
 from scipy.optimize import least_squares
 from scipy.special import gammaln
+
+if TYPE_CHECKING:                # stim is used only in `circuit: stim.Circuit` annotations, which
+    import stim                  # `from __future__ import annotations` keeps as strings — so stim
+                                 # is not needed at runtime. Keeping it lazy lets the failure-spectrum
+                                 # ansatz tools (and the report notebook) run without stim installed.
 
 
 # ---------------------------------------------------------------------------
