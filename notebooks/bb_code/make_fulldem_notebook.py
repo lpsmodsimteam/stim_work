@@ -20,16 +20,18 @@ detector error model** — the honest, un-projected representation — and **com
 
 | Technique | Single-sector report | This (full DEM) |
 |---|---|---|
-| **II** — min-weight onset (D, w0, f0, \|L(D)\|, \|F\|) | exact meet-in-the-middle | **BP-OSD search**, validated by search-saturation |
-| **I** — failure-spectrum ansatz + IS → LER(p) | f3/f5 pinned at the exact onset | f3/f5 pinned at the search onset |
+| **II** — min-weight onset (D, w0, f0, \|L(D)\|, \|F\|) | exact meet-in-the-middle | **exact MITM** (optimized pivot-chain) — the BP-OSD search *undercounts* \|L(D)\| ~7× |
+| **I** — failure-spectrum ansatz + IS → LER(p) | f3/f5 pinned at the exact onset | f3/f5 pinned at the **exact** onset |
 | **III** — replica-exchange splitting | cross-check to 1e-4 | cross-check to 1e-4 |
-| **convergence** | — | **search saturation** + **Relay-BP decoder convergence** |
+| **convergence** | — | **search-vs-exact** + **Relay-BP decoder convergence** |
 
 **Why the full DEM differs:** the single-sector representation merges fault mechanisms that differ only
 in their *other*-sector detectors; the full DEM does not. The fault distance D is representation-
-independent (expect D=6, w0=3), but Ñ, N, \|L(D)\|, \|F\|, f0 and the LER differ. The full DEM has **no
-exact MITM enumeration** (that is single-sector-specific at this scale), so its Table-2 numbers come
-from the BP-OSD search and are validated by the **search-saturation** plot.
+independent (D=6, w0=3), but Ñ, N, \|L(D)\|, \|F\|, f0 and the LER differ. The full-DEM Table 2 is computed
+by the **exact** detector-pivot MITM (the optimized `exact_min_weight_logicals_mitm`, ~46 min on the
+full DEM). The BP-OSD *search* is run too — but it **saturates at only ~15% of the true \|L(D)\|** (a
+false plateau, since BP-OSD is not a guaranteed min-weight decoder), which the convergence plot exposes.
+So the exact MITM, not the search, pins the ansatz onset f0.
 
 All heavy computation was done by `bb6_fig10_sweep.py --full-dem --decoder-conv`; this notebook loads
 `bb6_fulldem_curve/` and re-fits/re-plots (fast).""")
@@ -58,11 +60,11 @@ m = R["meta"]
 print(f"loaded {FULL_DIR.name} in {time.time()-_t:.0f}s — representation: "
       f"{'full both-sector DEM' if not m['single_sector'] else 'single-sector'}, method={m['method']}")''')
 
-md(r"""## Technique II — min-weight onset on the full DEM (search-derived Table 2)
+md(r"""## Technique II — exact min-weight onset on the full DEM (MITM)
 
-The full-DEM Table-2 quantities come from the BP-OSD search (`find_min_weight_logicals(sector=None)`),
-not the exact MITM (single-sector only). Their completeness is established by the **search-saturation**
-plot below.""")
+The full-DEM Table-2 quantities are the **exact** detector-pivot MITM (`exact_min_weight_logicals_mitm`,
+`distance_mitm.json`). The BP-OSD *search* is also run, but undercounts (next section), so the report
+prefers the exact counts and pins the ansatz onset f0 to them.""")
 
 code('''m = R["meta"]
 def _f(x): return "—" if x is None else (f"{x:.4g}" if isinstance(x, (int, float)) else str(x))
@@ -76,8 +78,10 @@ print(f"f0 = f*(D/2)  : {_f(m['f0'])}")''')
 
 md(r"""## Convergence diagnostics
 
-**(left) Search saturation** — `|L(D)|` found vs cumulative search trials; the plateau means the
-search found *all* minimum-weight logicals, so the search-derived Table-2 counts are complete.
+**(left) Search vs exact** — `|L(D)|` found by the BP-OSD search vs cumulative trials. It *plateaus*,
+which looks like completeness — but the exact MITM line shows the search saturates at only **~15%** of
+the true `|L(D)|`. BP-OSD is not a guaranteed min-weight decoder, so the search-saturation heuristic is
+**not** a reliable completeness check here; the exact MITM is authoritative (and is what pins f0).
 **(right) Relay-BP decoder convergence** — logical error rate (and disagreement with the most-legs
 decoder) vs the number of relay legs; the plateau / disagreement→0 shows the decoder has enough legs
 to be reliable on the full DEM.""")

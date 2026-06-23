@@ -39,7 +39,13 @@ def compute(outdir=DEFAULT_OUT, bootstrap=150, seed=0):
     p_ref = float(cfg.get("p_ref", 0.003))
     w = np.asarray(npz["spectrum_weights"]); F = np.asarray(npz["spectrum_failures"]); T = np.asarray(npz["spectrum_trials"])
     N = int(npz["n_expanded"]); q_base = float(npz["q_base"])
-    f0 = float(npz["onset_fraction"]); w0 = int(npz["onset"])
+    # Prefer the exact-MITM Table 2 (distance_mitm.json) over the BP-OSD search (distance.json) for
+    # BOTH the ansatz onset pin (f0/w0) and the Table-2 meta: the search can undercount |L(D)| even
+    # when its saturation curve looks complete, so the exact enumeration wins and re-pins f0.
+    _dm = outdir / "distance_mitm.json"; _ds = outdir / "distance.json"
+    dist = json.loads((_dm if _dm.exists() else _ds).read_text()) if (_dm.exists() or _ds.exists()) else {}
+    f0 = float(dist.get("onset_fraction", npz["onset_fraction"]))
+    w0 = int(dist.get("onset", npz["onset"]))
     p_grid = np.asarray(npz["ansatz_p"])
     isp, isL, isSE = np.asarray(npz["p_values"]), np.asarray(npz["is_P_logical"]), np.asarray(npz["is_P_logical_se"])
 
@@ -79,10 +85,8 @@ def compute(outdir=DEFAULT_OUT, bootstrap=150, seed=0):
     if rp.exists():
         repro = json.loads(rp.read_text())    # {seeds, p_ladder, mean, rel_spread, quoted_rel_se, ...}
 
-    # Representation/Table-2 metadata: distance.json carries the full Table-2 quantities for the
-    # full-DEM (search) path; the single-sector path is the exact-MITM-pinned EXACT constants. `meta`
-    # lets the report show either without single-sector-specific assumptions baked into the figures.
-    dist = json.loads((outdir / "distance.json").read_text()) if (outdir / "distance.json").exists() else {}
+    # Representation/Table-2 metadata: `dist` above already prefers the exact-MITM distance_mitm.json
+    # over the search distance.json. The single-sector path is the exact-MITM-pinned EXACT constants.
     single_sector = bool(dist.get("single_sector", cfg.get("mw_single_sector", True)))
     meta = dict(single_sector=single_sector,
                 code_label=cfg.get("code_label", "BB(6)=[[72,12,6]]"),
@@ -294,9 +298,10 @@ def fig_weight_vs_p(R, ax=None):
 
 
 def fig_search_convergence(R, ax=None):
-    """Search saturation: |L(D)| found vs cumulative BP-OSD search trials. The plateau means the
-    search found every minimum-weight logical — the completeness check for the search-derived
-    full-DEM Table 2 (no exact MITM there). Validated where an exact MITM count is available."""
+    """Search saturation: |L(D)| found vs cumulative BP-OSD search trials. The plateau LOOKS like
+    completeness — but where an exact-MITM count is available it is overlaid, and on the full DEM it
+    exposes that the BP-OSD search saturates well *below* the true |L(D)| (BP-OSD is not a guaranteed
+    min-weight decoder), so the exact enumeration — not the search plateau — is authoritative."""
     import matplotlib.pyplot as plt
     if ax is None:
         _, ax = plt.subplots(figsize=(8.4, 5.2))
@@ -310,14 +315,22 @@ def fig_search_convergence(R, ax=None):
     total = sc.get("n_systematic", 0) + sc.get("max_trials", 0)
     if total > x[-1]:                                   # extend to the full budget so the plateau shows
         x = np.append(x, total); y = np.append(y, y[-1])
-    ax.step(x, y, where="post", color="teal", lw=2, label="|L(D)| found")
+    ax.step(x, y, where="post", color="teal", lw=2, label="|L(D)| found (BP-OSD search)")
     nsys = sc.get("n_systematic", 0)
     if nsys:
         ax.axvline(nsys, color="gray", ls=":", lw=1, label=f"systematic→random ({nsys})")
-    ax.axhline(y[-1], color="crimson", ls="--", lw=1, label=f"saturated |L(D)| = {int(sc['final'])}")
+    ax.axhline(y[-1], color="teal", ls="--", lw=1, label=f"search plateau = {int(sc['final'])}")
+    # Overlay the EXACT MITM |L(D)| when it is the authoritative count (full-DEM mitm_exact) and the
+    # search undershot it — the gap is the search's incompleteness.
+    meta = R.get("meta") or {}
+    exact = meta.get("n_min_logicals")
+    if meta.get("method") == "mitm_exact" and exact and abs(exact - y[-1]) > 0.01 * max(exact, 1):
+        ax.axhline(exact, color="crimson", ls="-", lw=2,
+                   label=f"exact MITM |L(D)| = {int(exact)}  ← search found only {int(y[-1])} ({100*y[-1]/exact:.0f}%)")
+        ax.set_ylim(0, exact * 1.08)
     rep = "single-sector" if sc.get("single_sector") else "full DEM"
     ax.set_xlabel("cumulative search trials"); ax.set_ylabel("|L(D)| found")
-    ax.set_title(f"Min-weight search saturation ({rep})")
+    ax.set_title(f"Min-weight search vs exact MITM ({rep})")
     ax.legend(fontsize=8, loc="lower right"); ax.grid(True, alpha=0.3)
     return ax
 

@@ -1,0 +1,15 @@
+{
+  "rounds": 6,
+  "single_sector": false,
+  "sector_type": null,
+  "method": "mitm_exact",
+  "distance": 6,
+  "onset": 3,
+  "n_compressed": 16164,
+  "n_expanded": 68940,
+  "n_min_logicals": 2088,
+  "n_min_logicals_expanded": 261379316700,
+  "fail_count": 69740448,
+  "onset_fraction": 1.2771474632024192e-06,
+  "mitm_seconds": 2789.6
+}
