@@ -2,8 +2,9 @@
 
 The full-DEM analog of split_crosscheck.py. Runs the **tempered** replica-exchange estimate only —
 the over/under sequential bracket needs single-sector min-weight seeds, and the tempered estimate is
-the accurate one anyway. Reduced settings: full-DEM decodes are ~10-50x slower than the single Z-sector,
-so this is a near-threshold (6e-3 -> 3e-3) run of ~tens of minutes rather than the deep single-sector run.
+the accurate one anyway. Deep run: ladder 6e-3 -> 1e-4 (40 levels). Full-DEM decodes are ~100x+ slower
+than the single Z-sector (heavier near-threshold configs), so this is a multi-hour / overnight job; a
+keep-awake guard holds the system on for its duration since the run does not checkpoint.
 
 Writes bb6_fulldem_curve/splitting.json {tempered, diagnostics}; bb6_report consumes it (the bracket
 band is optional and simply omitted here). replica_exchange_estimate batches decodes via the relay
@@ -17,21 +18,37 @@ from bb_code_sim import BB_72_12_6, build_bb_circuit, RelayBPDecoder
 from surface_code_sim import ErrorModel
 from splitting import replica_exchange_estimate
 
-P_REF, P_HIGH, P_LOW, NLEV = 0.003, 0.006, 0.003, 12
+P_REF, P_HIGH, P_LOW, NLEV = 0.003, 0.006, 1e-4, 40   # deep overnight run: anchor 6e-3 -> 1e-4
 
 
 def _dec():
     return RelayBPDecoder(gamma0=0.125, pre_iter=80, num_sets=100, set_max_iter=60, stop_nconv=6)
 
 
+def _keep_awake(enable):
+    """Prevent Windows from sleeping while this long (no-checkpoint) run executes; release on exit.
+    ES_CONTINUOUS=0x80000000, ES_SYSTEM_REQUIRED=0x1, ES_AWAYMODE_REQUIRED=0x40. No-op off-Windows."""
+    try:
+        import ctypes
+        flags = 0x80000000 | (0x00000001 | 0x00000040 if enable else 0)
+        ctypes.windll.kernel32.SetThreadExecutionState(flags)
+    except Exception:
+        pass
+
+
 def main():
     circuit = build_bb_circuit(BB_72_12_6, ErrorModel(p_phys=P_REF, p_meas=P_REF), rounds=6, idle_noise=True)
-    print("tempered (replica exchange, full both-sector DEM) ...", flush=True)
+    print(f"tempered (replica exchange, full both-sector DEM), ladder {P_HIGH:.0e}->{P_LOW:.0e}, "
+          f"{NLEV} levels ...", flush=True)
+    _keep_awake(True)                                     # hold the system awake for the whole run
     t0 = time.time()
-    temper, diag = replica_exchange_estimate(
-        circuit, _dec(), p_ref=P_REF, p_high=P_HIGH, p_low=P_LOW, n_levels=NLEV,
-        n_walkers=6, local_steps=6, n_sweeps=200, burn_in=60, anchor_shots=2000,
-        distance=6, seed=42, single_sector=False)        # full DEM (sector=None internally)
+    try:
+        temper, diag = replica_exchange_estimate(
+            circuit, _dec(), p_ref=P_REF, p_high=P_HIGH, p_low=P_LOW, n_levels=NLEV,
+            n_walkers=6, local_steps=6, n_sweeps=200, burn_in=60, anchor_shots=2000,
+            distance=6, seed=42, single_sector=False)     # full DEM (sector=None internally)
+    finally:
+        _keep_awake(False)
     dt = time.time() - t0
     pl = np.asarray(temper.p_ladder); tP = np.asarray(temper.P_logical); tSE = np.asarray(temper.P_logical_se)
     out = {"tempered": {"p_ladder": pl.tolist(), "P_logical": tP.tolist(), "P_logical_se": tSE.tolist()},
