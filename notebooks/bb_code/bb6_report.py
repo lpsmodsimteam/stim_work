@@ -170,7 +170,8 @@ def splitting_comparison(R):
         bar = "se"
     ans = np.asarray(logical_error_rate_from_ansatz(R["fits"]["f3"], list(tp)))
     ratio = tP / np.maximum(ans, 1e-300)
-    inb = np.array([r["inside_bracket"] for r in s["compare"]], dtype=bool)
+    # inside_bracket is optional (the over/under bracket is only run for some representations).
+    inb = np.array([r.get("inside_bracket", False) for r in s.get("compare", [])], dtype=bool)
     # "valid" = ansatz lies within the (honest) error bar, i.e. consistent within ~1 sigma.
     consistent = np.abs(tP - ans) <= np.maximum(tSE, 1e-300)
     return dict(p=tp, tP=tP, tSE=tSE, ansatz=ans, ratio=ratio, bar=bar,
@@ -210,9 +211,9 @@ def fig_ler_vs_p(R, ax=None):
         # sweeping it down to ~1e-18. Validity is de-aliased agreement with the ansatz.
         c = splitting_comparison(R)
         tp, tP, tSE, valid = c["p"], c["tP"], c["tSE"], c["valid"]
-        bp = np.array(s["bracket"]["p_ladder"]); blo = np.array(s["bracket"]["lo"]); bhi = np.array(s["bracket"]["hi"])
         inb = c["inside_bracket"]
-        if inb.any():
+        if s.get("bracket") and inb.any():     # bracket band only if the run produced one (optional)
+            bp = np.array(s["bracket"]["p_ladder"]); blo = np.array(s["bracket"]["lo"]); bhi = np.array(s["bracket"]["hi"])
             ax.fill_between(bp[inb], blo[inb], bhi[inb], color="seagreen", alpha=0.12,
                             label="Technique III: splitting bracket (near-threshold mixing check)")
         lbl = ("Technique III: replica-exchange (3-run mean ± run-to-run spread)"
