@@ -88,7 +88,9 @@ def compute(outdir=DEFAULT_OUT, bootstrap=150, seed=0):
     # Representation/Table-2 metadata: `dist` above already prefers the exact-MITM distance_mitm.json
     # over the search distance.json. The single-sector path is the exact-MITM-pinned EXACT constants.
     single_sector = bool(dist.get("single_sector", cfg.get("mw_single_sector", True)))
-    meta = dict(single_sector=single_sector,
+    pmf = float(cfg.get("p_meas_factor", 1.0))
+    noise_label = "symmetric" if pmf == 1.0 else f"p_meas={pmf:g}×p_phys"
+    meta = dict(single_sector=single_sector, p_meas_factor=pmf, noise_label=noise_label,
                 code_label=cfg.get("code_label", "BB(6)=[[72,12,6]]"),
                 method=dist.get("method", "mitm_exact" if dist.get("exact_pin") else "search"),
                 D=int(dist.get("distance", 2 * w0)), w0=w0, N=N, f0=f0,
@@ -365,39 +367,84 @@ def fig_decoder_convergence(R, ax=None):
     return ax
 
 
-def fig_compare_ler(R_single, R_full, ax=None):
-    """Overlay the LER(p) curves (f3 ansatz + IS points) for the single-sector and full-DEM runs."""
+def _run_label(R):
+    """Label distinguishing a run by representation + noise model (for comparison plots/tables)."""
+    m = R["meta"]
+    rep = "single-sector" if m.get("single_sector", True) else "full DEM"
+    return f"{rep} · {m.get('noise_label', 'symmetric')}"
+
+
+def fig_compare_ler(R_a, R_b, ax=None):
+    """Overlay the LER(p) curves (f3 ansatz line + raw IS points) for two runs — e.g. symmetric vs
+    asymmetric noise, or single-sector vs full DEM. Runs are labeled by representation + noise model."""
     import matplotlib.pyplot as plt
     if ax is None:
         _, ax = plt.subplots(figsize=(8.6, 5.6))
-    for R, col, tag in ((R_single, "crimson", "single-sector (Z)"), (R_full, "navy", "full DEM")):
-        ax.plot(R["p_grid"], R["LER"]["f3"], "-", color=col, lw=2,
-                label=f"{tag}: f3 ansatz (authoritative)")
+    for R, col in ((R_a, "crimson"), (R_b, "navy")):
+        lab = _run_label(R)
+        ax.plot(R["p_grid"], R["LER"]["f3"], "-", color=col, lw=2, label=f"{lab}: f3 ansatz")
         ax.plot(R["isp"], R["isL"], "o", color=col, ms=3, alpha=0.4,
-                label=f"{tag}: raw IS points (collapse at low p — undersampled)")
+                label=f"{lab}: raw IS pts (collapse at low p)")
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel(r"Physical error rate $p$"); ax.set_ylabel("Logical error rate")
-    ax.set_title("LER(p): single-sector vs full DEM")
+    ax.set_title("LER(p) comparison")
     ax.legend(fontsize=8, loc="lower right"); ax.grid(True, which="both", alpha=0.3)
     return ax
 
 
-def table2_compare(R_single, R_full):
-    """Markdown side-by-side of the Table-2 min-weight quantities (single-sector vs full DEM)."""
+def fig_compare_spectrum(R_a, R_b, ax=None):
+    """Overlay the failure spectra f(w) — measured points + f3 ansatz line + exact-onset star (w0,f0)
+    — for two runs. Shows how the weight-space failure profile shifts with the noise model."""
+    import matplotlib.pyplot as plt
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8.6, 5.6))
+    for R, col in ((R_a, "crimson"), (R_b, "navy")):
+        w = np.asarray(R["w"]); F = np.asarray(R["F"]); T = np.asarray(R["T"])
+        f = F / np.maximum(T, 1); meas = F > 0
+        ax.plot(w[meas], f[meas], "o", color=col, ms=3, alpha=0.5, label=f"{_run_label(R)}: f(w)")
+        ww = np.arange(int(R["w0"]), int(w.max()) + 1, dtype=float)
+        ax.plot(ww, R["fits"]["f3"].f(ww), "-", color=col, lw=2, alpha=0.9)
+        ax.plot([R["w0"]], [R["f0"]], "*", color=col, ms=13, mec="k", mew=0.5, zorder=5)
+    ax.set_yscale("log")
+    ax.set_xlabel("fault weight $w$"); ax.set_ylabel("failure fraction $f(w)$")
+    ax.set_title("Failure spectrum comparison (★ = exact onset $f_0$)")
+    ax.legend(fontsize=8, loc="lower right"); ax.grid(True, which="both", alpha=0.3)
+    return ax
+
+
+def fig_compare_weight(R_a, R_b, ax=None):
+    """Overlay the reweighted-ansatz failing-config weight median π_q(w) vs p for two runs."""
+    import matplotlib.pyplot as plt
+    if ax is None:
+        _, ax = plt.subplots(figsize=(8.6, 5.6))
+    pg = np.geomspace(1e-4, 1e-2, 60)
+    for R, col in ((R_a, "crimson"), (R_b, "navy")):
+        med = np.array([_weight_percentiles(R, p)[2] for p in pg])
+        ax.plot(pg, med, "-", color=col, lw=2, label=f"{_run_label(R)}: median weight")
+    ax.axhline(R_a["w0"], color="darkorange", ls="--", lw=1.1, label=fr"onset $w_0={R_a['w0']}$")
+    ax.set_xscale("log"); ax.set_xlabel(r"Physical error rate $p$")
+    ax.set_ylabel("failing-config weight $w$")
+    ax.set_title("Failing-config weight comparison")
+    ax.legend(fontsize=8, loc="upper left"); ax.grid(True, which="both", alpha=0.3)
+    return ax
+
+
+def table2_compare(R_a, R_b):
+    """Markdown side-by-side of the Table-2 min-weight quantities for two runs (labeled by rep+noise)."""
     def g(m, k):
         v = m.get(k)
         return "—" if v is None else (f"{v:.4g}" if isinstance(v, (int, float)) else str(v))
-    ms, mf = R_single["meta"], R_full["meta"]
-    rows = [("method", ms["method"], mf["method"]),
-            ("distance D", g(ms, "D"), g(mf, "D")),
-            ("onset w0", g(ms, "w0"), g(mf, "w0")),
-            ("n_compressed", g(ms, "n_compressed"), g(mf, "n_compressed")),
-            ("n_expanded", g(ms, "n_expanded"), g(mf, "n_expanded")),
-            ("|L(D)| comp", g(ms, "n_min_logicals"), g(mf, "n_min_logicals")),
-            ("|L(D)| exp", g(ms, "n_min_logicals_expanded"), g(mf, "n_min_logicals_expanded")),
-            ("|F(D/2)|", g(ms, "fail_count"), g(mf, "fail_count")),
-            ("f0", g(ms, "f0"), g(mf, "f0"))]
-    head = f"| quantity | {ms['code_label']} single-sector | {mf['code_label']} full DEM |"
+    ma, mb = R_a["meta"], R_b["meta"]
+    rows = [("method", ma["method"], mb["method"]),
+            ("distance D", g(ma, "D"), g(mb, "D")),
+            ("onset w0", g(ma, "w0"), g(mb, "w0")),
+            ("n_compressed", g(ma, "n_compressed"), g(mb, "n_compressed")),
+            ("n_expanded", g(ma, "n_expanded"), g(mb, "n_expanded")),
+            ("|L(D)| comp", g(ma, "n_min_logicals"), g(mb, "n_min_logicals")),
+            ("|L(D)| exp", g(ma, "n_min_logicals_expanded"), g(mb, "n_min_logicals_expanded")),
+            ("|F(D/2)|", g(ma, "fail_count"), g(mb, "fail_count")),
+            ("f0", g(ma, "f0"), g(mb, "f0"))]
+    head = f"| quantity | {_run_label(R_a)} | {_run_label(R_b)} |"
     return "\n".join([head, "|---|---|---|"] + [f"| {a} | {b} | {c} |" for a, b, c in rows])
 
 

@@ -110,6 +110,10 @@ class Config:
 
     # circuit / noise
     p_ref: float = 0.003                 # circuit is built at this physical error rate
+    # Measurement-error multiplier (the --p-meas-factor seam): p_meas = p_meas_factor * p_phys.
+    # 1.0 = symmetric (paper default). The fail-fast reweighting is rate-agnostic, so a fixed ratio
+    # swept by overall strength p stays a valid single-parameter family — no downstream change.
+    p_meas_factor: float = 1.0
     rounds: int = BB_72_12_6.distance    # syndrome rounds (= d for the memory experiment)
 
     # Relay-BP decoder settings (paper §2.4 for BB(6): γ0=0.125, leg1=80 it,
@@ -225,8 +229,9 @@ def make_decoder(cfg: Config) -> RelayBPDecoder:
 
 
 def build_circuit(cfg: Config):
-    """The cfg.code (default BB(6)=[[72,12,6]]) memory circuit at p_ref with cfg.rounds rounds."""
-    em = ErrorModel.symmetric(cfg.p_ref)
+    """The cfg.code (default BB(6)=[[72,12,6]]) memory circuit at p_ref with cfg.rounds rounds.
+    Measurement error is p_meas_factor * p_phys (1.0 = symmetric)."""
+    em = ErrorModel(p_phys=cfg.p_ref, p_meas=cfg.p_ref * cfg.p_meas_factor)
     return BBCodeSimulator(cfg.code).build_circuit(em, rounds=cfg.rounds)
 
 
@@ -819,6 +824,10 @@ def main() -> None:
     ap.add_argument("--code", choices=sorted(CODES), default=None,
                     help="bivariate-bicycle code (default bb72=BB(6); bb144=BB(12)). Sets rounds=d "
                          "unless --rounds is given.")
+    ap.add_argument("--p-meas-factor", type=float, default=None,
+                    help="measurement error = factor * gate error (1.0 = symmetric, default). "
+                         "Asymmetric (e.g. 5) is rate-agnostic for the reweighting; clears the "
+                         "symmetric onset pin so Technique II recomputes.")
     ap.add_argument("--decoder-conv", action="store_true",
                     help="also measure Relay-BP decoder convergence (LER vs num_sets legs) on the "
                          "full DEM -> decoder_convergence.json")
@@ -854,6 +863,10 @@ def main() -> None:
     if args.mw_workers is not None: cfg.mw_workers = args.mw_workers
     if args.max_cores is not None: cfg.mw_workers = min(cfg.mw_workers, max(1, int(args.max_cores)))
     if args.no_symmetry: cfg.mw_use_symmetry = False
+    if args.p_meas_factor is not None:
+        cfg.p_meas_factor = args.p_meas_factor
+        if cfg.p_meas_factor != 1.0:
+            cfg.mw_f0_override = None   # symmetric onset pin invalid under asymmetric noise → recompute
     if args.full_dem:
         cfg.mw_single_sector = False
         cfg.mw_f0_override = None     # the exact-onset pin is single-sector-only → run the search
