@@ -96,12 +96,9 @@ md(r"""## Technique I — failure spectrum f(w) and the LER(p) curve (full DEM)
 Same machinery as the single-sector report (f3 & f5 ansatze pinned at the onset, importance-sampled
 spectrum, reweighted to LER(p)) — now on the full-DEM mechanism set.""")
 
-code('''fig, ax = plt.subplots(figsize=(9, 6))
-bb6_report.fig_failure_spectrum(R, ax)
-plt.show()''')
-
-code('''fig, ax = plt.subplots(figsize=(9, 6))
-bb6_report.fig_ler_vs_p(R, ax)
+code('''fig, (axL, axR) = plt.subplots(1, 2, figsize=(15, 6))
+bb6_report.fig_failure_spectrum(R, axL)   # weight-space view: f(w) + ansatz + exact onset star
+bb6_report.fig_ler_vs_p(R, axR)           # the Figure-10 LER(p) curve
 plt.show()
 i = np.argmin(abs(R["p_grid"] - 1e-4))
 print("full-DEM LER(1e-4): f3 = %.2e, f5 = %.2e" % (R["LER"]["f3"][i], R["LER"]["f5"][i]))''')
