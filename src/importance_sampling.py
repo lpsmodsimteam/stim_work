@@ -20,7 +20,7 @@ Reweighting formula (Eq. 3 of the paper):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -152,7 +152,7 @@ def importance_sample(
     p_ref: float,
     p_values: Sequence[float],
     weights: Optional[Sequence[int]] = None,
-    shots_per_weight: int = 1000,
+    shots_per_weight: Union[int, Sequence[int], Dict[int, int]] = 1000,
     q_base: Optional[float] = None,
     seed: Optional[int] = None,
 ) -> ImportanceSamplingResult:
@@ -168,7 +168,13 @@ def importance_sample(
               p_values are scaled relative to this.
     p_values : Target physical error rates at which to estimate P_logical.
     weights : Fault weights to sample at (default: 1..8).
-    shots_per_weight : Trials per weight w.
+    shots_per_weight : Trials per weight. Either an int (the same budget for every
+        weight) or a per-weight allocation — a dict ``{w: T}`` keyed by weight, or a
+        sequence aligned with ``weights``. Per-weight budgets let you pour shots into
+        the rare near-onset bins (where f(w) is tiny and a flat budget yields 0
+        failures → only a 3/T upper limit) and spend fewer on the high-weight bins
+        where f(w)≈O(1) is already pinned. Downstream (per-weight binomial SE, the
+        ansatz fit, the bootstrap) already handles heterogeneous trial counts.
     q_base : Base rate for the expanded representation. If None, inferred as
              min(DEM probabilities).
     seed : RNG seed.
@@ -189,14 +195,32 @@ def importance_sample(
         weights = list(range(1, min(9, N_exp + 1)))
     weights = list(weights)
 
+    # Resolve shots_per_weight to a per-weight trial list T_w. int -> broadcast (the
+    # historical behaviour); dict -> keyed by weight; sequence -> aligned with weights.
+    if isinstance(shots_per_weight, int):
+        T_w = [shots_per_weight] * len(weights)
+    elif isinstance(shots_per_weight, dict):
+        try:
+            T_w = [int(shots_per_weight[w]) for w in weights]
+        except KeyError as e:
+            raise ValueError(f"shots_per_weight dict is missing weight {e.args[0]}") from None
+    else:
+        T_w = [int(t) for t in shots_per_weight]
+        if len(T_w) != len(weights):
+            raise ValueError(
+                f"shots_per_weight sequence has {len(T_w)} entries but there are "
+                f"{len(weights)} weights")
+    if any(t < 0 for t in T_w):
+        raise ValueError("shots_per_weight must be non-negative")
+
     failures = [
-        _sample_failures_at_weight(det_mat, obs_mat, col_to_mech, w, shots_per_weight, decoder, rng)
-        for w in weights
+        _sample_failures_at_weight(det_mat, obs_mat, col_to_mech, w, T_w[j], decoder, rng)
+        for j, w in enumerate(weights)
     ]
 
     spectrum = FailureSpectrum(
         weights=weights,
-        trials=[shots_per_weight] * len(weights),
+        trials=T_w,
         failures=failures,
         n_expanded=N_exp,
         q_base=q_base,
@@ -477,7 +501,7 @@ def importance_sample_with_ansatz(
     w0: Optional[float] = None,
     f0: Optional[float] = None,
     weights: Optional[Sequence[int]] = None,
-    shots_per_weight: int = 1000,
+    shots_per_weight: Union[int, Sequence[int], Dict[int, int]] = 1000,
     q_base: Optional[float] = None,
     seed: Optional[int] = None,
 ) -> AnsatzSweepResult:
@@ -500,4 +524,114 @@ def importance_sample_with_ansatz(
         P_logical_ansatz=P,
         fit=fit,
         raw=raw,
+    )
+
+
+# ===========================================================================
+# Adaptive per-weight shot allocation — "hit N failures per weight"
+#
+# Sweep weights HIGH -> LOW. Predict the next (lower) weight's failure fraction
+# f(w) by log-linear extrapolation of the weights already measured, then give it
+# just enough shots to expect ~target_failures failures:  T_w = N / f_pred
+# (clamped). The top weights (f≈1) cost the fewest shots (≈N); the cost grows as
+# f(w) falls toward the onset. Each weight is tuned from the results of the ones
+# before it — no LER model, no binomial weighting.
+# ===========================================================================
+
+def predict_failure_fraction(measured: Dict[int, float], w: int, window: int = 3) -> float:
+    """Predict f(w) for an unsampled weight from already-measured weights.
+
+    `measured` maps weight -> measured failure fraction. Fits a line to log f vs
+    weight over the `window` measured points nearest `w` (using only 0<f<1 points,
+    where log f is informative) and extrapolates. Returns 1.0 when no informative
+    point exists yet — the top of a high->low sweep, where f≈1 and a few shots
+    suffice."""
+    pts = sorted((int(ww), float(f)) for ww, f in measured.items() if 0.0 < f < 1.0)
+    if not pts:
+        if measured:                       # only saturated (f=1) or empty (f=0) points so far
+            ww_near = min(measured, key=lambda x: abs(x - w))
+            return float(np.clip(measured[ww_near], 1e-12, 1.0))
+        return 1.0
+    pts.sort(key=lambda t: abs(t[0] - w))   # the `window` points closest in weight to w
+    use = sorted(pts[: max(2, window)])
+    if len(use) < 2:
+        return float(np.clip(use[0][1], 1e-12, 1.0))
+    xs = np.array([t[0] for t in use], dtype=float)
+    ys = np.log([t[1] for t in use])
+    slope, intercept = np.polyfit(xs, ys, 1)
+    return float(np.clip(np.exp(intercept + slope * w), 1e-12, 1.0))
+
+
+def shots_to_hit_failures(f_pred: float, target_failures: int, shots_min: int, shots_max: int) -> int:
+    """Shots needed to expect ~target_failures failures at predicted fraction f_pred (clamped)."""
+    need = target_failures / max(float(f_pred), 1e-300)
+    return int(np.clip(np.ceil(need), shots_min, shots_max))
+
+
+def importance_sample_adaptive(
+    circuit: "stim.Circuit",
+    decoder,
+    p_ref: float,
+    p_values: Sequence[float],
+    weights: Optional[Sequence[int]] = None,
+    *,
+    target_failures: int = 50,
+    shots_min: int = 4,
+    shots_max: int = 20000,
+    predict_window: int = 3,
+    q_base: Optional[float] = None,
+    seed: Optional[int] = None,
+) -> ImportanceSamplingResult:
+    """Weight-stratified IS with adaptive 'hit N failures per weight' shot allocation.
+
+    Sweeps `weights` high->low; each weight's shots are sized from the extrapolated
+    f(w) to expect ~`target_failures` failures (clamped to [shots_min, shots_max]).
+    Returns the same ImportanceSamplingResult as :func:`importance_sample`, with
+    per-weight `trials` reflecting the adaptive allocation (so the reweighted SE is
+    per-weight correct)."""
+    rng = np.random.default_rng(seed)
+    probs, det_mat, obs_mat = _parse_dem(circuit)
+    col_to_mech, q_base, _ = _expand(probs, q_base)
+    N_exp = col_to_mech.shape[0]
+    decoder.setup(circuit)
+    if weights is None:
+        weights = list(range(1, min(9, N_exp + 1)))
+    weights = sorted({int(w) for w in weights})
+
+    measured_f: Dict[int, float] = {}
+    F_by: Dict[int, int] = {}
+    T_by: Dict[int, int] = {}
+    for w in sorted(weights, reverse=True):
+        f_pred = predict_failure_fraction(measured_f, w, predict_window)
+        T_w = shots_to_hit_failures(f_pred, target_failures, shots_min, shots_max)
+        F = _sample_failures_at_weight(det_mat, obs_mat, col_to_mech, w, T_w, decoder, rng)
+        F_by[w], T_by[w] = F, T_w
+        measured_f[w] = F / T_w if T_w else 0.0
+
+    spectrum = FailureSpectrum(
+        weights=weights,
+        trials=[T_by[w] for w in weights],
+        failures=[F_by[w] for w in weights],
+        n_expanded=N_exp,
+        q_base=q_base,
+        p_ref=p_ref,
+    )
+
+    p_arr = np.asarray(p_values, dtype=float)
+    q_targets = np.clip(q_base * (p_arr / p_ref), 1e-300, 1.0 - 1e-15)
+    log_q = np.log(q_targets)
+    log_1mq = np.log1p(-q_targets)
+    P_logical = np.zeros_like(p_arr)
+    var = np.zeros_like(p_arr)
+    for w in weights:
+        T, F = T_by[w], F_by[w]
+        f = F / T if T > 0 else 0.0
+        f_se = np.sqrt(f * (1.0 - f) / T) if T > 0 else 0.0
+        log_binom = gammaln(N_exp + 1) - gammaln(w + 1) - gammaln(N_exp - w + 1)
+        weight = np.exp(log_binom + w * log_q + (N_exp - w) * log_1mq)
+        P_logical += f * weight
+        var += (f_se * weight) ** 2
+
+    return ImportanceSamplingResult(
+        p_values=p_arr, P_logical=P_logical, P_logical_se=np.sqrt(var), spectrum=spectrum,
     )
