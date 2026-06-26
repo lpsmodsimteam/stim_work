@@ -1,4 +1,4 @@
-"""Smoke tests for the BB(6) Figure-10 reproduction job (notebooks/bb_code/bb6_fig10_sweep.py).
+"""Smoke tests for the BB(6) Figure-10 reproduction job (experiments/bravyi/bb6_fig10_sweep.py).
 
 These run the *entire* multi-hour pipeline at tiny scale (Config.smoke): onset scan,
 Technique II (min-weight), the checkpointed IS sweep, Technique I (ansatz), Technique III
@@ -20,8 +20,8 @@ import pytest
 pytest.importorskip("relay_bp", reason="relay_bp not installed (build from pinned commit)")
 pytest.importorskip("ldpc", reason="ldpc not installed")
 
-# Make the production script importable (conftest already put src/ on the path).
-_BB6_DIR = pathlib.Path(__file__).parent.parent / "notebooks" / "bb_code"
+# Make the production driver importable (conftest already put src/ on the path).
+_BB6_DIR = pathlib.Path(__file__).parent.parent / "experiments" / "bravyi"
 sys.path.insert(0, str(_BB6_DIR))
 import bb6_fig10_sweep as bb6  # noqa: E402
 

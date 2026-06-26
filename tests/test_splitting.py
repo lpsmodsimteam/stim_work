@@ -105,7 +105,7 @@ def test_metropolis_chain_stays_in_failing_set():
     # by running with a sane q and confirming the chain runs and reports a finite
     # ratio (trivial-ratio case below also exercises in-set residency).
     q = float(q_base * (0.02 / 0.02))  # q at p_ref
-    cr = _metropolis_chain(
+    cr, _ = _metropolis_chain(   # returns (ChainResult, final_config) for warm-starting
         det_mat, obs_mat, col_to_mech, dec,
         q_cur=q, q_next=q, seed_config=seed,
         chain_steps=200, burn_in=20, thin=1,
@@ -139,7 +139,7 @@ def test_trivial_ratio_is_one():
     seed = _find_a_failing_config(det_mat, obs_mat, col_to_mech, dec, rng)
     assert seed is not None
     q = 0.01
-    cr = _metropolis_chain(
+    cr, _ = _metropolis_chain(   # returns (ChainResult, final_config) for warm-starting
         det_mat, obs_mat, col_to_mech, dec,
         q_cur=q, q_next=q, seed_config=seed,
         chain_steps=300, burn_in=50, thin=1,
