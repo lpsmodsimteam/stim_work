@@ -177,6 +177,13 @@ class Config:
     split_burn_in: int = 5000
     split_anchor_shots: int = 3000
     split_min_weight_max_trials: int = 400   # BP-OSD trials for splitting's min-weight seeds
+    # Replica-exchange (parallel-tempering) params: swaps between adjacent rungs mix the weight
+    # space for codes with many inequivalent logicals (BB(12)), where the swap-less sequential
+    # splitting freezes. These drive replica_exchange_estimate (see split_fulldem.py / split_bb144.py).
+    split_re_walkers: int = 6
+    split_re_local_steps: int = 6
+    split_re_sweeps: int = 200
+    split_re_burn_in: int = 60
 
     # onset scan (only used with --onset-scan)
     onset_shots: int = 200
@@ -211,6 +218,7 @@ class Config:
             split_p_high=0.01, split_p_low=0.005, split_n_levels=2, split_n_seeds=2,
             split_chain_steps=30, split_burn_in=10, split_anchor_shots=80,
             split_min_weight_max_trials=20,
+            split_re_walkers=2, split_re_local_steps=2, split_re_sweeps=4, split_re_burn_in=2,
             onset_shots=40,
             dconv_shots=40, dconv_num_sets=(1, 5, 20),
         )
@@ -413,9 +421,10 @@ def run_technique_ii(cfg: Config, outdir: pathlib.Path) -> dict:
     cached = _load_json(outdir / "distance.json")
     if (cached is not None and int(cached.get("rounds", -1)) == cfg.rounds
             and bool(cached.get("single_sector", False)) == cfg.mw_single_sector):
+        _cf0 = cached.get("onset_fraction")
+        _cf0s = f"{_cf0:.3e}" if isinstance(_cf0, (int, float)) else "None (unpinned)"
         print(f"\nTechnique II — reusing cached distance.json "
-              f"(D={cached['distance']}, onset w0={cached['onset']}, "
-              f"f0={cached['onset_fraction']:.3e})", flush=True)
+              f"(D={cached['distance']}, onset w0={cached['onset']}, f0={_cf0s})", flush=True)
         return cached
 
     sector = cfg.mw_sector_type if cfg.mw_single_sector else None
@@ -483,29 +492,41 @@ def run_technique_ii(cfg: Config, outdir: pathlib.Path) -> dict:
     print(f"  [II.2] |L(D)| compressed={ld_comp}, expanded={ld_exp:.4g} "
           f"(paper {PAPER_LD_EXP:.3g})   ({time.perf_counter() - t1:.0f}s)", flush=True)
 
-    print("  [II.3] exact onset fraction f*(D/2) via Proposition 1 ...", flush=True)
-    fails, n_exp = min_weight_fail_count(H, A, logicals, mult)
-    half = D // 2
-    log_choose = gammaln(n_exp + 1) - gammaln(half + 1) - gammaln(n_exp - half + 1)
-    f_star = float(fails / np.exp(log_choose))
+    half = (D + 1) // 2          # onset weight w0 = ceil(D/2) (correct for even AND odd D)
+    if logicals and D % 2 == 0:
+        # Even D: exact onset failure fraction f*(D/2) via Proposition 1.
+        print("  [II.3] exact onset fraction f*(D/2) via Proposition 1 ...", flush=True)
+        fails, n_exp = min_weight_fail_count(H, A, logicals, mult)
+        log_choose = gammaln(n_exp + 1) - gammaln(half + 1) - gammaln(n_exp - half + 1)
+        f_star = float(fails / np.exp(log_choose))
+    else:
+        # Odd D, or no weight-D logicals found by the search: the even-D Proposition-1 onset
+        # fraction does not apply / there is nothing to count. Report |L(D)| as a lower bound and
+        # leave f0 unpinned so Technique I FITS w0/f0 from the IS spectrum instead of pinning a
+        # wrong value — and so a multi-hour run never dies here on an empty list.
+        n_exp = int(mult.sum())
+        fails, f_star = 0, None
+        why = "no weight-D logicals found" if not logicals else f"D={D} is odd (Prop. 1 is even-D only)"
+        print(f"  [II.3] {why} → onset fraction unpinned (f0=None)", flush=True)
 
     out = {
         "rounds": cfg.rounds,
         "single_sector": bool(cfg.mw_single_sector),
         "sector_type": int(cfg.mw_sector_type) if cfg.mw_single_sector else None,
-        "method": "search",                          # BP-OSD search (exact MITM only for pinned single-sector)
-        "distance": int(D),
-        "onset": int(half),                          # w0 = D/2
-        "n_compressed": int(n_comp),                 # Ñ  (paper 2233)
-        "n_expanded": int(n_exp),                    # N  (paper 46224)
-        "n_min_logicals": int(ld_comp),              # |L(D)| in compressed/mechanism space
-        "n_min_logicals_expanded": int(ld_exp),      # |L(D)| expanded (paper 6.01e12)
-        "fail_count": int(fails),                    # |F(D/2)| (paper 3.83e8)
-        "onset_fraction": f_star,                    # f0 = f*(D/2) (paper 2.33e-5)
+        "method": "search",                          # symmetry-augmented BP-OSD search
+        "distance": int(D),                          # upper bound on the circuit fault distance
+        "distance_is_bound": True,                   # BP-OSD search → D is an upper bound (paper convention)
+        "onset": int(half),                          # w0 = ceil(D/2)
+        "n_compressed": int(n_comp),
+        "n_expanded": int(n_exp),
+        "n_min_logicals": int(ld_comp),              # |L(D)| lower bound (search-found, paper convention ≥)
+        "n_min_logicals_expanded": int(ld_exp),
+        "fail_count": int(fails),
+        "onset_fraction": f_star,                    # f0 = f*(D/2) for even D; None otherwise
     }
-    print(f"  D={D}, onset w0={half}, |L(D)|={ld_comp} (exp {ld_exp:.3g}, paper {PAPER_LD_EXP:.2g}), "
-          f"|F(D/2)|={fails:.3g} (paper {PAPER_FAILS:.2g}), "
-          f"f0={f_star:.3e} (paper 2.33e-5)   (total {time.perf_counter() - t0:.0f}s)")
+    f0s = f"{f_star:.3e}" if f_star is not None else "None"
+    print(f"  D≤{D}, onset w0={half}, |L(D)|≥{ld_comp} (exp {ld_exp:.3g}), |F|={fails}, "
+          f"f0={f0s}   (total {time.perf_counter() - t0:.0f}s)")
     _atomic_write_json(outdir / "distance.json", out)
     return out
 
@@ -608,7 +629,12 @@ def run_technique_i(cfg: Config, is_result: ImportanceSamplingResult,
     """
     K = build_circuit(cfg).detector_error_model(decompose_errors=False).num_observables
     w0 = f0 = None
-    if cfg.pin_onset and tech2 is not None:
+    # Pin the onset (w0,f0) ONLY when Technique II determined the fraction exactly (even D, MITM/
+    # search). For bb144 (odd D, f0 unknown) PINNING w0=ceil(D/2)=6 BREAKS the ansatz: the true
+    # onset is ~40 weights below where failures become observable (w≈46), a gap the f3/f5 form can't
+    # bridge (it collapses to LER≈1). So leave w0 free there — the fit then tracks the observable
+    # spectrum; the low-p extrapolation is unreliable and the splitting cross-check covers that regime.
+    if cfg.pin_onset and tech2 is not None and tech2.get("onset_fraction") is not None:
         w0, f0 = float(tech2["onset"]), float(tech2["onset_fraction"])
     print(f"\nTechnique I — ansatz '{cfg.ansatz_model}', K={K}, "
           f"pinned w0={w0}, f0={f0}", flush=True)
@@ -642,29 +668,37 @@ def run_technique_i(cfg: Config, is_result: ImportanceSamplingResult,
 
 # ============================ Technique III: splitting ==========================
 def run_technique_iii(cfg: Config, tech2: Optional[dict], outdir: pathlib.Path) -> dict:
-    """Multi-seeded Metropolis splitting estimate over an overlapping p-ladder (cross-check)."""
-    from splitting import splitting_estimate
+    """Replica-exchange (parallel-tempering) splitting cross-check over the p-ladder.
 
-    print("\nTechnique III — multi-seeded splitting cross-check ...", flush=True)
+    Uses replica_exchange_estimate — walkers per rung with SWAPS between adjacent rungs — not the
+    swap-less splitting_estimate, whose independent chains freeze for codes with many inequivalent
+    logicals (BB(12)). Prints [tempering] swap-accept progress; returns the flat ladder schema (plus
+    swap diagnostics) consumed by run_all/make_plot.
+    """
+    from splitting import replica_exchange_estimate
+
+    print("\nTechnique III — replica-exchange splitting cross-check ...", flush=True)
     circuit = build_circuit(cfg)
-    distance = int(tech2["distance"]) if tech2 is not None else BB_72_12_6.distance
-    res = splitting_estimate(
+    distance = int(tech2["distance"]) if tech2 is not None else cfg.code.distance
+    temper, diag = replica_exchange_estimate(
         circuit, make_decoder(cfg),
         p_ref=cfg.p_ref, p_high=cfg.split_p_high, p_low=cfg.split_p_low,
-        n_levels=cfg.split_n_levels, n_seeds=cfg.split_n_seeds,
-        chain_steps=cfg.split_chain_steps, burn_in=cfg.split_burn_in,
-        anchor_shots=cfg.split_anchor_shots, distance=distance,
-        min_weight_max_trials=cfg.split_min_weight_max_trials, seed=cfg.seed,
+        n_levels=cfg.split_n_levels, n_walkers=cfg.split_re_walkers,
+        local_steps=cfg.split_re_local_steps, n_sweeps=cfg.split_re_sweeps,
+        burn_in=cfg.split_re_burn_in, anchor_shots=cfg.split_anchor_shots,
+        distance=distance, seed=cfg.seed,
         single_sector=cfg.mw_single_sector, sector=cfg.mw_sector_type,
-        use_min_weight_seeds=False,   # near-threshold cross-check: MC seeds suffice
     )
     out = {
-        "p_ladder": np.asarray(res.p_ladder).tolist(),
-        "P_logical": np.asarray(res.P_logical).tolist(),
-        "P_logical_se": np.asarray(res.P_logical_se).tolist(),
+        "p_ladder": np.asarray(temper.p_ladder).tolist(),
+        "P_logical": np.asarray(temper.P_logical).tolist(),
+        "P_logical_se": np.asarray(temper.P_logical_se).tolist(),
+        "swap_accept": list(diag["swap_accept"]),
+        "mean_weight": list(diag["mean_weight"]),
     }
-    print(f"  ladder {res.p_ladder[0]:.2e}..{res.p_ladder[-1]:.2e}, "
-          f"P {np.asarray(res.P_logical)[0]:.2e}..{np.asarray(res.P_logical)[-1]:.2e}")
+    print(f"  ladder {temper.p_ladder[0]:.2e}..{temper.p_ladder[-1]:.2e}, "
+          f"P {np.asarray(temper.P_logical)[0]:.2e}..{np.asarray(temper.P_logical)[-1]:.2e}; "
+          f"swap-accept {min(diag['swap_accept']):.2f}..{max(diag['swap_accept']):.2f}")
     _atomic_write_json(outdir / "splitting.json", out)
     return out
 
@@ -690,7 +724,7 @@ def make_plot(cfg: Config, is_result: ImportanceSamplingResult, tech1: dict,
                 label="Technique III splitting")
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel("Physical error rate $p$"); ax.set_ylabel("Logical error rate")
-    ax.set_title(f"BB(6) [[72,12,6]] — Fig. 10 reproduction (Relay-BP, {cfg.label})")
+    ax.set_title(f"{cfg.code_label} — Fig. 10 reproduction (Relay-BP, {cfg.label})")
     ax.legend(); ax.grid(True, which="both", alpha=0.3)
     fig.tight_layout()
     fig.savefig(outdir / "bb6_fig10.png", dpi=150)
@@ -854,6 +888,12 @@ def main() -> None:
     if args.code is not None:
         cfg.code, cfg.code_label = CODES[args.code]
         if args.rounds is None: cfg.rounds = cfg.code.distance   # default rounds = code distance
+        if args.code != "bb72":
+            # The exact onset pin (mw_f0_override/mw_w0_override) is the BB(6) reference enumeration
+            # (D=6, f0=2.3239e-5) — invalid for any other code. Clear it so Technique II actually
+            # runs the symmetry-augmented BP-OSD search for this code instead of shortcutting to D=6.
+            cfg.mw_f0_override = None
+            cfg.mw_w0_override = None
     if args.rounds is not None: cfg.rounds = args.rounds
     if args.p_ref is not None:  cfg.p_ref = args.p_ref
     if args.shots is not None:  cfg.shots_per_weight = args.shots

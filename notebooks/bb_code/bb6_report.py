@@ -44,7 +44,15 @@ def compute(outdir=DEFAULT_OUT, bootstrap=150, seed=0):
     # when its saturation curve looks complete, so the exact enumeration wins and re-pins f0.
     _dm = outdir / "distance_mitm.json"; _ds = outdir / "distance.json"
     dist = json.loads((_dm if _dm.exists() else _ds).read_text()) if (_dm.exists() or _ds.exists()) else {}
-    f0 = float(dist.get("onset_fraction", npz["onset_fraction"]))
+    # onset_fraction may be null (e.g. odd circuit distance, where the even-D Proposition-1 onset
+    # fraction does not apply, or an unpinned/bounded large-code run). Then f0 is FIT, not pinned.
+    _f0raw = dist.get("onset_fraction") if "onset_fraction" in dist else npz["onset_fraction"]
+    try:
+        f0 = float(_f0raw)
+        if not np.isfinite(f0):
+            f0 = None
+    except (TypeError, ValueError):
+        f0 = None
     w0 = int(dist.get("onset", npz["onset"]))
     p_grid = np.asarray(npz["ansatz_p"])
     isp, isL, isSE = np.asarray(npz["p_values"]), np.asarray(npz["is_P_logical"]), np.asarray(npz["is_P_logical_se"])
@@ -54,13 +62,16 @@ def compute(outdir=DEFAULT_OUT, bootstrap=150, seed=0):
                                n_expanded=N, q_base=q_base, p_ref=p_ref)
 
     fits, LER, band = {}, {}, {}
-    # The f5 ansatz evaluates q**w for large w during fitting, which harmlessly overflows on some
-    # bootstrap resamples (caught below); silence those RuntimeWarnings so they don't flood the
-    # notebook (and so the warning machinery doesn't dominate the bootstrap runtime).
+    mw_onset = w0                                    # Technique-II min-weight onset weight (distance.json)
+    # Pin w0 only when f0 is exact (even D). Else FIT w0: for bb144 (odd D, unknown f0) pinning
+    # w0=ceil(D/2) BREAKS the ansatz — the onset is ~40 weights below where failures become
+    # observable (w≈46), a gap the f3/f5 form can't bridge (it collapses to LER≈1). A free w0 tracks
+    # the observable spectrum; the low-p extrapolation is then unreliable (splitting covers that).
+    _w0arg = float(w0) if f0 is not None else None
     with warnings.catch_warnings(), np.errstate(over="ignore", invalid="ignore", divide="ignore"):
         warnings.simplefilter("ignore", RuntimeWarning)
         for model in ("f3", "f5"):
-            fit = fit_failure_spectrum(spectrum(F), K=K, model=model, w0=float(w0), f0=f0)
+            fit = fit_failure_spectrum(spectrum(F), K=K, model=model, w0=_w0arg, f0=f0)
             fits[model] = fit
             LER[model] = np.asarray(logical_error_rate_from_ansatz(fit, list(p_grid)))
             # bootstrap band over resampled failures
@@ -69,11 +80,19 @@ def compute(outdir=DEFAULT_OUT, bootstrap=150, seed=0):
             for b in range(bootstrap):
                 fr = rng.binomial(T.astype(int), np.clip(F / np.maximum(T, 1), 0, 1))
                 try:
-                    fb = fit_failure_spectrum(spectrum(fr), K=K, model=model, w0=float(w0), f0=f0)
+                    fb = fit_failure_spectrum(spectrum(fr), K=K, model=model, w0=_w0arg, f0=f0)
                     bs[b] = logical_error_rate_from_ansatz(fb, list(p_grid))
                 except Exception:
                     pass
             band[model] = (np.nanpercentile(bs, 5, axis=0), np.nanpercentile(bs, 95, axis=0))
+
+    # f0 pinned (even D) → keep the exact (w0,f0). Else read the FITTED onset the ansatz settled on
+    # (the observable onset, ~46 for bb144); the Technique-II min-weight onset (mw_onset) is kept
+    # separately for the Table-2 row.
+    f0_pinned = f0 is not None
+    if f0 is None:
+        w0 = float(fits["f3"].params.get("w0", w0))
+        f0 = float(fits["f3"].f(w0))
 
     split = None
     sp = outdir / "splitting.json"
@@ -93,7 +112,9 @@ def compute(outdir=DEFAULT_OUT, bootstrap=150, seed=0):
     meta = dict(single_sector=single_sector, p_meas_factor=pmf, noise_label=noise_label,
                 code_label=cfg.get("code_label", "BB(6)=[[72,12,6]]"),
                 method=dist.get("method", "mitm_exact" if dist.get("exact_pin") else "search"),
-                D=int(dist.get("distance", 2 * w0)), w0=w0, N=N, f0=f0,
+                D=int(dist.get("distance", 2 * mw_onset)), w0=w0, mw_onset_weight=int(mw_onset),
+                N=N, f0=f0, f0_pinned=f0_pinned,
+                distance_is_bound=bool(dist.get("distance_is_bound", False)),
                 n_compressed=dist.get("n_compressed"), n_expanded=dist.get("n_expanded", N),
                 n_min_logicals=dist.get("n_min_logicals"),
                 n_min_logicals_expanded=dist.get("n_min_logicals_expanded"),
@@ -253,8 +274,9 @@ def fig_failure_spectrum(R, ax=None):
         fw = failure_spectrum_ansatz(ww, a=R["fits"][model].a, model=model, **R["fits"][model].params)
         ax.plot(ww, fw, "-", color=col, lw=2, label=f"{model} ansatz fit")
     ax.axvline(R["w0"], color="darkorange", ls="--", lw=1.1)
+    _pin = "exact" if R.get("meta", {}).get("f0_pinned", True) else "fitted"
     ax.plot([R["w0"]], [R["f0"]], "*", color="darkorange", ms=16, mec="k", mew=0.5, zorder=5,
-            label=fr"Technique II onset $(w_0{{=}}{R['w0']},\ f_0{{=}}{R['f0']:.3g})$ exact")
+            label=fr"Technique II onset $(w_0{{=}}{R['w0']},\ f_0{{=}}{R['f0']:.3g})$ {_pin}")
     ax.set_yscale("log"); ax.set_xlabel("Fault weight $w$"); ax.set_ylabel(r"failure fraction $f(w)$")
     ax.set_title("BB(6) — failure spectrum $f(w)$ (weight-space view)")
     ax.legend(fontsize=8, loc="lower right"); ax.grid(True, which="both", alpha=0.3)

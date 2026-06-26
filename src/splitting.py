@@ -734,7 +734,15 @@ def replica_exchange_estimate(
     wsum = np.zeros(L + 1); wcount = 0
 
     M = det_mat.shape[1]; K = obs_mat.shape[1]
+    import time as _time; _t0 = _time.time()
+    if verbose:
+        print(f"  [tempering] setup done (anchor+seeds); running {n_sweeps} sweeps "
+              f"x {n_walkers} walkers x {L+1} rungs ...", flush=True)
     for sweep in range(n_sweeps):
+        if verbose and (sweep % 10 == 0 or sweep == n_sweeps - 1):
+            _el = _time.time() - _t0
+            _eta = _el / max(sweep, 1) * (n_sweeps - sweep)
+            print(f"  [tempering] sweep {sweep}/{n_sweeps}  ({_el:.0f}s, ETA {_eta:.0f}s)", flush=True)
         # (a) local moves — balanced add/remove proposal, with the failing-set indicator decoded
         #     in ONE batch across all replicas per sub-step (failing is q-independent).
         for _sub in range(local_steps):

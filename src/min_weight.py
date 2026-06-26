@@ -218,9 +218,10 @@ def expanded_logical_count(logical_supports, multipliers) -> int:
 _MITM: Dict[str, object] = {}
 
 
-def _mitm_init(col_h, col_a, mindet, n_det) -> None:
+def _mitm_init(col_h, col_a, mindet, n_det, weight, dmax) -> None:
     _MITM.clear()
-    _MITM.update(col_h=col_h, col_a=col_a, mindet=mindet, n_det=n_det, _cache={})
+    _MITM.update(col_h=col_h, col_a=col_a, mindet=mindet, n_det=n_det, weight=int(weight),
+                 dmax=int(dmax), _cache={})
 
 
 def _mitm_prepare(d0: int):
@@ -242,41 +243,94 @@ def _mitm_prepare(d0: int):
         while x:
             det_cols[(x & -x).bit_length() - 1].append(c)
             x &= x - 1
-    cache[d0] = (cols0, det_cols, hmap)
+    deg = [len(dc) for dc in det_cols]  # per-detector candidate count (for most-constrained pivot)
+    cache[d0] = (cols0, det_cols, hmap, deg)
     return cache[d0]
 
 
 def _mitm_chunk(task) -> Set[FrozenSet[int]]:
-    """Enumerate weight-6 logicals for a slice ``[lo, hi)`` of anchor d0's ordered anchor pairs.
+    """Enumerate weight-``w`` logicals for a slice ``[lo, hi)`` of anchor d0's ordered anchor pairs.
 
-    A weight-6 logical S (⊕col_h = 0, ⊕col_a ≠ 0) with global-min detector d0 has ≥2 columns
+    A weight-``w`` logical S (⊕col_h = 0, ⊕col_a ≠ 0) with global-min detector d0 has ≥2 columns
     touching d0 — and any column touching d0 has min-detector == d0 (none touch a lower one), so
     those columns lie in ``cols0`` (min-detector == d0). We seed every anchor *pair* (a, b) ⊂ cols0
-    (cancelling d0) and complete the remaining four columns r1..r4 drawn from the columns with
-    min-detector ≥ d0 (so additional cols0 columns are permitted — this folds the |S0|=4 and |S0|=6
-    cases into the same branch). The four are found by a 4-deep *pivot chain*: at each step the
-    residual XOR ``T`` the still-unchosen columns must produce is nonzero, so its lowest set bit
-    ``lowbit(T)`` is touched by an odd (hence ≥1) number of them — the next column is enumerated
-    only from ``det_cols[lowbit(T)]``, never the full O(N²) pair list; the last column is fixed
-    exactly by a ``col_h`` hash-map lookup.
+    (cancelling d0) and complete the remaining ``w-2`` columns drawn from the columns with
+    min-detector ≥ d0 (so additional cols0 columns are permitted — this folds the |S0|=2,4,…=w
+    cases into the same branch). The completion is a ``(w-3)``-deep *pivot chain* plus a final
+    hash-closed column: at each step the residual XOR ``T`` the still-unchosen columns must produce
+    is nonzero, so its lowest set bit ``lowbit(T)`` is touched by an odd (hence ≥1) number of them —
+    the next column is enumerated only from ``det_cols[lowbit(T)]``, never the full O(N²) pair list;
+    after ``w-1`` columns are placed the residual equals exactly one column's support, fixed by a
+    ``col_h`` hash-map lookup. (w=6 reduces to the original pair + c1,c2,c3 + hash close.)
 
     Splitting an anchor's pair list into ``[lo, hi)`` slices lets the big anchors (large ``cols0``)
     be load-balanced across all workers instead of one anchor bounding the wall-time.
 
     Completeness: the chain misses S only if some intermediate residual hits 0 with columns still
-    to place — i.e. a proper prefix of S is itself a null cycle (a stabilizer). Its complement is
-    then a logical (⊕col_a ≠ 0, ⊕col_h = 0) of weight < 6, contradicting distance D = 6. So for a
-    true weight-6 logical no intermediate residual is 0 and S is always found; ``frozenset`` dedup
-    absorbs the orderings of the four completion columns.
+    to place — i.e. a proper prefix of S is itself a null cycle. Its prefix (⊕col_a ≠ 0) or its
+    complement (⊕col_a = 0 ⇒ complement carries S's nonzero action) is then a logical of weight
+    < w = D, contradicting the distance. So for a true weight-D logical no intermediate residual is
+    0 and S is always found; ``frozenset`` dedup absorbs the orderings of the completion columns.
     """
     d0, lo, hi = task
-    CH = _MITM["col_h"]; CA = _MITM["col_a"]
-    cols0, det_cols, hmap = _mitm_prepare(d0)
+    CH = _MITM["col_h"]; CA = _MITM["col_a"]; w = _MITM["weight"]; dmax = _MITM["dmax"]
+    cols0, det_cols, hmap, deg = _mitm_prepare(d0)
     hget = hmap.get
     res: Set[FrozenSet[int]] = set()
     if len(cols0) < 2:
         return res
     add = res.add
+    n_pivot = w - 3                      # det_cols-loop columns before the single hash-closed column
+
+    def _pivot_det(T):
+        """Most-constrained-variable pivot: among the set detectors of ``T`` return the one touched
+        by the fewest candidate columns (smallest ``det_cols``). Any set bit must be cleared by a
+        remaining column, so branching on the scarcest one is valid (completeness) and minimizes the
+        fan-out — collapsing effective branching from ~mean-degree to a handful. Ties → lowest."""
+        x = T
+        bd = (x & -x).bit_length() - 1
+        bl = deg[bd]
+        x &= x - 1
+        while x and bl > 1:
+            d = (x & -x).bit_length() - 1
+            if deg[d] < bl:
+                bl = deg[d]; bd = d
+            x &= x - 1
+        return bd
+
+    def _extend(T, chosen, axor, plies):
+        """Recurse over pivot columns (``plies`` left) then hash-close the final column.
+
+        ``chosen`` is the tuple of completion columns picked so far (anchor pair carried in the
+        closure as a/b); ``T`` is the running detector residual; ``axor`` the running observable XOR
+        of the anchor pair + ``chosen``. Picks the next column from the most-constrained set detector.
+
+        Branch-and-bound: the still-missing ``plies+1`` columns (``plies`` pivots + 1 hash-close)
+        must XOR to ``T``; a GF(2) XOR of k columns has popcount ≤ k·dmax, so ``T`` with
+        ``popcount(T) > (plies+1)·dmax`` is unreachable and the subtree is pruned.
+        """
+        if T.bit_count() > (plies + 1) * dmax:           # B&B: residual too heavy to clear
+            return
+        cand = det_cols[_pivot_det(T)]
+        if plies == 1:                                   # last pivot column, then hash close
+            for c in cand:
+                if c == a or c == b or c in chosen:
+                    continue
+                cw = hget(T ^ CH[c])
+                if cw is None or cw == a or cw == b or cw == c or cw in chosen:
+                    continue
+                if (axor ^ CA[c] ^ CA[cw]) != 0:
+                    add(frozenset((a, b, c, cw, *chosen)))
+            return
+        lim = plies * dmax                               # bound for the child (plies-1 pivots + close)
+        for c in cand:                                   # interior pivot column
+            if c == a or c == b or c in chosen:
+                continue
+            newT = T ^ CH[c]
+            if newT == 0 or newT.bit_count() > lim:      # closed early, or too heavy for the child
+                continue
+            _extend(newT, chosen + (c,), axor ^ CA[c], plies - 1)
+
     # Map a flat pair index range [lo,hi) onto (i, j) upper-triangular pairs of cols0 without
     # materializing the whole list.
     import itertools as _it
@@ -285,27 +339,50 @@ def _mitm_chunk(task) -> Set[FrozenSet[int]]:
         Tfull = CH[a] ^ CH[b]
         if Tfull == 0:
             continue
-        for c1 in det_cols[(Tfull & -Tfull).bit_length() - 1]:
-            if c1 == a or c1 == b:
-                continue
-            T1 = Tfull ^ CH[c1]
-            if T1 == 0:
-                continue
-            for c2 in det_cols[(T1 & -T1).bit_length() - 1]:
-                if c2 == a or c2 == b or c2 == c1:
+        if n_pivot == 1:                                 # w == 4: pair + 1 pivot + hash close
+            ax0 = CA[a] ^ CA[b]
+            for c in det_cols[(Tfull & -Tfull).bit_length() - 1]:
+                if c == a or c == b:
                     continue
-                T2 = T1 ^ CH[c2]
-                if T2 == 0:
+                cw = hget(Tfull ^ CH[c])
+                if cw is None or cw == a or cw == b or cw == c:
                     continue
-                for c3 in det_cols[(T2 & -T2).bit_length() - 1]:
-                    if c3 == a or c3 == b or c3 == c1 or c3 == c2:
-                        continue
-                    c4 = hget(T2 ^ CH[c3])
-                    if c4 is None or c4 == a or c4 == b or c4 == c1 or c4 == c2 or c4 == c3:
-                        continue
-                    if (CA[a] ^ CA[b] ^ CA[c1] ^ CA[c2] ^ CA[c3] ^ CA[c4]) != 0:
-                        add(frozenset((a, b, c1, c2, c3, c4)))
+                if (ax0 ^ CA[c] ^ CA[cw]) != 0:
+                    add(frozenset((a, b, c, cw)))
+        else:
+            _extend(Tfull, (), CA[a] ^ CA[b], n_pivot)
     return res
+
+
+def _mitm_iter_progress(iterable, *, total, desc, verbose):
+    """Yield from ``iterable`` while showing progress.
+
+    A long weight-12 enumeration would otherwise run silently for minutes/hours. When attached to
+    an interactive terminal we use a ``tqdm`` bar; under a redirected log (the overnight case) tqdm
+    carriage-returns are noise, so we fall back to a flushed line every ~30s. ``verbose=False``
+    passes through untouched.
+    """
+    if not verbose:
+        yield from iterable
+        return
+    import sys as _sys
+    is_tty = bool(getattr(_sys.stdout, "isatty", lambda: False)())
+    if is_tty:
+        try:
+            from tqdm import tqdm
+            for x in tqdm(iterable, total=total, desc=desc, unit="task"):
+                yield x
+            return
+        except Exception:
+            pass
+    import time as _t
+    t0 = _t.time(); last = t0
+    for i, x in enumerate(iterable, 1):
+        yield x
+        now = _t.time()
+        if now - last >= 30.0 or i == total:
+            print(f"    {desc}: {i}/{total} tasks ({now - t0:.0f}s)", flush=True)
+            last = now
 
 
 def exact_min_weight_logicals_mitm(
@@ -331,23 +408,27 @@ def exact_min_weight_logicals_mitm(
     internally into ``(type, c, s)``-sorted order so each ``l*m`` toric orbit is a contiguous
     block and the canonical anchors are ``block*l*m`` — independent of the input numbering.
 
-    Algorithm (specialized to ``weight == 6``): each weight-6 logical is canonicalized by its
-    global-minimum detector, which a 36-shift toric translation maps onto one of the ``n_det/lm``
-    canonical anchors ``block*lm`` — so only those anchors are searched, then the results are
-    expanded by the ``lm`` translations. At an anchor d0 the logical is an anchor *pair* (two
-    columns whose min-detector is d0) plus four completion columns found by a detector-pivot chain
-    (see :func:`_mitm_chunk`). The pivot chain enumerates each completion column only from the
-    columns touching the current residual's lowest detector — tens of candidates — instead of the
-    original's O(N²) pair table + per-anchor-pair ``searchsorted``, which made the full DEM (N≈16k)
-    intractable. The independent anchors are run across a process pool when the work is large.
+    Algorithm (any even ``weight`` = D): each min-weight logical is canonicalized by its
+    global-minimum detector, which an ``lm``-shift toric translation maps onto one of the
+    ``n_det/lm`` canonical anchors ``block*lm`` — so only those anchors are searched, then the
+    results are expanded by the ``lm`` translations. At an anchor d0 the logical is an anchor *pair*
+    (two columns whose min-detector is d0) plus ``weight-2`` completion columns found by a
+    detector-pivot chain (see :func:`_mitm_chunk`): a ``(weight-3)``-deep chain then one hash-closed
+    column. The pivot chain enumerates each completion column only from the columns touching the
+    current residual's lowest detector — tens of candidates — instead of an O(N²) pair table, which
+    made the full DEM (N≈16k) intractable. Cost grows as ``anchor_pairs · avg_deg^(weight-4)``, so
+    the independent anchors are run across a process pool when the work is large (weight-12 always).
 
     ``seed`` is retained for signature compatibility but is now unused: the pivot chain closes each
     candidate with an *exact* ``col_h`` lookup, so the probabilistic GF(2) hash of the original
     (and its collision guard) is no longer needed.
     """
     import os, time
-    if weight != 6:
-        raise NotImplementedError("exact MITM is specialized to weight 6 (the 2+2+2 split)")
+    if weight < 4:
+        raise ValueError(f"weight must be an integer >= 4 (got {weight})")
+    # NB: weight may be odd. A codeword needs ≥2 columns sharing its global-min detector (GF(2)
+    # parity of *detectors*), which holds for any total weight — circuit DEMs with measurement
+    # noise have odd-weight space-time logicals (e.g. the 144 single-sector circuit distance is 11).
     n_det, N = H.shape
     lm = l * m
     if n_det % lm != 0:
@@ -382,6 +463,7 @@ def exact_min_weight_logicals_mitm(
         col_a[j] = a
 
     mindet = [((col_h[j] & -col_h[j]).bit_length() - 1) if col_h[j] else -1 for j in range(N)]
+    dmax = max((h.bit_count() for h in col_h if h), default=1)   # heaviest column, for the B&B bound
 
     results: Set[FrozenSet[int]] = set()
     t0 = time.time()
@@ -416,24 +498,29 @@ def exact_min_weight_logicals_mitm(
     # 'spawn' rule); otherwise each spawned worker re-executes the script.
     import multiprocessing as _mp
     avg_deg = N / max(n_det, 1)
-    cost = anchor_pairs * avg_deg * avg_deg
+    cost = anchor_pairs * avg_deg ** max(weight - 4, 1)   # ~leaf evals; weight-6 → avg_deg^2 as before
     use_pool = cost > 5_000_000 and ncpu > 1 and not _mp.current_process().daemon
+    desc = f"[mitm] w{weight} anchors"
+    if verbose:
+        print(f"  [mitm] weight-{weight} enumeration: {len(tasks)} tasks, anchor_pairs={anchor_pairs}, "
+              f"avg_deg={avg_deg:.1f}, {'pool' if use_pool else 'serial'} ...", flush=True)
     if use_pool:
         try:
             nproc = min(len(tasks), ncpu)
             with _mp.Pool(nproc, initializer=_mitm_init,
-                          initargs=(col_h, col_a, mindet, n_det)) as pool:
-                for r in pool.imap_unordered(_mitm_chunk, tasks):
+                          initargs=(col_h, col_a, mindet, n_det, weight, dmax)) as pool:
+                for r in _mitm_iter_progress(pool.imap_unordered(_mitm_chunk, tasks),
+                                             total=len(tasks), desc=desc, verbose=verbose):
                     results |= r
         except (OSError, ValueError, RuntimeError, ImportError):
             use_pool = False
     if not use_pool:
-        _mitm_init(col_h, col_a, mindet, n_det)
-        for t in tasks:
+        _mitm_init(col_h, col_a, mindet, n_det, weight, dmax)
+        for t in _mitm_iter_progress(tasks, total=len(tasks), desc=desc, verbose=verbose):
             results |= _mitm_chunk(t)
 
     if verbose:
-        print(f"  [mitm] {len(results)} canonical weight-6 logicals ({time.time() - t0:.0f}s)", flush=True)
+        print(f"  [mitm] {len(results)} canonical weight-{weight} logicals ({time.time() - t0:.0f}s)", flush=True)
 
     perms = build_circuit_translation_perms(None, Hr, l=l, m=m, det_coords=coords_r, verbose=False)
     full: Set[FrozenSet[int]] = set()
