@@ -665,6 +665,7 @@ def replica_exchange_estimate(
     sector: int = 0,
     mw_supports=None,
     seed_p_grid: Optional[Sequence[float]] = None,
+    gap_weights: Optional[Sequence[int]] = None,
     verbose: bool = True,
 ) -> Tuple[SplittingResult, dict]:
     """Replica-exchange (parallel-tempering) splitting estimate of P_logical(p_low).
@@ -722,11 +723,32 @@ def replica_exchange_estimate(
     if verbose and seed_p_grid:
         print(f"  [tempering] harvested {len(mid_seeds)} intermediate seeds at p={list(seed_p_grid)}", flush=True)
 
-    # Failing-config seed pool: min-weight logicals (low weight) + intermediate (crossover MC) + typical.
+    # Failing-config seed pool: min-weight logicals (low weight) + intermediate + typical (high weight).
     pool: List[FrozenSet[int]] = []
-    pool += min_weight_logical_seeds(circuit, col_to_mech, det_mat, obs_mat, decoder,
-                                     distance=distance, seed=int(rng.integers(2**31)),
-                                     sector=(sector if single_sector else None), supports=mw_supports)
+    mw_seeds = min_weight_logical_seeds(circuit, col_to_mech, det_mat, obs_mat, decoder,
+                                        distance=distance, seed=int(rng.integers(2**31)),
+                                        sector=(sector if single_sector else None), supports=mw_supports)
+    pool += mw_seeds
+    # Bridge the weight gap by INFLATING the (rare) min-weight failing configs up to target weights:
+    # pad a weight-w0 failing config with random columns until it reaches w_t, keeping it failing.
+    # Direct-MC harvest can't reach these weights (failures there are far too rare), so we synthesize
+    # the intermediate-weight seeds the crossover rungs need.
+    if gap_weights and mw_seeds:
+        base = [set(s) for s in mw_seeds]
+        n_inflated = 0
+        for wt in gap_weights:
+            got = 0
+            for _ in range(40):
+                if got >= 20:
+                    break
+                s = set(base[int(rng.integers(len(base)))])
+                while len(s) < wt:
+                    s.add(int(rng.integers(N_exp)))
+                if _config_fails(det_mat, obs_mat, col_to_mech, s, decoder):
+                    pool.append(frozenset(s)); got += 1; n_inflated += 1
+        if verbose:
+            print(f"  [tempering] inflated min-weight seeds to gap weights {list(gap_weights)} "
+                  f"(+{n_inflated} configs)", flush=True)
     pool += mid_seeds
     pool += mc_seeds
     if not pool:
@@ -756,7 +778,14 @@ def replica_exchange_estimate(
         if verbose and (sweep % 10 == 0 or sweep == n_sweeps - 1):
             _el = _time.time() - _t0
             _eta = _el / max(sweep, 1) * (n_sweeps - sweep)
-            print(f"  [tempering] sweep {sweep}/{n_sweeps}  ({_el:.0f}s, ETA {_eta:.0f}s)", flush=True)
+            _diag = ""
+            if swap_attempts.sum() > 0:   # running diagnostics to watch the bridge live
+                _sa = swap_accepts / np.maximum(swap_attempts, 1)
+                _diag = f"  swap {_sa.min():.2f}-{_sa.max():.2f}"
+                if wcount > 0:
+                    _mw = wsum / max(wcount * n_walkers, 1)
+                    _diag += f"  mean-w {_mw[0]:.0f}->{_mw[-1]:.0f}"
+            print(f"  [tempering] sweep {sweep}/{n_sweeps}  ({_el:.0f}s, ETA {_eta:.0f}s){_diag}", flush=True)
         # (a) local moves — balanced add/remove proposal, with the failing-set indicator decoded
         #     in ONE batch across all replicas per sub-step (failing is q-independent).
         for _sub in range(local_steps):

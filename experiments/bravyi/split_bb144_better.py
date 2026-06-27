@@ -23,8 +23,8 @@ from splitting import replica_exchange_estimate
 from repo_paths import RUNS
 
 P_REF = 0.003
-P_HIGH, P_LOW, NLEV = 0.006, 0.0012, 34          # ladder focused on the crossover, denser
-SEED_P_GRID = [0.004, 0.0028, 0.002]              # harvest intermediate-weight seeds across the gap
+P_HIGH, P_LOW, NLEV = 0.006, 0.0004, 44          # span the ~7e-4 cliff into the onset region, denser
+GAP_WEIGHTS = list(range(12, 78, 6))             # inflate min-weight seeds to these weights (bridge w~7-90)
 OUTDIR = RUNS / "bravyi" / "bb12" / "bb144_split_better"
 
 
@@ -49,22 +49,30 @@ def main():
 
     circuit = build_bb_circuit(BB_144_12_12, ErrorModel(p_phys=P_REF, p_meas=P_REF), rounds=12, idle_noise=True)
 
-    if args.pilot:
-        supports, nwalk, nsweep, burn = [], 4, 20, 5
-        out, tag = OUTDIR / "splitting_pilot.json", "PILOT"
+    # Min-weight seeds are the inflation base; the partial search finds none for bb144, so use the
+    # systematic search but CACHE it (paid once, reused by later runs / the other mode).
+    cache = OUTDIR / "mw_supports.json"
+    if cache.exists():
+        supports = [frozenset(s) for s in json.loads(cache.read_text())]
+        print(f"[seeds] reusing {len(supports)} cached min-weight logicals", flush=True)
     else:
         H, A, mult, probs, _ = single_sector_dem(circuit, detector_type=0)
-        print("[seeds] parallel min-weight logical search (workers=24) ...", flush=True)
+        print("[seeds] systematic min-weight logical search (workers=24, ~45min) ...", flush=True)
         t = time.time()
         supports = list(find_min_weight_logicals(
             circuit, 11, max_trials=200, osd_order=10, max_iter=200, priors=probs,
             seed=42, progress_every=500, workers=24, systematic=True, sector=0))
         print(f"[seeds] found {len(supports)} min-weight logicals in {time.time()-t:.0f}s", flush=True)
-        supports, nwalk, nsweep, burn = list(supports), 10, 110, 40
+        cache.write_text(json.dumps([sorted(int(c) for c in s) for s in supports]))
+    if args.pilot:
+        nwalk, nsweep, burn = 4, 20, 5
+        out, tag = OUTDIR / "splitting_pilot.json", "PILOT"
+    else:
+        nwalk, nsweep, burn = 10, 110, 40
         out, tag = OUTDIR / "splitting.json", "FULL"
 
     print(f"[{tag}] bridge-fix replica-exchange: ladder {P_HIGH:.0e}->{P_LOW:.0e} x{NLEV}, "
-          f"walkers={nwalk}, sweeps={nsweep}, seed_p_grid={SEED_P_GRID}, n_seeds={len(supports)} ...",
+          f"walkers={nwalk}, sweeps={nsweep}, gap_weights={GAP_WEIGHTS}, n_seeds={len(supports)} ...",
           flush=True)
     _keep_awake(True); t0 = time.time()
     try:
@@ -72,7 +80,7 @@ def main():
             circuit, _dec(), p_ref=P_REF, p_high=P_HIGH, p_low=P_LOW, n_levels=NLEV,
             n_walkers=nwalk, local_steps=4, n_sweeps=nsweep, burn_in=burn, anchor_shots=4000,
             distance=11, seed=42, single_sector=True, sector=0,
-            mw_supports=supports, seed_p_grid=SEED_P_GRID)
+            mw_supports=supports, gap_weights=GAP_WEIGHTS)
     finally:
         _keep_awake(False)
     dt = time.time() - t0
@@ -80,7 +88,7 @@ def main():
     out.write_text(json.dumps({
         "tempered": {"p_ladder": pl.tolist(), "P_logical": tP.tolist(), "P_logical_se": tSE.tolist()},
         "diagnostics": {"swap_accept": diag["swap_accept"], "mean_weight": diag["mean_weight"]},
-        "seeded": True, "n_seeds": len(supports), "seed_p_grid": SEED_P_GRID,
+        "seeded": True, "n_seeds": len(supports), "gap_weights": GAP_WEIGHTS,
         "params": {"n_walkers": nwalk, "n_sweeps": nsweep, "n_levels": NLEV,
                    "p_high": P_HIGH, "p_low": P_LOW}}, indent=2))
     print(f"  done ({dt:.0f}s): ladder {pl[0]:.2e}..{pl[-1]:.2e}, P {tP[0]:.2e}..{tP[-1]:.2e}", flush=True)
