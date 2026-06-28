@@ -80,12 +80,13 @@ level's chains start from the final states of the previous level's chains.
 from __future__ import annotations
 
 import itertools
+import math
 from dataclasses import dataclass
 from typing import Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 import numpy as np
 import stim
-from scipy.special import logsumexp
+from scipy.special import logsumexp, expit
 
 from importance_sampling import _expand, _parse_dem
 
@@ -864,6 +865,286 @@ def replica_exchange_estimate(
         q_ladder=q_ladder, p_ladder=p_ladder, P_logical=P_logical, P_logical_se=P_logical * rel,
         log_ratios=combined, log_ratios_se=combined_se, P_high=P_high, P_high_se=P_high_se,
         per_level_chains=[], n_seeds_used=n_walkers, q_base=q_base, p_ref=p_ref, n_expanded=N_exp,
+    ), diag
+
+
+# ---------------------------------------------------------------------------
+# Paper-faithful multi-seeded splitting  (arXiv:2511.15177 Alg. 2/3 + §5.3)
+# ---------------------------------------------------------------------------
+#
+# This is a FAITHFUL implementation of the paper's actual method (as opposed to
+# `replica_exchange_estimate`, which is the paper's *future-work* parallel-tempering
+# idea). It implements:
+#   * Algorithm 3 — single-random-bit-flip Metropolis on pi(E|F)=q^|E|(1-q)^(N-|E|),
+#     symmetric proposal (no add/remove Hastings factor), decoder failing-set test.
+#   * Algorithm 2 — BAR (Bennett) ratio estimator g(x)=1/(1+x) with optimal c (Eq.17),
+#     and the adaptive precision controller: grow each level's chain until
+#     (sigma + Delta) <= eps/sqrt(t), where sigma is the relative SE of the g-terms
+#     and Delta is the full-vs-first-half mixing discrepancy.
+#   * §5.3 multi-seeded warm-start — L Monte-Carlo-sampled *typical* failing seeds at
+#     p_0; for each, M chains; every lower-p chain is initialised from the FINAL
+#     failing config of the adjacent higher-p chain. LM estimates -> mean + std bars.
+#   * Eq.18 ladder spacing  p_{j+1}=p_j 2^{-1/sqrt(w_j)}, w_j=max(D/2, p_j N).
+#
+# Deviation (documented): the adaptive sigma+Delta is evaluated on the POOLED
+# level-i samples across the LM instances (not per single chain) so the LM chains at
+# a level can advance in one batched decode; this only changes *when* we stop growing
+# a level, not the estimator. Set L=M=1 to recover the strict per-chain controller.
+
+
+def _eq18_ladder(p_high: float, p_low: float, N_exp: int, distance: int,
+                 max_levels: int = 400) -> np.ndarray:
+    """Paper Eq.18 downward ladder: p_{j+1}=p_j 2^(-1/sqrt(w_j)), w_j=max(D/2,p_j N).
+
+    Starts at p_high and steps down until <= p_low (inclusive last point)."""
+    w0 = max(distance / 2.0, 1.0)
+    ps = [float(p_high)]
+    for _ in range(max_levels):
+        pj = ps[-1]
+        wj = max(distance / 2.0, pj * N_exp, w0)
+        pj1 = pj * 2.0 ** (-1.0 / math.sqrt(wj))
+        ps.append(pj1)
+        if pj1 <= p_low:
+            break
+    return np.array(ps)
+
+
+def _alg3_advance(configs: List[set], q: float, n_steps: int,
+                  det_mat: np.ndarray, obs_mat: np.ndarray, col_to_mech: np.ndarray,
+                  decoder, N_exp: int, rng: np.random.Generator,
+                  collect_from: int = 0, thin: int = 1):
+    """Advance every config in `configs` by `n_steps` Algorithm-3 Metropolis steps at
+    rate q (in place). Symmetric single-random-bit proposal; pi-accept then decoder
+    failing-set test. Returns (weights_per_config, n_transitions). Only pi-accepted
+    moves are decoded (one batched decode per step)."""
+    logodds = math.log(q) - math.log1p(-q)        # log(q/(1-q)) < 0 for small q
+    n = len(configs)
+    M = det_mat.shape[1]
+    weights: List[List[int]] = [[] for _ in range(n)]
+    trans = 0
+    for step in range(n_steps):
+        bits = rng.integers(N_exp, size=n)
+        urand = rng.random(size=n)
+        cands = []                                 # (k, newset)
+        for k in range(n):
+            cur = configs[k]; b = int(bits[k])
+            if b in cur:                           # propose REMOVE: pi-ratio (1-q)/q, accept prob 1
+                ns = set(cur); ns.discard(b); cands.append((k, ns))
+            elif math.log(urand[k]) < logodds:     # propose ADD: pi-accept w.p. q/(1-q)
+                ns = set(cur); ns.add(b); cands.append((k, ns))
+            # else: pi-reject the add -> stay, no decode
+        if cands:
+            synd = np.zeros((len(cands), M), dtype=bool)
+            truth = np.zeros((len(cands), obs_mat.shape[1]), dtype=bool)
+            for idx, (k, ns) in enumerate(cands):
+                synd[idx], truth[idx] = _config_syndrome_truth(det_mat, obs_mat, col_to_mech, ns)
+            preds = decoder.decode_batch(synd)
+            fails = np.any(preds != truth, axis=1)
+            for idx, (k, ns) in enumerate(cands):
+                if fails[idx]:                     # accept only if still failing (E' in F)
+                    configs[k] = ns; trans += 1
+        if step >= collect_from and ((step - collect_from) % thin == 0):
+            for k in range(n):
+                weights[k].append(len(configs[k]))
+    return weights, trans
+
+
+def _sigma_delta(weights_pooled: np.ndarray, q_lo: Optional[float], q_hi: Optional[float],
+                 q_i: float, N_exp: int) -> Tuple[float, float]:
+    """Algorithm-2 precision metrics on pooled level-i weight samples (c=1).
+
+    g_-(E)=g(pi_i/pi_{i-1}) uses q_lo=q_{i-1}; g_+(E)=g(pi_i/pi_{i+1}) uses q_hi=q_{i+1}.
+    Returns (sigma, Delta): sigma = max relative SE over the available sides; Delta =
+    max full-vs-first-half relative discrepancy. Missing side (anchor / last) skipped."""
+    w = weights_pooled.astype(float)
+    T = w.size
+    if T < 2:
+        return float("inf"), float("inf")
+    half = max(1, T // 2)
+    sig_terms = []; del_terms = []
+    for q_other in (q_lo, q_hi):
+        if q_other is None:
+            continue
+        # u = log(pi_i/pi_other) = w log(q_i/q_other) + (N-w) log((1-q_i)/(1-q_other))
+        u = w * (math.log(q_i) - math.log(q_other)) + (N_exp - w) * (math.log1p(-q_i) - math.log1p(-q_other))
+        g = expit(-u)                              # g(pi_i/pi_other) = 1/(1+pi_i/pi_other)
+        gm = g.mean()
+        if gm <= 0:
+            return float("inf"), float("inf")
+        sig_terms.append(g.std(ddof=1) / gm / math.sqrt(T))
+        del_terms.append(abs(gm - g[:half].mean()) / gm)
+    if not sig_terms:
+        return 0.0, 0.0
+    return max(sig_terms), max(del_terms)
+
+
+def _bar_ratio(w_a: np.ndarray, w_b: np.ndarray, q_a: float, q_b: float,
+               N_exp: int, iters: int = 3) -> float:
+    """BAR estimate of r = P(p_b)/P(p_a) from level-a (higher p) and level-b (lower p)
+    weight samples (Eq.17), iterating c -> r a few times. a=i-1, b=i."""
+    if w_a.size == 0 or w_b.size == 0:
+        return float("nan")
+    la = math.log(q_a) - math.log(q_b)                       # >0
+    lb = math.log1p(-q_a) - math.log1p(-q_b)                 # <0
+    da = w_a.astype(float) * la + (N_exp - w_a.astype(float)) * lb   # delta on a-samples
+    db = w_b.astype(float) * la + (N_exp - w_b.astype(float)) * lb   # delta on b-samples
+    lnc = 0.0
+    for _ in range(iters):
+        num = float(expit(-(lnc + da)).sum())                # Σ_a g(c pi_a/pi_b)
+        den = float(expit((lnc + db)).sum())                 # Σ_b g(pi_b/(c pi_a))
+        if num <= 0.0 or den <= 0.0:
+            break
+        lnc = lnc + math.log(num) - math.log(den)            # ln r = ln c + ln(num/den)
+    return math.exp(lnc)
+
+
+def multi_seeded_split_estimate(
+    circuit: stim.Circuit,
+    decoder,
+    *,
+    p_ref: float,
+    p_high: float,
+    p_low: float,
+    L: int = 12,
+    M: int = 3,
+    T_init: int = 10_000,
+    T_cap: Optional[int] = None,
+    eps: float = 0.25,
+    lam: float = 2.0,
+    burn_frac: float = 0.1,
+    thin: int = 1,
+    ladder: str = "eq18",
+    n_levels: Optional[int] = None,
+    distance: Optional[int] = None,
+    anchor_shots: int = 5000,
+    q_base: Optional[float] = None,
+    single_sector: bool = False,
+    sector: int = 0,
+    seed: Optional[int] = None,
+    verbose: bool = True,
+) -> Tuple[SplittingResult, dict]:
+    """Paper-faithful multi-seeded splitting (arXiv:2511.15177 Alg. 2/3 + §5.3).
+
+    See the module section comment above for the algorithm. Returns
+    (SplittingResult, diagnostics). ``P_logical_se`` is the across-instance std of the
+    LM estimates (the paper's error bar), NOT a /sqrt(LM) standard error.
+
+    For the BB(12) reproduction the paper uses L=12, M=3, T_init=1e6; that is hours of
+    compute. Validate first on a tiny code (e.g. [[18,4,4]]) with T_init~1e4.
+    """
+    rng = np.random.default_rng(seed)
+
+    if single_sector:
+        from min_weight import single_sector_dem
+        H, A, mult, probs_merged, _ = single_sector_dem(circuit, detector_type=sector)
+        det_mat = H.T.astype(bool); obs_mat = A.T.astype(bool)
+        if q_base is None:
+            q_base = float(_parse_dem(circuit)[0].min())
+        col_to_mech = np.repeat(np.arange(H.shape[1], dtype=np.int64), mult)
+        decoder.setup_from_matrices(H, probs_merged, A)
+    else:
+        probs, det_mat, obs_mat = _parse_dem(circuit)
+        col_to_mech, q_base, _ = _expand(probs, q_base)
+        decoder.setup(circuit)
+    N_exp = col_to_mech.shape[0]
+
+    # --- ladder ---
+    if ladder == "eq18":
+        if distance is None:
+            raise ValueError("ladder='eq18' needs `distance` (for w_j=max(D/2,p_j N))")
+        p_ladder = _eq18_ladder(p_high, p_low, N_exp, distance)
+    elif ladder == "geom":
+        if n_levels is None:
+            raise ValueError("ladder='geom' needs n_levels")
+        p_ladder = np.geomspace(p_high, p_low, n_levels + 1)
+    else:
+        raise ValueError("ladder must be 'eq18' or 'geom'")
+    q_ladder = np.clip(q_base * (p_ladder / p_ref), 1e-300, 1.0 - 1e-15)
+    nlev = len(q_ladder)            # number of rates (chains run at every rate)
+    t_edges = nlev - 1             # number of ratio steps; per-level budget eps/sqrt(t)
+    if T_cap is None:
+        T_cap = 32 * T_init
+    if verbose:
+        print(f"  [multiseed] ladder {nlev} rates  p {p_ladder[0]:.3e}->{p_ladder[-1]:.3e} "
+              f"({ladder}); N_exp={N_exp}, L={L}, M={M}, eps/sqrt(t)={eps/math.sqrt(max(t_edges,1)):.3f}",
+              flush=True)
+
+    # --- anchor: MC at p_0, harvest L typical failing seeds ---
+    P_high, P_high_se, mc_fails = _direct_mc_failure_prob(
+        det_mat, obs_mat, col_to_mech, decoder, float(q_ladder[0]), anchor_shots, rng)
+    if P_high <= 0.0 or len(mc_fails) < 1:
+        raise ValueError(f"direct MC at p_high={p_high:g} saw no failures; raise p_high/anchor_shots")
+    if len(mc_fails) < L:
+        if verbose:
+            print(f"  [multiseed] only {len(mc_fails)} MC seeds < L={L}; sampling with replacement", flush=True)
+        idx = rng.integers(len(mc_fails), size=L)
+        seeds_L = [mc_fails[int(i)] for i in idx]
+    else:
+        seeds_L = list(mc_fails[:L])
+    n_inst = L * M
+    # instance (l,m) starts from typical seed l
+    configs = [set(seeds_L[l]) for l in range(L) for _ in range(M)]
+
+    # --- march levels downward, warm-starting + adaptive growth ---
+    weights_per_level: List[List[np.ndarray]] = []
+    diag_levels = []
+    import time as _time; _t0 = _time.time()
+    for i in range(nlev):
+        q_i = float(q_ladder[i])
+        q_lo = float(q_ladder[i - 1]) if i > 0 else None       # higher p neighbour (a)
+        q_hi = float(q_ladder[i + 1]) if i < nlev - 1 else None  # lower p neighbour
+        acc = [[] for _ in range(n_inst)]
+        T = 0; lam_p = lam; first = True; sd = (float("inf"), float("inf"))
+        while True:
+            chunk = T_init if first else int(math.ceil(lam_p * T_init))
+            cfrom = int(burn_frac * chunk) if first else 0
+            w_chunk, ntr = _alg3_advance(configs, q_i, chunk, det_mat, obs_mat, col_to_mech,
+                                         decoder, N_exp, rng, collect_from=cfrom, thin=thin)
+            for k in range(n_inst):
+                acc[k].extend(w_chunk[k])
+            T += chunk
+            pooled = np.array([w for k in range(n_inst) for w in acc[k]], dtype=float)
+            sd = _sigma_delta(pooled, q_lo, q_hi, q_i, N_exp)
+            if not first:
+                lam_p *= lam
+            first = False
+            if (sd[0] + sd[1]) <= eps / math.sqrt(max(t_edges, 1)) or T >= T_cap:
+                break
+        weights_per_level.append([np.array(acc[k], dtype=float) for k in range(n_inst)])
+        mw = float(np.mean([np.mean(acc[k]) for k in range(n_inst) if acc[k]]))
+        diag_levels.append({"p": float(p_ladder[i]), "T": T, "sigma": sd[0], "Delta": sd[1],
+                            "mean_weight": mw, "transitions": int(ntr)})
+        if verbose:
+            print(f"  [multiseed] level {i:2d}/{nlev-1} p={p_ladder[i]:.3e}  T={T:>8d}  "
+                  f"sig+del={sd[0]+sd[1]:.3f}  mean-w={mw:5.1f}  ({_time.time()-_t0:.0f}s)", flush=True)
+
+    # --- per-instance splitting estimates via BAR, then mean + std bars ---
+    P_inst = np.zeros((n_inst, nlev)); P_inst[:, 0] = P_high
+    logr_inst = np.full((n_inst, t_edges), np.nan)
+    for k in range(n_inst):
+        for i in range(1, nlev):
+            r = _bar_ratio(weights_per_level[i - 1][k], weights_per_level[i][k],
+                           float(q_ladder[i - 1]), float(q_ladder[i]), N_exp)
+            logr_inst[k, i - 1] = math.log(r) if (r and r > 0 and np.isfinite(r)) else np.nan
+            P_inst[k, i] = P_inst[k, i - 1] * (r if (r and np.isfinite(r)) else 1.0)
+
+    P_logical = np.nanmean(P_inst, axis=0)
+    P_logical_se = np.nanstd(P_inst, axis=0, ddof=1) if n_inst > 1 else np.zeros(nlev)
+    log_ratios = np.nanmean(logr_inst, axis=0)
+    log_ratios_se = np.nanstd(logr_inst, axis=0, ddof=1) if n_inst > 1 else np.zeros(t_edges)
+
+    diag = {"levels": diag_levels, "L": L, "M": M, "n_inst": n_inst, "ladder": ladder,
+            "P_high": float(P_high), "eps": eps,
+            "mean_weight": [d["mean_weight"] for d in diag_levels],
+            "T_per_level": [d["T"] for d in diag_levels],
+            "sigma_plus_delta": [d["sigma"] + d["Delta"] for d in diag_levels]}
+    if verbose:
+        print(f"  [multiseed] done: P({p_ladder[0]:.2e})={P_logical[0]:.3e} -> "
+              f"P({p_ladder[-1]:.2e})={P_logical[-1]:.3e}  (±{P_logical_se[-1]:.1e})", flush=True)
+    return SplittingResult(
+        q_ladder=q_ladder, p_ladder=p_ladder, P_logical=P_logical, P_logical_se=P_logical_se,
+        log_ratios=log_ratios, log_ratios_se=log_ratios_se, P_high=P_high, P_high_se=P_high_se,
+        per_level_chains=[], n_seeds_used=n_inst, q_base=q_base, p_ref=p_ref, n_expanded=N_exp,
     ), diag
 
 

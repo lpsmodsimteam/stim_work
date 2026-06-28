@@ -60,10 +60,32 @@ is an unreliable absolute-LER estimator for codes with many inequivalent logical
 - Ground-truth MC + the bias probe (per-rung weight vs truth): see the analysis in this directory's
   git history / the conversation that produced this note.
 
-## If revisiting
+## Root cause confirmed against the paper, and the faithful method implemented
 
-The diagnosis points at within-rung weight equilibration, not cross-rung mixing. Things that *might*
-help (all more compute, none guaranteed to close the gap): far more `local_steps`/sweeps; a
-weight-biased / cluster proposal that moves O(many) columns per step; many more rungs so each rung's
-weight relaxation is easier. Given the IS ansatz is direct-MC-validated, the pragmatic answer is to
-use IS for bb144 and keep splitting as a cross-check.
+Reading §5 of arXiv:2511.15177 directly settled *why* `replica_exchange_estimate` under-estimates:
+**it is not the paper's method.** The paper's actual recipe was never implemented; we built its
+*future-work* idea (parallel tempering, named as future work in its limitations) on top of an
+estimator and seeding the paper warns against. Specifically, the paper's method has three parts we
+were missing:
+
+- **Algorithm 2 — BAR ratio estimator + adaptive precision.** Bidirectional Bennett estimator
+  `r_j = c·⟨g(cπ_{j-1}/π_j)⟩_{j-1}/⟨g(c⁻¹π_j/π_{j-1})⟩_j`, `g(x)=1/(1+x)`, optimal `c≈r_j`; grow each
+  level's chain until `(σ+Δ) ≤ ε/√t` (relative SE σ + full-vs-first-half mixing discrepancy Δ,
+  ε=0.25). We used a **one-sided** forward reweight (highest-variance, tail-dominated) with **fixed**
+  chain length and **no** precision controller.
+- **§5.3 multi-seeded warm-start.** Seed `p_0` with **MC-sampled *typical* failing configs**, and
+  seed every lower-`p` chain from the **adjacent higher-`p` chain's final failing config**. The
+  paper's BB footnote states their BB runs failed precisely when they seeded on **low-/min-weight
+  circuit logicals** — which is exactly what our pool did, and exactly the too-high/too-low weight
+  miscalibration measured above.
+- **Eq. 18 ladder** `p_{j±1}=p_j·2^{∓1/√w_j}`, `w_j=max(D/2, p_jN)` (we used plain `geomspace`).
+
+These are now implemented faithfully in `splitting.multi_seeded_split_estimate` (Algorithm 2/3 +
+§5.3), kept separate from `replica_exchange_estimate` (the future-work variant). On the tiny
+[[18,4,4]] code it **straddles** direct MC (0.99×, 0.72×, 0.85×, 1.37× across p, MC truth within the
+instance-spread error bars) — i.e. noisy-but-unbiased, with **no** systematic downward collapse.
+
+**Pending:** run `experiments/bravyi/split_bb144_multiseed.py` (use `--pilot` first) to test whether
+the faithful method closes the gap to the IS-ansatz on bb144. The paper itself needed `T_init=10⁶`
+and large compute for BB(12) (and dropped BB(18)), so this is a heavy run. Until that lands, the
+verdict stands: **use IS for bb144; splitting is a cross-check.**

@@ -28,6 +28,9 @@ from splitting import (
     high_rate_mc_seeds,
     splitting_estimate,
     SplittingResult,
+    _eq18_ladder,
+    _bar_ratio,
+    multi_seeded_split_estimate,
 )
 
 
@@ -207,3 +210,40 @@ def test_splitting_estimate_smoke():
     assert res.P_logical[0] == pytest.approx(res.P_high, rel=1e-12)
     # Lower p should not give a higher estimate (monotone-ish; allow MC slack).
     assert res.P_logical[-1] <= res.P_logical[0] * 5
+
+
+# --- paper-faithful multi-seeded splitting (Alg. 2/3 + §5.3) ----------------
+
+def test_eq18_ladder_descends_to_p_low():
+    """Eq.18 ladder starts at p_high, decreases monotonically, and reaches <= p_low."""
+    ladder = _eq18_ladder(p_high=0.03, p_low=0.005, N_exp=5000, distance=4)
+    assert ladder[0] == pytest.approx(0.03)
+    assert ladder[-1] <= 0.005
+    assert np.all(np.diff(ladder) < 0)
+
+
+def test_bar_ratio_trivial_is_one():
+    """With q_a == q_b the BAR ratio P(p_b)/P(p_a) must be exactly 1 for any weights."""
+    rng = np.random.default_rng(0)
+    w_a = rng.integers(2, 20, size=500).astype(float)
+    w_b = rng.integers(2, 20, size=500).astype(float)
+    r = _bar_ratio(w_a, w_b, q_a=1e-3, q_b=1e-3, N_exp=10_000)
+    assert r == pytest.approx(1.0, abs=1e-9)
+
+
+def test_multiseed_estimate_smoke():
+    sim = SurfaceCodeSimulator(distance=3)
+    circuit = sim.build_circuit(ErrorModel.symmetric(0.02), rounds=3)
+    res, diag = multi_seeded_split_estimate(
+        circuit, PyMatchingDecoder(),
+        p_ref=0.02, p_high=0.03, p_low=0.02, ladder="geom", n_levels=3,
+        L=2, M=2, T_init=300, eps=0.5, distance=3, anchor_shots=400, seed=0,
+        verbose=False,
+    )
+    assert isinstance(res, SplittingResult)
+    assert res.P_logical.shape == res.q_ladder.shape
+    assert np.all(np.isfinite(res.P_logical))
+    assert res.P_logical[0] == pytest.approx(res.P_high, rel=1e-12)
+    assert res.P_logical[-1] <= res.P_logical[0] * 5
+    assert diag["n_inst"] == 4
+    assert len(diag["levels"]) == res.q_ladder.shape[0]

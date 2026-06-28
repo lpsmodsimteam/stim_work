@@ -71,12 +71,17 @@ converged low-p extrapolator. Both are flagged in `splitting.py`'s module docstr
    orders of magnitude short at the lower ladder levels. Crank it up and watch the
    across-seed spread (`log_ratios_se`) shrink before trusting a point.
 2. **Levels are not warm-started (deviation from §5).** The paper seeds each lower-q
-   chain from the *final failing configs of the adjacent higher-q chain*. The current
-   code instead reuses one fixed seed pool for every level, so lower levels start cold
-   from too-high-weight configs and **bias their ratios downward**. The recommended
-   fix is to propagate each level's final chain states as the next level's seeds
-   (sequential/annealed splitting) — this both aligns with the paper and dramatically
-   improves mixing because adjacent `π_q` overlap. This is the highest-value next edit.
+   chain from the *final failing configs of the adjacent higher-q chain*. The
+   `splitting_estimate`/`replica_exchange_estimate` code instead reuses one fixed seed
+   pool for every level, so lower levels start cold from too-high-weight configs and
+   **bias their ratios downward** (measured directly for bb144: see
+   `docs/bb144_splitting_vs_is.md`).
 
-Until (2) is addressed, validate splitting only over the p-range where IS+ansatz also
-have signal, and read agreement there as the success criterion — not the low-p tail.
+   **Now addressed:** `splitting.multi_seeded_split_estimate` is a faithful
+   implementation of the paper's Algorithm 2/3 + §5.3 — sequential warm-start from
+   MC-sampled *typical* failing configs, the BAR ratio estimator, the adaptive σ+Δ
+   precision controller, and the Eq.18 ladder. Prefer it over the older estimators when
+   you want the paper's method; the older two remain for comparison.
+
+Validate splitting over the p-range where IS+ansatz also have signal, and read
+agreement there as the success criterion — not the low-p tail.
