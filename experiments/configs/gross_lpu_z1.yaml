@@ -1,0 +1,18 @@
+# SEAM (P1): gross-code LPU Z-bar-1 logical measurement (ZX-dual of gross_lpu_x1).
+label: gross_lpu_z1
+code_name: bb144
+experiment: lpu_z1
+decoder_name: relay
+techniques: [IS, I]
+
+p_ref: 0.005
+lpu_C: 10
+lpu_d_init: 12
+ansatz_model: f5
+
+mw_single_sector: false
+
+weights_range: [1, 189]
+adaptive: true
+adaptive_failures: 20
+adaptive_shots_max: 1000000

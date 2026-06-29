@@ -1,0 +1,50 @@
+# Two-gross [[288,12,18]] memory, all 3 techniques. Construction matches Bravyi et al.
+# arXiv:2308.07915 Table 3 (A = x^3+y^2+y^7, B = y^3+x+x^2); n=288/k=12 verified.
+# Budgets tuned from a sizing probe: N_expanded=542,592 (3x BB(12)), q_base=1.33e-4, 2736 sector
+# detectors; the single-sector failure onset is detectable around w~110 (f rises 0.003->0.20 over
+# w=110..160), with the dominant binomial mass reaching the failure region only at p>~3.5e-3.
+label: bb288_memory
+code_name: bb288
+experiment: memory
+decoder_name: relay
+techniques: [II, IS, I, III]
+split_method: multiseed
+
+p_ref: 0.002
+p_lo: 3.0e-4
+p_hi: 4.0e-3
+ansatz_model: f5
+
+# Relay-BP (same family as BB(12); the 288 DEM is ~3x larger so each decode is heavier).
+relay_gamma0: 0.125
+relay_pre_iter: 80
+relay_num_sets: 100
+relay_set_max_iter: 60
+relay_stop_nconv: 6
+
+# Technique II — D=18 is EVEN, so IF the circuit fault distance is even and weight-D circuit
+# logicals are found, Proposition 1 gives an exact f0 onset pin for the ansatz (unlike BB(12)'s odd
+# circuit distance). This BP-OSD min-weight search at d~18 over 12 logicals is the slowest step;
+# drop "II" from techniques to skip it.
+mw_workers: 24
+mw_systematic: true
+
+# Technique I / IS — sweep the rising onset region (~110) up through the mass at p_hi (mu~150,
+# w_hi~200). Adaptive 'hit N failures', high->low; the f5 ansatz extrapolates the onset to low p.
+# shots_max bounded (the 288 decode is heavy) so near-onset weights don't run away.
+weights_range: [70, 205]
+weight_stride: 4
+adaptive: true
+adaptive_failures: 10
+adaptive_shots_min: 4
+adaptive_shots_max: 100000
+
+# Technique III — multi-seeded splitting. At N_exp=542k single-flip mixing is even slower than BB(12)
+# and the estimate under-shoots deep sub-threshold (docs/bb144_splitting_vs_is.md). STRICTLY a
+# cross-check; trust the IS ansatz for the absolute LER. Very expensive — drop "III" to skip.
+split_p_high: 0.006
+split_p_low: 0.002
+split_L: 12
+split_M: 3
+split_T_init: 2000000
+split_ladder: eq18

@@ -1479,6 +1479,41 @@ def build_logical_z1_circuit(
 
 
 # ---------------------------------------------------------------------------
+# Future LPU circuit seams (registered in experiment_runner.CIRCUIT_BUILDERS).
+# These are placeholders for the next experiment families — implement here so the
+# rest of the framework (configs, SLURM launcher, techniques) needs no changes.
+# ---------------------------------------------------------------------------
+
+def build_automorphism_circuit(
+    error_model: ErrorModel,
+    C: int = 10,
+    d_init: int = 12,
+) -> stim.Circuit:
+    """SEAM: gross-code automorphism (logical-Clifford-by-permutation) circuit via the LPU.
+
+    Not yet implemented. The half-LPU machinery (HalfLPU, build_lpu_cycle, _build_circuit) is the
+    intended foundation — an automorphism applies a qubit/check permutation realised through the
+    same gauging-measurement rounds. Implement here and register in CIRCUIT_BUILDERS['automorphism'].
+    """
+    raise NotImplementedError("build_automorphism_circuit: LPU automorphism circuit not yet built")
+
+
+def build_joint_pauli_circuit(
+    error_model: ErrorModel,
+    operators: str = "X1X2",
+    C: int = 10,
+    d_init: int = 12,
+) -> stim.Circuit:
+    """SEAM: joint multi-logical Pauli measurement (e.g. X̄₁X̄₂) via the LPU.
+
+    Not yet implemented. Generalises build_logical_x1/z1 (single-logical measurement) to a joint
+    measurement of several logicals through one gauging-measurement protocol. Implement here and
+    register in CIRCUIT_BUILDERS['joint_pauli'].
+    """
+    raise NotImplementedError("build_joint_pauli_circuit: LPU joint-Pauli circuit not yet built")
+
+
+# ---------------------------------------------------------------------------
 # Layer 9 — Simulation sweep API
 # ---------------------------------------------------------------------------
 

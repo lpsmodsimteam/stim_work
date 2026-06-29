@@ -1,0 +1,21 @@
+# SEAM (P1): gross-code LPU X-bar-1 logical measurement (tour-de-gross gauging protocol).
+# The LPU circuit builder exists (gross_code_lpu_tdg.build_logical_x1_circuit). Technique II/III
+# assume the single-Z-sector memory representation, so this config runs IS + ansatz only for now;
+# extend min_weight/splitting for LPU circuits to enable II/III.
+label: gross_lpu_x1
+code_name: bb144
+experiment: lpu_x1
+decoder_name: relay
+techniques: [IS, I]
+
+p_ref: 0.005
+lpu_C: 10
+lpu_d_init: 12
+ansatz_model: f5
+
+mw_single_sector: false        # LPU circuits are decoded on the full DEM, not the Z-sector projection
+
+weights_range: [1, 189]
+adaptive: true
+adaptive_failures: 20
+adaptive_shots_max: 1000000

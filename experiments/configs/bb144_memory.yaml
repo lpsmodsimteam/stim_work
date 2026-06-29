@@ -1,0 +1,41 @@
+# BB(12) = [[144,12,12]] gross-code memory, all 3 techniques.
+# P0 — runs tomorrow. The heavy one (N_expanded ~ 1.8e5).
+label: bb144_memory
+code_name: bb144
+experiment: memory
+decoder_name: relay
+techniques: [II, IS, I, III]
+split_method: multiseed
+
+p_ref: 0.003
+ansatz_model: f5
+
+# Relay-BP tuned for BB(12) (the user's validated settings: fewer relay legs than BB(6)).
+relay_gamma0: 0.125
+relay_pre_iter: 80
+relay_num_sets: 100
+relay_set_max_iter: 60
+relay_stop_nconv: 6
+
+# Technique II — odd circuit distance (D~11), so no even-D f0 pin; the symmetry-augmented BP-OSD
+# search still reports D and |L(D)|. This is the slow step; drop "II" from techniques to skip it.
+mw_workers: 24
+mw_systematic: true
+
+# Technique I / IS — adaptive, sweeping high->low and skipping ~3/4 of weights (onset ~46; the
+# ansatz interpolates the skipped weights). This is the user's validated adaptive sweep.
+weights_range: [5, 113]
+weight_stride: 4
+adaptive: true
+adaptive_failures: 10
+adaptive_shots_max: 1000000
+
+# Technique III — multi-seeded splitting. NOTE (docs/bb144_splitting_vs_is.md): single-flip mixing is
+# slow at N~1.8e5 and the estimate under-shoots deep sub-threshold even at large T_init. Treat as a
+# cross-check; trust the IS ansatz for the absolute LER. T_init is the per-level floor.
+split_p_high: 0.006
+split_p_low: 0.003
+split_L: 12
+split_M: 3
+split_T_init: 1000000
+split_ladder: eq18

@@ -7,6 +7,15 @@ name = "stim-work-qec"
 version = "0.0.0"
 description = "Fail-fast QEC techniques (importance sampling, replica-exchange splitting, min-weight distance/onset) for bivariate-bicycle codes."
 requires-python = ">=3.9"
+# Core pip-installable deps. relay_bp (Rust BP decoder) and ldpc (BP-OSD) come from the project's
+# conda/env setup, not declared here — see experiments/requirements.txt / environment notes.
+dependencies = [
+    "numpy",
+    "scipy",
+    "stim",
+    "pyyaml",
+    "matplotlib",
+]
 
 # Flat module layout under src/. An editable install (`pip install -e .`) puts these on the path so
 # notebooks/scripts can `import bb_code_sim`, `import bb6_report`, etc. from any working directory —
@@ -24,4 +33,5 @@ py-modules = [
     "gross_code_lpu_tdg",
     "bb6_report",
     "repo_paths",
+    "experiment_runner",
 ]

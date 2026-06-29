@@ -199,6 +199,12 @@ class BBCodeParams:
 
 BB_72_12_6   = BBCodeParams(l=6,  m=6, a_exps=[(3,0),(0,1),(0,2)], b_exps=[(0,3),(1,0),(2,0)], distance=6)
 BB_144_12_12 = BBCodeParams(l=12, m=6, a_exps=[(3,0),(0,1),(0,2)], b_exps=[(0,3),(1,0),(2,0)], distance=12)
+# Kunlun [[18,4,4]] (arXiv:2505.09684): A = x + 1 + y^2, B = y + 1 + x^2.
+BB_18_4_4    = BBCodeParams(l=3,  m=3, a_exps=[(1,0),(0,0),(0,2)], b_exps=[(0,1),(0,0),(2,0)], distance=4)
+# "Two-gross" [[288,12,18]] (Bravyi et al., arXiv:2308.07915 Table 3): l=m=12,
+# A = x^3 + y^2 + y^7, B = y^3 + x + x^2. Exponents match the paper; n=288, k=12 verified
+# (build_parity_checks + _gf2_rank). The d=18 claim is the paper's (code distance).
+BB_288_12_18 = BBCodeParams(l=12, m=12, a_exps=[(3,0),(0,2),(0,7)], b_exps=[(0,3),(1,0),(2,0)], distance=18)
 
 
 # ---------------------------------------------------------------------------

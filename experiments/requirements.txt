@@ -1,0 +1,12 @@
+# pip-installable deps for the fail-fast experiment framework.
+# Install the package itself editable first:  pip install -e .   (from the repo root)
+numpy
+scipy
+stim
+pyyaml
+matplotlib
+
+# Decoders NOT on default PyPI — install from the project's env / channels:
+#   relay_bp   (Rust Relay-BP decoder; the default `relay` decoder)
+#   ldpc       (BP-OSD; the `bposd` decoder and Technique-II min-weight search)
+# See the project environment setup for how these are provided (conda env `qec`).

@@ -1,0 +1,32 @@
+# BB(6) = [[72,12,6]] memory, all 3 techniques (arXiv:2511.15177 Fig. 10 reproduction).
+# P0 — runs tomorrow. Keys map directly onto experiment_runner.Config fields.
+label: bb6_memory
+code_name: bb6
+experiment: memory
+decoder_name: relay
+techniques: [II, IS, I, III]
+split_method: multiseed
+
+p_ref: 0.003
+ansatz_model: f5
+
+# Technique II — exact onset pin from the BB(6) reference enumeration (D=6, w0=3, f0=2.3239e-5):
+# skips the multi-minute BP-OSD search and pins the Technique-I ansatz.
+mw_f0_override: 2.3239e-5
+mw_w0_override: 3
+
+# Technique I / IS — adaptive 'hit N failures per weight', sweeping a band that brackets the onset
+# (~3) and the dominant binomial mass. The ansatz fits a smooth f(w) over this.
+weights_range: [2, 60]
+adaptive: true
+adaptive_failures: 50
+adaptive_shots_max: 50000
+
+# Technique III — multi-seeded splitting (paper Alg. 2/3) over the overlap p-range. BB(6) has few
+# logicals and mixes well, so this is a meaningful cross-check of the IS ansatz here.
+split_p_high: 0.006
+split_p_low: 0.003
+split_L: 12
+split_M: 3
+split_T_init: 100000
+split_ladder: eq18
