@@ -126,17 +126,26 @@ code('''p_grid = np.geomspace(1e-4, 0.013, 40)
 # Adaptive 'hit N failures per weight' allocation: target 200 failures matches flat-6000's
 # precision at the budget-critical onset bin (f(2)~0.03 -> ~160 failures) at ~4x fewer shots —
 # the 200/f(w) schedule concentrates shots at the onset and skims the saturated high-f tail.
+# The weight window is sized per model from the binomial mass at the TOP of the p grid
+# (w_hi = μ + 4√μ, floored at 10), so the reweighted curves carry no truncation sag anywhere
+# on the grid — the extra saturated-tail weights cost only ~200-400 shots each under adaptive.
+def weight_window(c):
+    mu_ref = sum(e.args_copy()[0] for e in c.detector_error_model().flattened() if e.type == "error")
+    mu = mu_ref * p_grid.max() / P_REF
+    return list(range(1, max(10, int(np.ceil(mu + 4 * np.sqrt(mu)))) + 1))
+
 tech1 = {}
 for name in MODELS:
     c = make_circuit(name, P_REF)
+    W = weight_window(c)
     spec = importance_sample_adaptive(c, RelayBPDecoder(), p_ref=P_REF, p_values=[P_REF],
-                                      weights=list(range(1, 11)), target_failures=200,
+                                      weights=W, target_failures=200,
                                       shots_max=30_000, seed=1).spectrum
     fw = dict(zip(spec.weights, np.asarray(spec.failures) / np.asarray(spec.trials)))
     fit = fit_failure_spectrum(spec, K=c.num_observables, model="f5", w0=None, f0=None)
     LER = np.asarray(logical_error_rate_from_ansatz(fit, list(p_grid)))
     tech1[name] = dict(spec=spec, fw=fw, fit=fit, LER=LER)
-    print(f"{name:16s}: measured f(2)={fw[2]:.4f} ({sum(spec.trials)} shots total)   "
+    print(f"{name:16s}: w=1..{W[-1]}, measured f(2)={fw[2]:.4f} ({sum(spec.trials)} shots total)   "
           f"f5 fit cost={fit.cost:.2f}")''')
 
 # ===========================================================================
@@ -227,7 +236,7 @@ code('''tech1_abl, mc_abl = {}, {}
 for name in ABLATED:
     c = make_ablated_circuit(name, P_REF)
     spec = importance_sample_adaptive(c, RelayBPDecoder(), p_ref=P_REF, p_values=[P_REF],
-                                      weights=list(range(1, 11)), target_failures=200,
+                                      weights=weight_window(c), target_failures=200,
                                       shots_max=30_000, seed=3).spectrum
     fit = fit_failure_spectrum(spec, K=c.num_observables, model="f5", w0=None, f0=None)
     tech1_abl[name] = dict(spec=spec, fit=fit,
@@ -258,8 +267,9 @@ code('''# Budget operating point: DEEP in the suppression regime — below every
 P_STAR = 5e-4
 
 # Point values at p* come from the MEASURED spectra, binomially reweighted — NOT from the f5
-# fits. The sampled weights (1..10) cover every model's onset (w0=2, f(1)=0), so the reweighting
-# is exact-in-expectation at low p; independently-fitted (w0, f0, shape) EXTRAPOLATIONS drift
+# fits. The per-model weight windows cover every onset (w0=2, f(1)=0) AND the binomial mass over
+# the whole grid, so the reweighting is exact-in-expectation everywhere; independently-fitted
+# (w0, f0, shape) EXTRAPOLATIONS drift
 # apart model-to-model down here and can even invert the full-vs-ablated ordering (negative
 # "marginals"). The fits still supply the curve-wide pseudo-thresholds, where they are anchored.
 from importance_sampling import reweight_spectrum
@@ -316,8 +326,8 @@ print(f"Willow-form sum: {sum(P_STAR / r[4] for r in rows if r[4]):.3f} = "
 code('''fig, (axL, axR) = plt.subplots(1, 2, figsize=(12, 4.5))
 # left: marginal budget fractions vs p — REWEIGHTED measured spectra (solid), the same estimator
 # as the table/bars at p*, so the panels agree. The f5-fit version is kept as faint dashed lines
-# (unclipped) to make the low-p extrapolation drift visible instead of hiding it. At the very top
-# of the grid the reweighted curves truncate slightly (binomial mass above the sampled weights).
+# (unclipped) to make the low-p extrapolation drift visible instead of hiding it. The per-model
+# weight windows cover the binomial mass over the whole grid, so there is no truncation sag.
 Lf_rw = reweight_spectrum(tech1["full symmetric"]["spec"], p_grid).P_logical
 Lf_fit = tech1["full symmetric"]["LER"]
 for ch in CHANNELS:
