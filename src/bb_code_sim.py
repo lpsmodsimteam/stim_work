@@ -201,6 +201,12 @@ BB_72_12_6   = BBCodeParams(l=6,  m=6, a_exps=[(3,0),(0,1),(0,2)], b_exps=[(0,3)
 BB_144_12_12 = BBCodeParams(l=12, m=6, a_exps=[(3,0),(0,1),(0,2)], b_exps=[(0,3),(1,0),(2,0)], distance=12)
 # Kunlun [[18,4,4]] (arXiv:2505.09684): A = x + 1 + y^2, B = y + 1 + x^2.
 BB_18_4_4    = BBCodeParams(l=3,  m=3, a_exps=[(1,0),(0,0),(0,2)], b_exps=[(0,1),(0,0),(2,0)], distance=4)
+# Kunlun-family sibling at (l,m)=(6,6): SAME polynomials, k=4, code distance 8 EXACT — both
+# sectors verified by complete split-MITM elimination of w<=7 (w<=4 exhaustive, 2+3 / 3+3 / 3+4
+# splits empty) with weight-8 logicals exhibited by randomized information-set search. The family
+# keeps k=4 whenever 3|l and 3|m; any side of length 3 pins d=4, so (6,6) is the smallest
+# distance-scaled partner — the Lambda pair for [[18,4,4]] (d: 4 -> 8).
+BB_72_4_8    = BBCodeParams(l=6,  m=6, a_exps=[(1,0),(0,0),(0,2)], b_exps=[(0,1),(0,0),(2,0)], distance=8)
 # "Two-gross" [[288,12,18]] (Bravyi et al., arXiv:2308.07915 Table 3): l=m=12,
 # A = x^3 + y^2 + y^7, B = y^3 + x + x^2. Exponents match the paper; n=288, k=12 verified
 # (build_parity_checks + _gf2_rank). The d=18 claim is the paper's (code distance).

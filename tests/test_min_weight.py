@@ -159,3 +159,16 @@ def test_fail_count_budget_guard_raises():
     logicals_odd = [frozenset(range(i, i + 3)) for i in range(0, 24, 3)]       # weight-3 (odd)
     with pytest.raises(InfeasibleEnumerationError):
         min_weight_fail_count_odd(H, A, logicals_odd, logicals_even, max_restrictions=3)
+
+
+def test_bb_72_4_8_registry_params():
+    """[[72,4,8]]: same polynomials as BB_18_4_4 at (l,m)=(6,6) must give n=72, k=4 (d=8 is the
+    exact split-MITM result recorded in bb_code_sim.py; too slow to re-verify here)."""
+    from bb_code_sim import BB_18_4_4, BB_72_4_8, build_parity_checks, _gf2_rank
+
+    assert (BB_72_4_8.a_exps, BB_72_4_8.b_exps) == (BB_18_4_4.a_exps, BB_18_4_4.b_exps)
+    HX, HZ = build_parity_checks(BB_72_4_8)
+    n = HX.shape[1]
+    assert n == 72
+    assert not (HX @ HZ.T % 2).any()                      # CSS commutation
+    assert n - _gf2_rank(HX) - _gf2_rank(HZ) == 4         # k = 4

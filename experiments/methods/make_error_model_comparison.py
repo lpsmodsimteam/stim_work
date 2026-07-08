@@ -9,6 +9,10 @@ Technique III (replica-exchange splitting), and direct Monte-Carlo, all on the s
 Willow error budget is built from — and §6 assembles the Willow-style budget: isolated vs marginal
 fractions of LER_full, the mixing bucket, per-channel pseudo-thresholds, and the Σ p/p_th terms.
 
+§7 computes the TRUE Λ: the five channels rerun on the same-polynomial sibling BB_72_4_8 (d: 4→8,
+rounds ∝ d, per-round ε), per-channel thresholds from the ε18=ε72 crossings, Λ(p) curves, the
+per-(+2)-step λ = √Λ, and the Willow identity check 1/Λ vs Σ p/p_th.
+
 Noise channels are isolated by FILTERING instructions on one symmetric(p) circuit, so every variant
 shares the identical per-location rate p (apples-to-apples). Run top-to-bottom in the `qec` kernel.
 """
@@ -239,13 +243,16 @@ code('''P_STAR = 0.005                       # budget operating point (MC-anchor
 def ansatz_at(d, p):                 # evaluate a stored f5 fit at scalar p
     return float(np.asarray(logical_error_rate_from_ansatz(d["fit"], [p]))[0])
 
-def pseudo_threshold(pg, LER):       # break-even LER(p)=p, log-log interpolated
-    r = np.log(LER) - np.log(pg)
+def crossing_p(pg, y1, y2):          # p where y1(p)=y2(p), log-log interpolated (None if never)
+    r = np.log(y1) - np.log(y2)
     s = np.nonzero(np.diff(np.sign(r)) != 0)[0]
     if s.size == 0:
         return None
     i = s[-1]; t = r[i] / (r[i] - r[i + 1])
     return float(np.exp(np.log(pg[i]) + t * (np.log(pg[i + 1]) - np.log(pg[i]))))
+
+def pseudo_threshold(pg, LER):       # break-even LER(p)=p (single-code threshold stand-in)
+    return crossing_p(pg, LER, np.asarray(pg))
 
 CHANNELS = ["CZ only", "meas only", "prep only", "idle only"]
 ABL_OF = {"CZ only": "no CZ", "meas only": "no meas", "prep only": "no prep", "idle only": "no idle"}
@@ -293,6 +300,100 @@ axR.set_xticks(x, labels, rotation=20); axR.set_ylabel(f"fraction of LER_full at
 axR.legend(fontsize=8); axR.grid(alpha=0.3, axis="y")
 fig.suptitle("Kunlun [[18,4,4]] — Willow-style error budget"); plt.tight_layout(); plt.show()''')
 
+# ===========================================================================
+md(r"""## §7 — The true Λ: five channels on the [[72,4,8]] sibling
+
+Everything so far used *pseudo*-thresholds because a real threshold is a crossing between code
+sizes. The Kunlun polynomials give a distance-scaled partner: **[[72,4,8]]** at `(l,m)=(6,6)` —
+same `A = 1+x+y²`, `B = 1+y+x²`, `k=4`, code distance **8 exact** (both sectors: `w≤7` eliminated by
+complete split-MITM, weight-8 logicals exhibited). `d: 4 → 8` is two `+2` steps, the K=4 analog of
+Google's `d=3,5,7` ladder.
+
+**Conventions.** Rounds scale with distance (`d/2`: 2 rounds for d=4, 4 for d=8), and Λ compares
+**per-round** logical error rates `ε(p) = 1 − (1−LER)^{1/rounds}`: `Λ_i(p) = ε₁₈,ᵢ(p)/ε₇₂,ᵢ(p)`.
+The channel crossings `ε₁₈,ᵢ = ε₇₂,ᵢ` are the *true* per-channel thresholds `p_th,i` that the
+Willow budget divides by. No exact `f₀*` at this size (the `L(D)`/`L(D+1)` enumerations are the
+bb144-regime problem) — the Λ budget doesn't need it.
+
+**Cost.** This section reruns the five channels on a 144-qubit circuit — expect **one to two
+hours**; each cell checkpoints nothing, so run it when the kernel can sit.""")
+
+code('''from bb_code_sim import BB_72_4_8
+
+ROUNDS72 = BB_72_4_8.distance // 2       # rounds ∝ distance (the d=4 run above used d/2 = 2)
+def make_circuit72(model, p):
+    return filter_noise_channel(BBCodeSimulator(BB_72_4_8).build_circuit(ErrorModel.symmetric(p), rounds=ROUNDS72),
+                                MODELS[model])
+
+tech2_72 = {}
+print(f"{'model':16s} {'D':>2}   (circuit fault distance, BP-OSD upper bound; f0 unpinned at this size)")
+for name in MODELS:
+    tech2_72[name] = compute_distance(make_circuit72(name, P_REF)).distance
+    print(f"{name:16s} {tech2_72[name]:2d}")''')
+
+code('''tech1_72, mc72 = {}, {}
+mc72_pts = {0.008: 40_000, 0.004: 80_000}
+for name in MODELS:
+    c = make_circuit72(name, P_REF)
+    # Weight window from the binomial mass: μ(p) = E[#faults] = Σ DEM error probs, rescaled to p.
+    mu_ref = sum(e.args_copy()[0] for e in c.detector_error_model().flattened() if e.type == "error")
+    w_hi = int(np.ceil((mu := mu_ref * p_grid.max() / P_REF) + 4 * np.sqrt(mu)))
+    W = list(range(1, 16)) + list(range(16, w_hi + 1, 2))   # stride-2 tail: f5 pools weights, halves the cost
+    spec = importance_sample(c, RelayBPDecoder(), p_ref=P_REF, p_values=[P_REF],
+                             weights=W, shots_per_weight=3000, seed=4).spectrum
+    fit = fit_failure_spectrum(spec, K=c.num_observables, model="f5", w0=None, f0=None)
+    tech1_72[name] = dict(fit=fit, LER=np.asarray(logical_error_rate_from_ansatz(fit, list(p_grid))))
+    mc72[name] = {p: direct_mc(make_circuit72(name, p), s) for p, s in mc72_pts.items()}
+    print(f"{name:16s}: weights 1..{w_hi} ({len(W)} sampled), f5 cost={fit.cost:.2f}, "
+          f"MC LER(0.008)={mc72[name][0.008][0]:.3e}", flush=True)''')
+
+code('''def per_round(LER, rounds):
+    return 1.0 - (1.0 - np.clip(LER, 0.0, 1.0 - 1e-12)) ** (1.0 / rounds)
+
+eps18 = {m: per_round(tech1[m]["LER"], ROUNDS) for m in MODELS}
+eps72 = {m: per_round(tech1_72[m]["LER"], ROUNDS72) for m in MODELS}
+
+P_LAM = 0.003                            # evaluate Λ below the crossings, near the MC anchors
+i_lam = int(np.argmin(np.abs(p_grid - P_LAM)))
+rows7 = []
+print(f"{'channel':16s} {'p_th (ε18=ε72)':>15} {'Λ(p*)':>9} {'p*/p_th':>9}     (p* = {P_LAM})")
+for m in MODELS:
+    pth = crossing_p(p_grid, eps18[m], eps72[m])
+    lam = float(eps18[m][i_lam] / eps72[m][i_lam])
+    rows7.append((m, pth, lam))
+    pths = f"{pth:.4f}" if pth else ">grid"
+    term = f"{P_LAM/pth:.3f}" if pth else "-"
+    print(f"{m:16s} {pths:>15} {lam:9.3g} {term:>9}")
+
+lam_full = dict((m, l) for m, _, l in rows7)["full symmetric"]
+print(f"\\nΛ_full(p*) = {lam_full:.3g}  →  per-(+2-distance)-step λ = √Λ = {np.sqrt(lam_full):.3g}  (d: 4→8 is two steps)")
+inv_lam = 1.0 / lam_full
+terms = {m: P_LAM / pth for m, pth, _ in rows7 if pth is not None and m != "full symmetric"}
+spam_term = terms.get("meas only", 0) + terms.get("prep only", 0)
+print(f"Willow identity check at p*: 1/Λ_full = {inv_lam:.3f}  vs  Σᵢ p*/p_th,i = {sum(terms.values()):.3f}"
+      f"   (CZ {terms.get('CZ only', float('nan')):.3f}, SPAM {spam_term:.3f}, idle {terms.get('idle only', float('nan')):.3f})")
+print("residual = mixed-channel faults (isolated channels cannot see them — see §1/§5); "
+      "Σ < 1/Λ_full means the additive budget under-covers by that share.")''')
+
+code('''fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
+for m in MODELS:
+    col = COLORS[m]
+    axL.plot(p_grid, eps18[m], "-", color=col, lw=2, label=m)
+    axL.plot(p_grid, eps72[m], "--", color=col, lw=1.5)
+    mp = sorted(mc72[m])
+    axL.plot(mp, [per_round(np.asarray([mc72[m][p][0]]), ROUNDS72)[0] for p in mp], "^", color=col, ms=6)
+    axR.plot(p_grid, eps18[m] / eps72[m], "-", color=col, lw=2, label=m)
+axL.set_xscale("log"); axL.set_yscale("log")
+axL.set_xlabel("physical error rate p"); axL.set_ylabel("per-round logical error rate ε")
+axL.set_title("[[18,4,4]] (solid, 2 rounds) vs [[72,4,8]] (dashed, 4 rounds; ▲=MC)")
+axL.legend(fontsize=8); axL.grid(alpha=0.3, which="both")
+axR.set_xscale("log"); axR.set_yscale("log")
+axR.axhline(1.0, color="gray", lw=1); axR.axvline(P_LAM, color="gray", ls=":", lw=1)
+axR.set_xlabel("physical error rate p"); axR.set_ylabel(r"$\\Lambda(p) = \\varepsilon_{18}/\\varepsilon_{72}$")
+axR.set_title("error suppression per channel (crossings = true $p_{th,i}$)")
+axR.legend(fontsize=8); axR.grid(alpha=0.3, which="both")
+plt.tight_layout(); plt.show()''')
+
 # ---------------------------------------------------------------------------
 md(r"""## Takeaways
 
@@ -315,9 +416,13 @@ md(r"""## Takeaways
   convention) count each mixed fault once per participant, so they **over-count** (Σ > 1). The gap
   between the two decompositions *is* the mixed-fault structure — read it together with the ablated
   distances, which name the channels every weight-3 hook needs.
-* **Pseudo-thresholds stand in for `p_th,i`** in the Willow sum `Σᵢ p/p_th,i`: a true Λ requires a
-  second code size — the same-polynomial `(l,m)=(6,6)` sibling **[[72,4,8]]** (exact d=8, both sectors,
-  verified by complete w≤7 MITM) is the natural partner.
+* **Pseudo-thresholds (§6) vs true thresholds (§7).** §6's break-even points need only one code; §7
+  replaces them with the real thing — the `ε₁₈,ᵢ(p) = ε₇₂,ᵢ(p)` crossings against the same-polynomial
+  sibling **[[72,4,8]]** — and reads off `Λ_i(p)` directly. With `d: 4→8` (two `+2` steps) the
+  per-step suppression is `λ = √Λ_full`.
+* **The Willow identity `1/Λ ≈ Σᵢ p/p_th,i` is the §7 punchline**: how far the sum falls short of
+  `1/Λ_full` measures exactly how much the mixed-channel faults (the §1 `D=3` hook, invisible to
+  every isolated channel) break the additive budget.
 
 *Generated by `make_error_model_comparison.py`.*""")
 
