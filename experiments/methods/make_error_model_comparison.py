@@ -178,7 +178,10 @@ md(r"""## §2 — Technique I: failure-spectrum ansatz (per model)
 Importance-sample the failure spectrum `f(w)` and fit the f5 ansatz (onset `w₀` left free — the multistart
 fit finds the good minimum), then reweight to `LER(p)` over the grid.""")
 
-code('''p_grid = np.geomspace(1e-4, 0.013, 40)
+code('''# Grid top at 0.04 so the weak channels' break-even crossings (split idles ~0.012-0.02) land
+# IN-grid instead of reporting a bound; the per-model weight windows auto-size from p_grid.max(),
+# and the adaptive allocator makes the extra saturated-tail bins nearly free (~200 shots each).
+p_grid = np.geomspace(1e-4, 0.04, 44)
 # Adaptive 'hit N failures per weight' allocation: target 200 failures matches flat-6000's
 # precision at the budget-critical onset bin (f(2)~0.03 -> ~160 failures) at ~4x fewer shots —
 # the 200/f(w) schedule concentrates shots at the onset and skims the saturated high-f tail.
@@ -234,7 +237,7 @@ code('''def direct_mc(circ, shots):
     return m, (max(m, 1e-9) * (1 - m) / shots) ** 0.5
 
 mc_pts = {p: int(s * MC_SCALE) for p, s in
-          {0.012: 80_000, 0.008: 120_000, 0.005: 200_000, 0.003: 300_000}.items()}
+          {0.03: 40_000, 0.012: 80_000, 0.008: 120_000, 0.005: 200_000, 0.003: 300_000}.items()}
 mc = {name: {p: direct_mc(make_circuit(name, p), s) for p, s in mc_pts.items()} for name in MODELS}
 
 print("   p        " + "".join(f"{n:>15}" for n in MODELS))
@@ -366,8 +369,8 @@ for ch in CHANNELS:
 print(f"error budget at p* = {P_STAR}   (LER_full: reweighted {L_full:.3e}, splitting {S_full:.3e})")
 print(f"{'channel':12s} {'isolated':>9} {'iso(split)':>10} {'marginal':>9} {'p_pth':>9} {'p*/p_pth':>9}")
 for ch, iso, marg, iso_split, pth in rows:
-    pths = f"{pth:.4f}" if pth else ">grid"
-    term = f"{P_STAR/pth:.3f}" if pth else "-"
+    pths = f"{pth:.4f}" if pth else f">{p_grid.max():.3g}"      # no break-even crossing in-grid
+    term = f"{P_STAR/pth:.3f}" if pth else f"<{P_STAR/p_grid.max():.3f}"   # bound, not a blank
     print(f"{ch:12s} {iso:9.3f} {iso_split:10.3f} {marg:9.3f} {pths:>9} {term:>9}")
 mixing = 1.0 - sum(r[1] for r in rows)
 spam_iso = sum(r[1] for r in rows if r[0] in ("meas only", "prep only"))
@@ -491,8 +494,8 @@ for m in MODELS:
     lam = eps_at(tech1[m], P_LAM, ROUNDS) / eps_at(tech1_72[m], P_LAM, ROUNDS72)
     lam_fit = float(eps18[m][i_lam] / eps72[m][i_lam])
     rows7.append((m, pth, lam))
-    pths = f"{pth:.4f}" if pth else ">grid"
-    term = f"{P_LAM/pth:.3f}" if pth else "-"
+    pths = f"{pth:.4f}" if pth else f">{p_grid.max():.3g}"
+    term = f"{P_LAM/pth:.3f}" if pth else f"<{P_LAM/p_grid.max():.3f}"
     print(f"{m:16s} {pths:>15} {lam:9.3g} {lam_fit:9.3g} {term:>9}")
 
 lam_full = dict((m, l) for m, _, l in rows7)["full symmetric"]
