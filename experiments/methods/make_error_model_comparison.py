@@ -102,7 +102,8 @@ ancilla of each type — derived from the built circuit itself, so it is exactly
 noise-channel predicates key on. Inline `·channel` tags show how each noise instruction is
 classified (`cz` / `meas` / `prep` / `gate_idle` / `meas_idle`): each data qubit is busy in six
 of the seven CX layers, idles through the one it sits out (`·gate_idle`), and idles again while
-the ancillas are measured and reset (`·meas_idle`).""")
+the ancillas are measured and reset (`·meas_idle`). The second cell renders the full one-cycle
+gate schedule as a stim `timeline-svg` diagram (noiseless build, all 36 qubits).""")
 
 code('''watch = {0: "data q0 (L)", 9: "data q9 (R)", 18: "X-anc q18", 27: "Z-anc q27"}
 c = make_circuit("full symmetric", P_REF)
@@ -136,6 +137,12 @@ print("-" * (8 + 27 * len(watch)))
 for L in range(n_show):
     row = [" ".join(s for l, s in timeline[q] if l == L) or "—" for q in watch]
     print(f"{L:>5} | " + " | ".join(f"{r:^24}" for r in row))''')
+
+code('''# The same schedule as a stim timeline diagram — noiseless build, so it shows the pure gate
+# structure (one cycle + final readout; 9 ticks, all 36 qubits). The annotated table above is
+# the noise/channel legend; this is the geometry.
+clean = BBCodeSimulator(P).build_circuit(ErrorModel.symmetric(0.0), rounds=1)
+clean.diagram("timeline-svg")''')
 
 # ===========================================================================
 md(r"""## §1 — Technique II: distance, onset, perfect-decoder floor (per model)
