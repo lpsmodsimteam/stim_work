@@ -102,8 +102,9 @@ ancilla of each type — derived from the built circuit itself, so it is exactly
 noise-channel predicates key on. Inline `·channel` tags show how each noise instruction is
 classified (`cz` / `meas` / `prep` / `gate_idle` / `meas_idle`): each data qubit is busy in six
 of the seven CX layers, idles through the one it sits out (`·gate_idle`), and idles again while
-the ancillas are measured and reset (`·meas_idle`). The second cell renders the full one-cycle
-gate schedule as a stim `timeline-svg` diagram (noiseless build, all 36 qubits).""")
+the ancillas are measured and reset (`·meas_idle`). The second cell renders the NOISY one-cycle
+schedule as a stim `timeline-svg` diagram, sliced to the watched qubits (+ their CX partners as
+context lines, ~16 of 36 qubit rails) so the labelled noise boxes are actually readable.""")
 
 code('''watch = {0: "data q0 (L)", 9: "data q9 (R)", 18: "X-anc q18", 27: "Z-anc q27"}
 c = make_circuit("full symmetric", P_REF)
@@ -138,11 +139,31 @@ for L in range(n_show):
     row = [" ".join(s for l, s in timeline[q] if l == L) or "—" for q in watch]
     print(f"{L:>5} | " + " | ".join(f"{r:^24}" for r in row))''')
 
-code('''# The same schedule as a stim timeline diagram — noiseless build, so it shows the pure gate
-# structure (one cycle + final readout; 9 ticks, all 36 qubits). The annotated table above is
-# the noise/channel legend; this is the geometry.
-clean = BBCodeSimulator(P).build_circuit(ErrorModel.symmetric(0.0), rounds=1)
-clean.diagram("timeline-svg")''')
+code('''# A watchable SLICE of the NOISY circuit instead of all 36 qubits: keep only instructions
+# touching `watch` (CX / DEPOLARIZE2 kept per-pair when either endpoint is watched, so the CX
+# partners appear as context lines); detectors/observables are dropped since their
+# measurement-record indices don't survive the cut. The labelled noise boxes (DEP1/DEP2 = cz,
+# gate_idle, meas_idle; ERR = prep/meas X_ERROR) sit exactly where the table's ·channel tags are.
+noisy = BBCodeSimulator(P).build_circuit(ErrorModel.symmetric(P_REF), rounds=1)
+sl = stim.Circuit()
+for inst in noisy.flattened():
+    nm = inst.name
+    if nm in ("DETECTOR", "OBSERVABLE_INCLUDE", "QUBIT_COORDS", "SHIFT_COORDS"):
+        continue
+    if nm == "TICK":
+        sl.append("TICK")
+        continue
+    t = [x.value for x in inst.targets_copy()]
+    args = inst.gate_args_copy()
+    if nm in ("CX", "DEPOLARIZE2"):
+        pairs = [(a, b) for a, b in zip(t[::2], t[1::2]) if a in watch or b in watch]
+        if pairs:
+            sl.append(nm, [q for ab in pairs for q in ab], args)
+    else:
+        keep = [q for q in t if q in watch]
+        if keep:
+            sl.append(nm, keep, args)
+sl.diagram("timeline-svg")''')
 
 # ===========================================================================
 md(r"""## §1 — Technique II: distance, onset, perfect-decoder floor (per model)
