@@ -233,8 +233,8 @@ for name in ABLATED:
     tech1_abl[name] = dict(spec=spec, fit=fit,
                            LER=np.asarray(logical_error_rate_from_ansatz(fit, list(p_grid))))
     mc_abl[name] = {p: direct_mc(make_ablated_circuit(name, p), s) for p, s in mc_pts.items()}
-    print(f"{name:10s}: f5 fit cost={fit.cost:.2f}   MC LER(p={max(mc_pts)}) = "
-          f"{mc_abl[name][max(mc_pts)][0]:.3e}")''')
+    print(f"{name:10s}: f5 fit cost={fit.cost:.2f}   MC LER(p={min(mc_pts)}) = "
+          f"{mc_abl[name][min(mc_pts)][0]:.3e}")''')
 
 # ===========================================================================
 md(r"""## §6 — The error budget (Willow-style)
