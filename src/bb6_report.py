@@ -78,13 +78,16 @@ def compute(outdir=DEFAULT_OUT, bootstrap=150, seed=0, models=("f3", "f5"), prim
             fit = fit_failure_spectrum(spectrum(F), K=K, model=model, w0=_w0arg, f0=f0)
             fits[model] = fit
             LER[model] = np.asarray(logical_error_rate_from_ansatz(fit, list(p_grid)))
-            # bootstrap band over resampled failures
+            # bootstrap band over resampled failures — warm-started from the primary fit's params
+            # (a resample is a small perturbation of the same data, so it lands in the same basin;
+            # this skips the multistart grid, ~37x fewer f5 solver calls per refit)
             rng = np.random.default_rng(seed)
             bs = np.full((bootstrap, len(p_grid)), np.nan)
             for b in range(bootstrap):
                 fr = rng.binomial(T.astype(int), np.clip(F / np.maximum(T, 1), 0, 1))
                 try:
-                    fb = fit_failure_spectrum(spectrum(fr), K=K, model=model, w0=_w0arg, f0=f0)
+                    fb = fit_failure_spectrum(spectrum(fr), K=K, model=model, w0=_w0arg, f0=f0,
+                                              init_params=fit.params)
                     bs[b] = logical_error_rate_from_ansatz(fb, list(p_grid))
                 except Exception:
                     pass

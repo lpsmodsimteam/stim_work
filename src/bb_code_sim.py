@@ -606,6 +606,52 @@ def build_bb_circuit(
 
 
 # ---------------------------------------------------------------------------
+# Noise-channel isolation
+# ---------------------------------------------------------------------------
+
+NOISE_INSTRUCTIONS = {"DEPOLARIZE1", "DEPOLARIZE2", "X_ERROR", "Y_ERROR", "Z_ERROR",
+                      "PAULI_CHANNEL_1", "PAULI_CHANNEL_2"}
+
+# Position-sensitive predicates keep(inst, prev, nxt) that isolate ONE physical channel of a
+# built BB circuit. They encode the instruction layout of build_bb_circuit above (which bundles
+# channels): X_ERROR right after an R is a *preparation* error, right before an M a *measurement*
+# error; DEPOLARIZE1 is *idle* data noise except right after an H (the 1q-gate error on the
+# X-ancillas); DEPOLARIZE2 is the two-qubit-gate channel. Because they are coupled to the
+# builder's layout, they live here — next to the code they describe — and every consumer
+# (drivers, generated notebooks) imports this one copy.
+NOISE_CHANNEL_PREDICATES = {
+    "cz":   lambda i, p, n: i.name == "DEPOLARIZE2",                                       # two-qubit gate
+    "meas": lambda i, p, n: i.name == "X_ERROR" and n is not None and n.name == "M",        # before a measurement
+    "prep": lambda i, p, n: i.name == "X_ERROR" and p is not None and p.name == "R",        # after a reset
+    "idle": lambda i, p, n: i.name == "DEPOLARIZE1" and not (p is not None and p.name == "H"),  # idle data (not post-H)
+}
+
+
+def filter_noise_channel(circuit: stim.Circuit, channel) -> stim.Circuit:
+    """Isolate one physical noise channel by filtering instructions on a built circuit.
+
+    ``channel``: ``None``/``'full'``/unknown → the circuit unchanged (full symmetric noise); a key
+    of :data:`NOISE_CHANNEL_PREDICATES` keeps only that channel at the same base rate; or a callable
+    ``keep(inst, prev, nxt) -> bool`` applied to noise instructions (e.g. ``lambda i, p, n:
+    not NOISE_CHANNEL_PREDICATES['cz'](i, p, n)`` for a leave-one-out ablation). Non-noise
+    instructions are always kept; the circuit is flattened (REPEAT blocks unrolled).
+    """
+    keep = channel if callable(channel) else NOISE_CHANNEL_PREDICATES.get(channel)
+    if keep is None:
+        return circuit
+    insts = list(circuit.flattened())
+    out = stim.Circuit()
+    for i, inst in enumerate(insts):
+        if inst.name in NOISE_INSTRUCTIONS:
+            prev = insts[i - 1] if i > 0 else None
+            nxt = insts[i + 1] if i + 1 < len(insts) else None
+            if not keep(inst, prev, nxt):
+                continue
+        out.append(inst)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Simulator
 # ---------------------------------------------------------------------------
 

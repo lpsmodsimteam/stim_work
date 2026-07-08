@@ -121,3 +121,41 @@ def test_distance_surface_d3():
     for w in res.witnesses:
         assert int(w.sum()) == 3
         assert not (H @ w % 2).any() and (A @ w % 2).any()
+
+
+def test_fail_count_from_restrictions_matches_enumerating_wrapper():
+    """The shared Prop-1 vote helper must agree with min_weight_fail_count on the same logicals.
+
+    (This replaces the old bb144_onset_fraction.py --self-test; 100 is the frozen golden value
+    for this seed-0 synthetic, so a semantics drift in either routine fails loudly.)
+    """
+    from itertools import combinations
+    from min_weight import fail_count_from_restrictions
+
+    rng = np.random.default_rng(0)
+    M, K, N = 6, 2, 14
+    H = (rng.random((M, N)) < 0.4).astype(np.uint8)
+    A = (rng.random((K, N)) < 0.4).astype(np.uint8)
+    mult = rng.integers(1, 4, size=N).astype(np.int64)
+    D = 4
+    logicals = [frozenset(map(int, rng.choice(N, size=D, replace=False))) for _ in range(20)]
+
+    ref, _ = min_weight_fail_count(H, A, logicals, mult)
+    uniq = {tuple(sorted(r)) for s in logicals for r in combinations(sorted(s), D // 2)}
+    assert fail_count_from_restrictions(H, A, mult, uniq) == ref == 100
+
+
+def test_fail_count_budget_guard_raises():
+    """Over-budget enumerations must raise BEFORE committing memory (even and odd variants)."""
+    from min_weight import InfeasibleEnumerationError, min_weight_fail_count_odd
+
+    H = np.zeros((2, 30), dtype=np.uint8)
+    A = np.ones((1, 30), dtype=np.uint8)
+    logicals_even = [frozenset(range(i, i + 4)) for i in range(0, 24, 4)]      # weight-4
+    with pytest.raises(InfeasibleEnumerationError):
+        min_weight_fail_count(H, A, logicals_even, max_restrictions=3)
+    fails, _ = min_weight_fail_count(H, A, logicals_even, max_restrictions=10**6)  # under budget: runs
+
+    logicals_odd = [frozenset(range(i, i + 3)) for i in range(0, 24, 3)]       # weight-3 (odd)
+    with pytest.raises(InfeasibleEnumerationError):
+        min_weight_fail_count_odd(H, A, logicals_odd, logicals_even, max_restrictions=3)

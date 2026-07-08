@@ -36,7 +36,8 @@ the *same* [[18,4,4]] code:
 | **idle only** | `DEPOLARIZE1` on **idle data qubits** (while ancillas are reset/measured) |
 
 We isolate a channel by **filtering noise instructions** on one `symmetric(p)` circuit — so every variant
-uses the *identical* per-location rate `p` (a clean apples-to-apples comparison), with no change to `src`.
+uses the *identical* per-location rate `p` (a clean apples-to-apples comparison) — via
+`bb_code_sim.filter_noise_channel`, whose predicates live next to the circuit builder whose layout they encode.
 Two channels share an instruction name and are split by **position**: `X_ERROR` is a *preparation* error
 right after an `R` and a *measurement* error right before an `M`; `DEPOLARIZE1` is an *idle* error (on the
 data qubits, which sit idle during ancilla reset/measurement) except right after an `H`, where it is the
@@ -52,45 +53,28 @@ busy on a `CX` in the other; rounds 1–5 keep every qubit busy). So a data qubi
 md("""## Setup — the code, the noise filter, and the three models""")
 
 code('''import numpy as np, matplotlib.pyplot as plt, stim
-from bb_code_sim import BBCodeParams, BBCodeSimulator, RelayBPDecoder
+from bb_code_sim import (BBCodeParams, BBCodeSimulator, RelayBPDecoder,
+                         NOISE_CHANNEL_PREDICATES, filter_noise_channel)
 from surface_code_sim import ErrorModel
 from min_weight import (dem_check_action_matrices, compute_distance, optimal_onset_fraction,
-                        find_weight_logicals_mitm, _mw_init, _mw_coset_enum_task)
+                        find_weight_logicals_mitm, find_all_min_weight_logicals)
 from importance_sampling import importance_sample, fit_failure_spectrum, logical_error_rate_from_ansatz
 from splitting import replica_exchange_estimate
 
 P = BBCodeParams(l=3, m=3, a_exps=[(1, 0), (0, 0), (0, 2)], b_exps=[(0, 1), (0, 0), (2, 0)], distance=4)
 P_REF, ROUNDS = 0.01, 2
 
-# Isolate noise channels by filtering instructions on ONE symmetric(p) circuit (same base rate p).
-# `keep` is a predicate(inst, prev, nxt)->bool for NOISE ops (position-aware, so we can tell a reset
-# X_ERROR from a measurement X_ERROR); non-noise ops are always kept; None keeps all noise.
-NOISE = {"DEPOLARIZE1", "DEPOLARIZE2", "X_ERROR", "Y_ERROR", "Z_ERROR", "PAULI_CHANNEL_1", "PAULI_CHANNEL_2"}
-def filter_noise(circ, keep):
-    if keep is None:
-        return circ
-    insts = list(circ.flattened())
-    out = stim.Circuit()
-    for i, inst in enumerate(insts):
-        if inst.name in NOISE:
-            prev = insts[i - 1] if i > 0 else None
-            nxt = insts[i + 1] if i + 1 < len(insts) else None
-            if not keep(inst, prev, nxt):
-                continue
-        out.append(inst)
-    return out
-
-# noise-channel predicates
-def _cz(inst, prev, nxt):    return inst.name == "DEPOLARIZE2"                                  # two-qubit CX gate
-def _meas(inst, prev, nxt):  return inst.name == "X_ERROR" and nxt is not None and nxt.name == "M"   # before a measurement
-def _prep(inst, prev, nxt):  return inst.name == "X_ERROR" and prev is not None and prev.name == "R"  # after a reset
-def _idle(inst, prev, nxt):  return inst.name == "DEPOLARIZE1" and not (prev is not None and prev.name == "H")  # idle data qubits (not the post-H ancilla gate)
-
-MODELS = {"full symmetric": None, "CZ only": _cz, "meas only": _meas, "prep only": _prep, "idle only": _idle}
+# Channels are isolated by position-filtering ONE symmetric(p) circuit at the same base rate p.
+# bb_code_sim.filter_noise_channel owns the position predicates (X_ERROR after R = prep, before
+# M = meas; DEPOLARIZE1 not post-H = idle; DEPOLARIZE2 = two-qubit gate) — they encode the layout
+# of build_bb_circuit, so they live in src next to it.
+MODELS = {"full symmetric": None, "CZ only": "cz", "meas only": "meas",
+          "prep only": "prep", "idle only": "idle"}
 COLORS = {"full symmetric": "crimson", "CZ only": "navy", "meas only": "seagreen",
           "prep only": "darkorange", "idle only": "purple"}
 def make_circuit(model, p):
-    return filter_noise(BBCodeSimulator(P).build_circuit(ErrorModel.symmetric(p), rounds=ROUNDS), MODELS[model])
+    return filter_noise_channel(BBCodeSimulator(P).build_circuit(ErrorModel.symmetric(p), rounds=ROUNDS),
+                                MODELS[model])
 
 for name in MODELS:
     print(f"{name:16s}: {make_circuit(name, P_REF).detector_error_model().num_errors} DEM mechanisms")''')
@@ -106,16 +90,11 @@ code distance (Appendix A.6 route for `f₀*`). We enumerate `L(D)` with the ldp
 `D` (robust) and the coset search for odd `D`.""")
 
 code('''def enumerate_LD(circuit, D):
-    """Complete L(D): half-MITM for even D (exact, no ldpc); coset search for odd D."""
-    H, A, mult, priors = dem_check_action_matrices(circuit); K = A.shape[0]
-    if D % 2 == 0:
-        return find_weight_logicals_mitm(H, A, D)
-    _mw_init(H, A, priors, 10, 200); LD = set()
-    for mask in range(1, (1 << K)):
-        for s in _mw_coset_enum_task((mask, D, 40)):
-            if len(s) == D:
-                LD.add(frozenset(s))
-    return LD
+    """Complete L(D): half-MITM for even D (exact, no ldpc); parallel coset enumeration for odd D."""
+    if D % 2 != 0:
+        return find_all_min_weight_logicals(circuit, D, budget_per_coset=40)
+    H, A, mult, priors = dem_check_action_matrices(circuit)
+    return find_weight_logicals_mitm(H, A, D)
 
 tech2 = {}
 print(f"{'model':16s} {'D':>2} {'w0':>3} {'#DEM':>6} {'|L(D)|':>8} {'f0*':>8}   route")
@@ -211,11 +190,11 @@ models (`keep = not channel`) through the same pipeline.
 The ablated distances are a structural diagnostic: if dropping channel *i* restores `D=4`, then
 channel *i* participates in **every** weight-3 hook; if `D` stays 3, the hooks survive without it.""")
 
-code('''ABLATED = {"no CZ": _cz, "no meas": _meas, "no prep": _prep, "no idle": _idle}
+code('''ABLATED = {"no CZ": "cz", "no meas": "meas", "no prep": "prep", "no idle": "idle"}
 def make_ablated_circuit(name, p):
-    drop = ABLATED[name]
-    return filter_noise(BBCodeSimulator(P).build_circuit(ErrorModel.symmetric(p), rounds=ROUNDS),
-                        lambda i, pr, nx: not drop(i, pr, nx))
+    drop = NOISE_CHANNEL_PREDICATES[ABLATED[name]]
+    return filter_noise_channel(BBCodeSimulator(P).build_circuit(ErrorModel.symmetric(p), rounds=ROUNDS),
+                                lambda i, pr, nx: not drop(i, pr, nx))
 
 tech2_abl = {}
 print(f"{'model':10s} {'D':>2} {'w0':>3} {'#DEM':>6} {'|L(D)|':>8} {'f0*':>10}   hook diagnosis")

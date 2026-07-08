@@ -80,7 +80,7 @@ REPO_ROOT = _add_src_to_path()
 from scipy.special import gammaln  # noqa: E402
 
 from bb_code_sim import (BBCodeSimulator, BBCodeParams, BB_72_12_6, BB_144_12_12,  # noqa: E402
-                         RelayBPDecoder)
+                         RelayBPDecoder, filter_noise_channel)
 
 # Code registry for the --code seam (default BB(6); others are future bicycle codes).
 CODES = {"bb72": (BB_72_12_6, "BB(6)=[[72,12,6]]"), "bb144": (BB_144_12_12, "BB(12)=[[144,12,12]]")}
@@ -184,11 +184,11 @@ class Config:
     # directly instead of re-running the multi-minute BP-OSD search (which plateaus ~0.5% low).
     mw_f0_override: Optional[float] = 2.3239e-5
     mw_w0_override: Optional[int] = 3
-    # II.3 feasibility cap: the exact Proposition-1 onset fraction (even D) enumerates every
-    # weight-D/2 restriction of every min-weight logical — ~C(D, D/2)·|L(D)| subsets. For large
-    # even D with a big L(D) (the cz channel: D=22, |L(D)|=17856 → ~1.3e10 restrictions) this OOMs
-    # and never finishes. Above this cap, skip the exact enumeration and leave f0 unpinned (same as
-    # the odd-D branch); for bb144 an unpinned onset is the correct choice anyway (see run_technique_i).
+    # II.3 restriction budget, passed to min_weight_fail_count (which owns the guard): the exact
+    # Proposition-1 onset enumerates ~C(D, D/2)·|L(D)| restrictions — for the cz channel (D=22,
+    # |L(D)|=17856 → ~1.3e10) that OOMs. Over budget the library raises InfeasibleEnumerationError
+    # and II.3 leaves f0 unpinned (same as the odd-D branch); for bb144 an unpinned onset is the
+    # correct choice anyway (see run_technique_i).
     mw_prop1_max_restrictions: int = 100_000_000
 
     # Decoder-convergence diagnostic (--decoder-conv): Relay-BP LER vs # legs on the full DEM.
@@ -269,35 +269,14 @@ def make_decoder(cfg: Config) -> RelayBPDecoder:
     )
 
 
-_NOISE = {"DEPOLARIZE1", "DEPOLARIZE2", "X_ERROR", "Y_ERROR", "Z_ERROR", "PAULI_CHANNEL_1", "PAULI_CHANNEL_2"}
-_NOISE_PRED = {
-    "cz":   lambda i, p, n: i.name == "DEPOLARIZE2",                                       # two-qubit gate
-    "meas": lambda i, p, n: i.name == "X_ERROR" and n is not None and n.name == "M",        # before a measurement
-    "prep": lambda i, p, n: i.name == "X_ERROR" and p is not None and p.name == "R",        # after a reset
-    "idle": lambda i, p, n: i.name == "DEPOLARIZE1" and not (p is not None and p.name == "H"),  # idle data (not post-H)
-}
-def _filter_noise(circ, model):
-    """Isolate one physical noise channel by filtering instructions on the built circuit (same base rate)."""
-    keep = _NOISE_PRED.get(model)
-    if keep is None:                       # None / 'full' / unknown -> full symmetric (no filtering)
-        return circ
-    insts = list(circ.flattened()); out = stim.Circuit()
-    for i, inst in enumerate(insts):
-        if inst.name in _NOISE:
-            prev = insts[i - 1] if i > 0 else None
-            nxt = insts[i + 1] if i + 1 < len(insts) else None
-            if not keep(inst, prev, nxt):
-                continue
-        out.append(inst)
-    return out
-
-
 def build_circuit(cfg: Config):
     """The cfg.code (default BB(6)=[[72,12,6]]) memory circuit at p_ref with cfg.rounds rounds,
-    optionally filtered to a single noise channel (cfg.noise_model). Every technique reads this.
+    optionally filtered to a single noise channel (cfg.noise_model — the canonical position
+    predicates in bb_code_sim.filter_noise_channel). Every technique reads this.
     Measurement error is p_meas_factor * p_phys (1.0 = symmetric)."""
     em = ErrorModel(p_phys=cfg.p_ref, p_meas=cfg.p_ref * cfg.p_meas_factor)
-    return _filter_noise(BBCodeSimulator(cfg.code).build_circuit(em, rounds=cfg.rounds), cfg.noise_model)
+    return filter_noise_channel(BBCodeSimulator(cfg.code).build_circuit(em, rounds=cfg.rounds),
+                                cfg.noise_model)
 
 
 # ================================ checkpoint I/O ==================================
@@ -499,7 +478,7 @@ def run_technique_ii(cfg: Config, outdir: pathlib.Path) -> dict:
     from min_weight import (
         dem_check_action_matrices, single_sector_dem, compute_distance,
         find_min_weight_logicals, min_weight_fail_count, expanded_logical_count,
-        build_circuit_translation_perms,
+        build_circuit_translation_perms, InfeasibleEnumerationError,
     )
 
     # Paper Table-2 targets (BB(6)-circuit, Z-type / single-sector representation).
@@ -609,31 +588,24 @@ def run_technique_ii(cfg: Config, outdir: pathlib.Path) -> dict:
           f"(paper {PAPER_LD_EXP:.3g})   ({time.perf_counter() - t1:.0f}s)", flush=True)
 
     half = (D + 1) // 2          # onset weight w0 = ceil(D/2) (correct for even AND odd D)
-    # Feasibility of the exact Proposition-1 enumeration: ~C(D, D/2)·|L(D)| weight-D/2 restrictions.
-    from math import comb
-    restr_est = comb(D, half) * ld_comp if (logicals and D % 2 == 0) else 0
-    if logicals and D % 2 == 0 and restr_est <= cfg.mw_prop1_max_restrictions:
-        # Even D, tractable: exact onset failure fraction f*(D/2) via Proposition 1.
-        print(f"  [II.3] exact onset fraction f*(D/2) via Proposition 1 "
-              f"(~{restr_est:.2g} restrictions) ...", flush=True)
-        fails, n_exp = min_weight_fail_count(H, A, logicals, mult)
-        log_choose = gammaln(n_exp + 1) - gammaln(half + 1) - gammaln(n_exp - half + 1)
-        f_star = float(fails / np.exp(log_choose))
+    # Exact onset fraction where available. When it is not — odd D, no weight-D logicals found, or
+    # an even-D enumeration over the library's restriction budget (e.g. cz: D=22, |L(D)|=17856 →
+    # ~1.3e10 restrictions → OOM) — report |L(D)| as a lower bound and leave f0 unpinned: Technique I
+    # then FITS w0/f0 from the IS spectrum instead of pinning a wrong value, and a multi-hour run
+    # never dies here.
+    n_exp = int(mult.sum())
+    fails, f_star = 0, None
+    if logicals and D % 2 == 0:
+        print("  [II.3] exact onset fraction f*(D/2) via Proposition 1 ...", flush=True)
+        try:
+            fails, n_exp = min_weight_fail_count(H, A, logicals, mult,
+                                                 max_restrictions=cfg.mw_prop1_max_restrictions)
+            log_choose = gammaln(n_exp + 1) - gammaln(half + 1) - gammaln(n_exp - half + 1)
+            f_star = float(fails / np.exp(log_choose))
+        except InfeasibleEnumerationError as exc:
+            print(f"  [II.3] {exc} → onset fraction unpinned (f0=None)", flush=True)
     else:
-        # Odd D, no weight-D logicals found, OR an even-D enumeration too large to run (e.g. cz:
-        # D=22, |L(D)|=17856 → ~1.3e10 restrictions → OOM). In all three cases the exact onset
-        # fraction is unavailable/inapplicable, so report |L(D)| as a lower bound and leave f0
-        # unpinned — Technique I then FITS w0/f0 from the IS spectrum instead of pinning a wrong
-        # value, and a multi-hour run never dies here.
-        n_exp = int(mult.sum())
-        fails, f_star = 0, None
-        if not logicals:
-            why = "no weight-D logicals found"
-        elif D % 2 != 0:
-            why = f"D={D} is odd (Prop. 1 is even-D only)"
-        else:
-            why = (f"D={D} even but ~{restr_est:.2g} restrictions exceed cap "
-                   f"{cfg.mw_prop1_max_restrictions:.2g} (exact onset infeasible)")
+        why = "no weight-D logicals found" if not logicals else f"D={D} is odd (Prop. 1 is even-D only)"
         print(f"  [II.3] {why} → onset fraction unpinned (f0=None)", flush=True)
 
     out = {

@@ -20,6 +20,7 @@ Reweighting formula (Eq. 3 of the paper):
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from itertools import product
 from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -344,6 +345,7 @@ def fit_failure_spectrum(
     model: str = "f3",
     w0: Optional[float] = None,
     f0: Optional[float] = None,
+    init_params: Optional[Dict[str, float]] = None,
 ) -> AnsatzFit:
     """Fit an ansatz (f2/f3/f5) to a sampled failure spectrum.
 
@@ -352,6 +354,10 @@ def fit_failure_spectrum(
     the wide dynamic range well conditioned. ``a = 1 - 2^-K`` with K the number of
     logical observables. ``w0`` and/or ``f0`` may be pinned (e.g. from Technique II,
     the min-weight analysis); otherwise they are fit.
+
+    ``init_params`` warm-starts the solver from a previous fit's ``params`` and skips
+    the multistart grid — use it for refits of a perturbed spectrum (e.g. bootstrap
+    resamples), which land in the same basin at ~1/37th the f5 solver calls.
     """
     if model not in _ANSATZ_EXTRA:
         raise ValueError(f"unknown ansatz model {model!r} (use f2/f3/f5)")
@@ -425,16 +431,15 @@ def fit_failure_spectrum(
         # a bad local minimum (e.g. a low-gamma basin that matches only the onset and undershoots the
         # rest of the spectrum by several ×, especially when w0 is left free). Seed several shape starts
         # and keep the lowest-cost solution -- this is strictly >= the single-start quality.
-        import itertools as _it
-        shape_grid = {"gamma": [2.0, 4.0, 6.0, 8.0], "gamma1": [2.0, 4.0, 6.0, 8.0],
-                      "gamma2": [1.0, 1.5, 2.0], "wc": [2.0, 4.0, 8.0]}
-        free_shape = [p for p in free_names if p in shape_grid]
-        starts = [dict(init)]
-        for combo in (_it.product(*[shape_grid[p] for p in free_shape]) if free_shape else []):
-            s = dict(init)
-            for p, v in zip(free_shape, combo):
-                s[p] = v
-            starts.append(s)
+        # A warm start (init_params) replaces the grid with that single start.
+        if init_params is not None:
+            starts = [{**init, **{k: v for k, v in init_params.items() if k in free_names}}]
+        else:
+            shape_grid = {"gamma": [2.0, 4.0, 6.0, 8.0], "gamma1": [2.0, 4.0, 6.0, 8.0],
+                          "gamma2": [1.0, 1.5, 2.0], "wc": [2.0, 4.0, 8.0]}
+            free_shape = [p for p in free_names if p in shape_grid]
+            grid = product(*(shape_grid[p] for p in free_shape)) if free_shape else ()
+            starts = [dict(init)] + [{**init, **dict(zip(free_shape, combo))} for combo in grid]
         sol = None
         for s in starts:
             x0 = np.clip(np.array([s[n] for n in free_names], dtype=float),

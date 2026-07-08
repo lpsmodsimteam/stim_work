@@ -42,37 +42,20 @@ Proposition 1.""")
 md("""## Setup — both codes, the five channels, and the two decoders""")
 
 code('''import numpy as np, matplotlib.pyplot as plt, stim
-from bb_code_sim import BBCodeParams, BBCodeSimulator, RelayBPDecoder
+from bb_code_sim import BBCodeParams, BBCodeSimulator, RelayBPDecoder, filter_noise_channel
 from surface_code_sim import ErrorModel, PyMatchingDecoder
 from min_weight import (dem_check_action_matrices, compute_distance, optimal_onset_fraction,
-                        find_weight_logicals_mitm, _mw_init, _mw_coset_enum_task)
+                        find_weight_logicals_mitm, find_all_min_weight_logicals)
 from importance_sampling import importance_sample, fit_failure_spectrum, logical_error_rate_from_ansatz
 from splitting import replica_exchange_estimate
 
 P_REF, ROUNDS = 0.01, 3   # 3 syndrome rounds for BOTH codes (surface distance-search is ldpc-fragile at 2)
 P_BB = BBCodeParams(l=3, m=3, a_exps=[(1, 0), (0, 0), (0, 2)], b_exps=[(0, 1), (0, 0), (2, 0)], distance=4)
-NOISE = {"DEPOLARIZE1", "DEPOLARIZE2", "X_ERROR", "Y_ERROR", "Z_ERROR", "PAULI_CHANNEL_1", "PAULI_CHANNEL_2"}
 
-# --- BB: the depth-7 builder bundles channels, so isolate them by filtering instructions by POSITION ---
-def _filter(circ, keep):
-    if keep is None:
-        return circ
-    insts = list(circ.flattened()); out = stim.Circuit()
-    for i, inst in enumerate(insts):
-        if inst.name in NOISE:
-            prev = insts[i - 1] if i > 0 else None
-            nxt = insts[i + 1] if i + 1 < len(insts) else None
-            if not keep(inst, prev, nxt):
-                continue
-        out.append(inst)
-    return out
-BB_PRED = {
-    "full symmetric": None,
-    "CZ only":   lambda i, p, n: i.name == "DEPOLARIZE2",
-    "meas only": lambda i, p, n: i.name == "X_ERROR" and n is not None and n.name == "M",
-    "prep only": lambda i, p, n: i.name == "X_ERROR" and p is not None and p.name == "R",
-    "idle only": lambda i, p, n: i.name == "DEPOLARIZE1" and not (p is not None and p.name == "H"),
-}
+# --- BB: the depth-7 builder bundles channels, so isolate them by POSITION-filtering the built
+# circuit — bb_code_sim.filter_noise_channel owns the predicates, next to the builder they encode ---
+BB_CHANNEL = {"full symmetric": None, "CZ only": "cz", "meas only": "meas",
+              "prep only": "prep", "idle only": "idle"}
 
 # --- surface: stim generation flags already separate the channels (drop 1q depol for pure CZ) ---
 SURF_FLAGS = {
@@ -101,7 +84,8 @@ COLORS = {"full symmetric": "crimson", "CZ only": "navy", "meas only": "seagreen
 
 def make_circuit(code, model, p):
     if code == "BB":
-        return _filter(BBCodeSimulator(P_BB).build_circuit(ErrorModel.symmetric(p), rounds=ROUNDS), BB_PRED[model])
+        return filter_noise_channel(BBCodeSimulator(P_BB).build_circuit(ErrorModel.symmetric(p), rounds=ROUNDS),
+                                    BB_CHANNEL[model])
     return _surf(model, p)
 def decoder_for(code):
     return RelayBPDecoder() if code == "BB" else PyMatchingDecoder()
@@ -119,15 +103,11 @@ channel). Even `D` uses Proposition 1 (ldpc-free half-MITM for `L(D)`); odd `D` 
 Appendix A.6 route with the coset search.""")
 
 code('''def enumerate_LD(circuit, D):
-    H, A, mult, priors = dem_check_action_matrices(circuit); K = A.shape[0]
-    if D % 2 == 0:
-        return find_weight_logicals_mitm(H, A, D)
-    _mw_init(H, A, priors, 10, 200); LD = set()
-    for mask in range(1, (1 << K)):
-        for s in _mw_coset_enum_task((mask, D, 40)):
-            if len(s) == D:
-                LD.add(frozenset(s))
-    return LD
+    """Complete L(D): half-MITM for even D (exact, no ldpc); parallel coset enumeration for odd D."""
+    if D % 2 != 0:
+        return find_all_min_weight_logicals(circuit, D, budget_per_coset=40)
+    H, A, mult, priors = dem_check_action_matrices(circuit)
+    return find_weight_logicals_mitm(H, A, D)
 
 tech2 = {}
 print(f"{'code':22s} {'channel':16s} {'D':>2} {'w0':>3} {'#DEM':>6} {'|L(D)|':>8} {'f0*':>8}")

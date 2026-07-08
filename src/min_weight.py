@@ -1065,25 +1065,70 @@ def find_all_min_weight_logicals(
     return found
 
 
+class InfeasibleEnumerationError(RuntimeError):
+    """The exact onset enumeration would exceed the caller's restriction budget (would OOM)."""
+
+
+def _check_restriction_budget(estimate: int, max_restrictions: Optional[int]) -> None:
+    if max_restrictions is not None and estimate > max_restrictions:
+        raise InfeasibleEnumerationError(
+            f"~{estimate:.3g} weight-w0 restrictions exceed max_restrictions="
+            f"{max_restrictions:.3g}; exact onset enumeration is infeasible at this scale "
+            f"(report |L(D)| and an f0 bound instead)")
+
+
+def fail_count_from_restrictions(H, A, multipliers, restrictions) -> int:
+    """Proposition-1 max-class vote over an explicit set of unique restrictions (paper §4.3).
+
+    Groups the restrictions by (syndrome σ=H·r, action a=A·r) in the expanded representation
+    (each restriction r contributes ρ(r)=Π_{j∈r} m_j copies); for each σ the largest-action
+    class succeeds while the rest fail. ``restrictions`` is an iterable of column-index
+    collections, already deduplicated by the caller. Shared by the even-D
+    (:func:`min_weight_fail_count`) and odd-D (:func:`min_weight_fail_count_odd`) counters and
+    by streaming callers that produce the restriction set under their own memory budget.
+    """
+    H = np.asarray(H, dtype=np.uint8)
+    A = np.asarray(A, dtype=np.uint8)
+    multipliers = np.asarray(multipliers, dtype=np.int64)
+    # sigma_key -> { action_key -> summed multiplicity }
+    by_sigma: Dict[bytes, Dict[bytes, int]] = {}
+    for r in restrictions:
+        idx = np.fromiter(r, dtype=np.int64, count=len(r))
+        rho = int(np.prod(multipliers[idx]))
+        sig = np.packbits((H[:, idx].sum(axis=1) % 2).astype(np.uint8)).tobytes()
+        act = np.packbits((A[:, idx].sum(axis=1) % 2).astype(np.uint8)).tobytes()
+        d = by_sigma.setdefault(sig, {})
+        d[act] = d.get(act, 0) + rho
+    fails = 0
+    for action_sizes in by_sigma.values():
+        sizes = list(action_sizes.values())
+        fails += sum(sizes) - max(sizes)
+    return fails
+
+
 def min_weight_fail_count(
     H: np.ndarray,
     A: np.ndarray,
     logical_supports,
     multipliers: Optional[np.ndarray] = None,
+    *,
+    max_restrictions: Optional[int] = None,
 ) -> Tuple[int, int]:
     """Exact |F(D/2)| for even D via Proposition 1 (paper §4.3).
 
     F(D/2) is the set of weight-D/2 failing errors under a max-class min-weight
     decoder, and equals the failing subset of L(D)|_{D/2} (the weight-D/2
-    restrictions of the min-weight logicals). We enumerate those restrictions,
-    partition them by (syndrome σ=H·r, action a=A·r) in the expanded representation
-    (each restriction r contributes ρ(r)=Π_{j∈r} m_j copies), and for each σ the
-    largest-action class succeeds while the rest fail.
+    restrictions of the min-weight logicals). We enumerate those restrictions and
+    score them with :func:`fail_count_from_restrictions`.
+
+    ``max_restrictions`` guards the ~C(D, D/2)·|L(D)| enumeration (e.g. bb144 cz:
+    D=22, |L(D)|=17856 → ~1.3e10 restrictions OOMs a 64 GB box); above the budget an
+    :class:`InfeasibleEnumerationError` is raised before any memory is committed.
 
     Returns (|F(D/2)|, N_expanded). Requires all logicals to share weight D (even).
     """
-    H = H.astype(np.uint8)
-    A = A.astype(np.uint8)
+    from math import comb
+
     N = H.shape[1]
     if multipliers is None:
         multipliers = np.ones(N, dtype=np.int64)
@@ -1098,6 +1143,7 @@ def min_weight_fail_count(
     if D % 2 != 0:
         raise ValueError("Proposition-1 exact onset requires even D (see Appendix A.6 for odd D)")
     half = D // 2
+    _check_restriction_budget(comb(D, half) * len(supports), max_restrictions)
 
     # Unique weight-D/2 restrictions of the min-weight logicals.
     restrictions: Set[FrozenSet[int]] = set()
@@ -1105,23 +1151,7 @@ def min_weight_fail_count(
         for r in combinations(sorted(s), half):
             restrictions.add(frozenset(r))
 
-    # Group restrictions by syndrome σ, accumulating expanded-rep set sizes per action a.
-    # sigma_key -> { action_key -> summed multiplicity }
-    by_sigma: Dict[bytes, Dict[bytes, int]] = {}
-    for r in restrictions:
-        idx = np.fromiter(r, dtype=np.int64, count=len(r))
-        rho = int(np.prod(multipliers[idx]))
-        sig = np.packbits((H[:, idx].sum(axis=1) % 2).astype(np.uint8)).tobytes()
-        act = np.packbits((A[:, idx].sum(axis=1) % 2).astype(np.uint8)).tobytes()
-        by_sigma.setdefault(sig, {})
-        by_sigma[sig][act] = by_sigma[sig].get(act, 0) + rho
-
-    # For each syndrome, the max-class action succeeds; all other classes fail.
-    fails = 0
-    for action_sizes in by_sigma.values():
-        sizes = list(action_sizes.values())
-        fails += sum(sizes) - max(sizes)
-
+    fails = fail_count_from_restrictions(H, A, multipliers, restrictions)
     N_expanded = int(multipliers.sum())
     return fails, N_expanded
 
@@ -1167,12 +1197,9 @@ def find_weight_logicals_mitm(
     for lst in groups.values():
         if len({a for _, a in lst}) < 2:        # need two differing actions to make a logical
             continue
-        for i in range(len(lst)):
-            pi, ai = lst[i]
-            for j in range(i + 1, len(lst)):
-                pj, aj = lst[j]
-                if aj != ai and pi.isdisjoint(pj):
-                    logicals.add(pi | pj)
+        for (pi, ai), (pj, aj) in combinations(lst, 2):
+            if aj != ai and pi.isdisjoint(pj):
+                logicals.add(pi | pj)
     return logicals
 
 
@@ -1182,6 +1209,8 @@ def min_weight_fail_count_odd(
     logicals_D,
     logicals_Dp1,
     multipliers: Optional[np.ndarray] = None,
+    *,
+    max_restrictions: Optional[int] = None,
 ) -> Tuple[int, int]:
     """Exact |F(w0)| for ODD D via Appendix A.6 of arXiv:2511.15177, where w0 = (D+1)/2.
 
@@ -1198,7 +1227,8 @@ def min_weight_fail_count_odd(
     number of min-weight fails. Returns (|F(w0)|, N_expanded). See :func:`min_weight_fail_count` for the
     even-D case (Proposition 1).
     """
-    H = H.astype(np.uint8); A = A.astype(np.uint8)
+    from math import comb
+
     N = H.shape[1]
     if multipliers is None:
         multipliers = np.ones(N, dtype=np.int64)
@@ -1213,6 +1243,8 @@ def min_weight_fail_count_odd(
     if D % 2 == 0:
         raise ValueError("min_weight_fail_count_odd is for odd D; use min_weight_fail_count (Prop. 1) for even D")
     w0 = (D + 1) // 2
+    n_Dp1 = len(logicals_Dp1) if hasattr(logicals_Dp1, "__len__") else 0
+    _check_restriction_budget(comb(D, w0) * len(sup_D) + comb(D + 1, w0) * n_Dp1, max_restrictions)
 
     def rho(cols) -> int:
         return int(np.prod(multipliers[list(cols)]))
@@ -1223,16 +1255,7 @@ def min_weight_fail_count_odd(
 
     # (ii) weight-w0 restrictions of L(D+1), minus L(D)|_{w0}, scored by the max-class vote
     R_Dp1: Set[FrozenSet[int]] = {frozenset(r) for s in logicals_Dp1 for r in combinations(sorted(s), w0)}
-    by_sigma: Dict[bytes, Dict[bytes, int]] = {}
-    for r in (R_Dp1 - R_D):
-        idx = np.fromiter(r, dtype=np.int64, count=len(r))
-        sig = np.packbits((H[:, idx].sum(axis=1) % 2).astype(np.uint8)).tobytes()
-        act = np.packbits((A[:, idx].sum(axis=1) % 2).astype(np.uint8)).tobytes()
-        by_sigma.setdefault(sig, {})
-        by_sigma[sig][act] = by_sigma[sig].get(act, 0) + rho(idx)
-    for action_sizes in by_sigma.values():
-        sizes = list(action_sizes.values())
-        fails += sum(sizes) - max(sizes)
+    fails += fail_count_from_restrictions(H, A, multipliers, R_Dp1 - R_D)
 
     N_expanded = int(multipliers.sum())
     return fails, N_expanded
@@ -1261,6 +1284,7 @@ def optimal_onset_fraction(
     seed: Optional[int] = None,
     sector: Optional[int] = None,
     mitm_max_choose: int = 5_000_000,
+    max_restrictions: Optional[int] = 100_000_000,
 ) -> OnsetResult:
     """Exact optimal onset fraction f*(w0), w0 = ⌈D/2⌉, for even OR odd circuit distance.
 
@@ -1276,6 +1300,8 @@ def optimal_onset_fraction(
 
     ``sector`` restricts to a single CSS detector sector (see :func:`dem_check_action_matrices`).
     With complete logical sets the result is exact; with partial sets it is a lower bound on |F(w0)|.
+    ``max_restrictions`` bounds the exact enumeration (see :func:`min_weight_fail_count`); pass
+    ``None`` to disable the guard.
     """
     H, A, mult, priors = dem_check_action_matrices(circuit, sector=sector)
     if distance is None:
@@ -1287,15 +1313,16 @@ def optimal_onset_fraction(
             max_iter=max_iter, priors=priors, seed=seed, sector=sector,
         )
     from scipy.special import gammaln
+    w0 = (distance + 1) // 2                     # ceil(D/2): correct for even AND odd D
     if distance % 2 == 0:
-        w0 = distance // 2
-        fails, n_exp = min_weight_fail_count(H, A, logicals, mult)
+        fails, n_exp = min_weight_fail_count(H, A, logicals, mult,
+                                             max_restrictions=max_restrictions)
         n_Dp1 = None
     else:
-        w0 = (distance + 1) // 2
         if logicals_Dp1 is None:
             logicals_Dp1 = find_weight_logicals_mitm(H, A, distance + 1, max_choose=mitm_max_choose)
-        fails, n_exp = min_weight_fail_count_odd(H, A, logicals, logicals_Dp1, mult)
+        fails, n_exp = min_weight_fail_count_odd(H, A, logicals, logicals_Dp1, mult,
+                                                 max_restrictions=max_restrictions)
         n_Dp1 = len(logicals_Dp1)
     # C(N_expanded, w0) via log-gamma to avoid overflow on large N.
     log_choose = gammaln(n_exp + 1) - gammaln(w0 + 1) - gammaln(n_exp - w0 + 1)
