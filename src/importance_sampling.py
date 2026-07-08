@@ -417,13 +417,31 @@ def fit_failure_spectrum(
 
     param_cov: Optional[np.ndarray] = None
     if free_names:
-        x0 = np.array([init[n] for n in free_names], dtype=float)
         bounds = (
             np.array([lo[n] for n in free_names]),
             np.array([hi[n] for n in free_names]),
         )
-        x0 = np.clip(x0, bounds[0] + 1e-9, bounds[1] - 1e-9)
-        sol = least_squares(residual, x0, bounds=bounds, method="trf")
+        # Multistart: the (w0, f0, shape) least-squares is non-convex, so a single start can fall into
+        # a bad local minimum (e.g. a low-gamma basin that matches only the onset and undershoots the
+        # rest of the spectrum by several ×, especially when w0 is left free). Seed several shape starts
+        # and keep the lowest-cost solution -- this is strictly >= the single-start quality.
+        import itertools as _it
+        shape_grid = {"gamma": [2.0, 4.0, 6.0, 8.0], "gamma1": [2.0, 4.0, 6.0, 8.0],
+                      "gamma2": [1.0, 1.5, 2.0], "wc": [2.0, 4.0, 8.0]}
+        free_shape = [p for p in free_names if p in shape_grid]
+        starts = [dict(init)]
+        for combo in (_it.product(*[shape_grid[p] for p in free_shape]) if free_shape else []):
+            s = dict(init)
+            for p, v in zip(free_shape, combo):
+                s[p] = v
+            starts.append(s)
+        sol = None
+        for s in starts:
+            x0 = np.clip(np.array([s[n] for n in free_names], dtype=float),
+                         bounds[0] + 1e-9, bounds[1] - 1e-9)
+            cand = least_squares(residual, x0, bounds=bounds, method="trf")
+            if sol is None or cand.cost < sol.cost:
+                sol = cand
         params = kwargs_from(sol.x)
         cost = float(sol.cost)
         # Covariance ≈ (JᵀJ)⁻¹ scaled by residual variance (Gauss-Newton approx).

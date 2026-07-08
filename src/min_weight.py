@@ -1126,14 +1126,127 @@ def min_weight_fail_count(
     return fails, N_expanded
 
 
+def find_weight_logicals_mitm(
+    H: np.ndarray,
+    A: np.ndarray,
+    weight: int,
+    *,
+    max_choose: int = 5_000_000,
+) -> Set[FrozenSet[int]]:
+    """Exact, complete enumeration of all weight-``weight`` (EVEN) logical supports via half-MITM.
+
+    Every weight-``weight`` logical splits into two disjoint weight-``weight/2`` halves with equal
+    detector syndrome (``H·ℓ=0``) and differing logical action (``A·ℓ≠0``). We enumerate all
+    weight-``weight/2`` column subsets, bucket them by syndrome, and pair up disjoint halves whose
+    actions differ. Exact and complete, but the enumeration is ``C(N, weight/2)`` subsets, so this is
+    intended for SMALL systems (e.g. the [[18,4,4]] tutorial, where it supplies ``L(D+1)`` for the
+    odd-``D`` onset). Raises if the enumeration would exceed ``max_choose`` subsets.
+
+    Returns a set of frozenset column supports, each of size ``weight``.
+    """
+    from math import comb
+    H = np.asarray(H, dtype=np.uint8); A = np.asarray(A, dtype=np.uint8)
+    M, N = H.shape; K = A.shape[0]
+    if weight % 2 != 0:
+        raise ValueError(f"half-MITM enumeration needs even weight (got {weight})")
+    half = weight // 2
+    if comb(N, half) > max_choose:
+        raise ValueError(f"C({N},{half})={comb(N, half)} exceeds max_choose={max_choose}; "
+                         f"this exact enumerator is for small systems only")
+    powM = 1 << np.arange(M, dtype=object)
+    powK = 1 << np.arange(K, dtype=object)
+    bsig = [int(x) for x in (H.T.astype(object) @ powM)]   # per-column detector syndrome (int mask)
+    bact = [int(x) for x in (A.T.astype(object) @ powK)]   # per-column logical action (int mask)
+    groups: Dict[int, List[Tuple[FrozenSet[int], int]]] = {}
+    for combo in combinations(range(N), half):
+        sig = 0; act = 0
+        for c in combo:
+            sig ^= bsig[c]; act ^= bact[c]
+        groups.setdefault(sig, []).append((frozenset(combo), act))
+    logicals: Set[FrozenSet[int]] = set()
+    for lst in groups.values():
+        if len({a for _, a in lst}) < 2:        # need two differing actions to make a logical
+            continue
+        for i in range(len(lst)):
+            pi, ai = lst[i]
+            for j in range(i + 1, len(lst)):
+                pj, aj = lst[j]
+                if aj != ai and pi.isdisjoint(pj):
+                    logicals.add(pi | pj)
+    return logicals
+
+
+def min_weight_fail_count_odd(
+    H: np.ndarray,
+    A: np.ndarray,
+    logicals_D,
+    logicals_Dp1,
+    multipliers: Optional[np.ndarray] = None,
+) -> Tuple[int, int]:
+    """Exact |F(w0)| for ODD D via Appendix A.6 of arXiv:2511.15177, where w0 = (D+1)/2.
+
+    For odd D the onset weight is w0 = ⌈D/2⌉ = (D+1)/2 and BOTH L(D) and L(D+1) contribute failures:
+
+      (i)  Every weight-w0 restriction of L(D) fails: if r ⊂ ℓ ∈ L(D) then ℓ∖r has weight (D−1)/2 < w0,
+           so a min-weight decoder prefers that lighter, different-class correction. We count them all.
+      (ii) Weight-w0 restrictions of L(D+1) — after removing any that also appear in L(D)|_{w0} — fail
+           unless their class wins the max-class vote among same-syndrome weight-w0 errors (the
+           Section-4.3 procedure: per syndrome, the largest-action class succeeds, the rest fail; an
+           A-way tie gives success probability 1/A, i.e. ``sum − max`` fails in expectation).
+
+    With complete L(D) and L(D+1) this is exact; with partial (sampled) sets it is a lower bound on the
+    number of min-weight fails. Returns (|F(w0)|, N_expanded). See :func:`min_weight_fail_count` for the
+    even-D case (Proposition 1).
+    """
+    H = H.astype(np.uint8); A = A.astype(np.uint8)
+    N = H.shape[1]
+    if multipliers is None:
+        multipliers = np.ones(N, dtype=np.int64)
+    multipliers = np.asarray(multipliers, dtype=np.int64)
+
+    sup_D = [frozenset(s) for s in logicals_D]
+    if not sup_D:
+        raise ValueError("no weight-D logicals provided")
+    D = len(next(iter(sup_D)))
+    if any(len(s) != D for s in sup_D):
+        raise ValueError("all L(D) supports must have the same weight D")
+    if D % 2 == 0:
+        raise ValueError("min_weight_fail_count_odd is for odd D; use min_weight_fail_count (Prop. 1) for even D")
+    w0 = (D + 1) // 2
+
+    def rho(cols) -> int:
+        return int(np.prod(multipliers[list(cols)]))
+
+    # (i) every weight-w0 restriction of L(D) fails (lighter complement in another class)
+    R_D: Set[FrozenSet[int]] = {frozenset(r) for s in sup_D for r in combinations(sorted(s), w0)}
+    fails = sum(rho(r) for r in R_D)
+
+    # (ii) weight-w0 restrictions of L(D+1), minus L(D)|_{w0}, scored by the max-class vote
+    R_Dp1: Set[FrozenSet[int]] = {frozenset(r) for s in logicals_Dp1 for r in combinations(sorted(s), w0)}
+    by_sigma: Dict[bytes, Dict[bytes, int]] = {}
+    for r in (R_Dp1 - R_D):
+        idx = np.fromiter(r, dtype=np.int64, count=len(r))
+        sig = np.packbits((H[:, idx].sum(axis=1) % 2).astype(np.uint8)).tobytes()
+        act = np.packbits((A[:, idx].sum(axis=1) % 2).astype(np.uint8)).tobytes()
+        by_sigma.setdefault(sig, {})
+        by_sigma[sig][act] = by_sigma[sig].get(act, 0) + rho(idx)
+    for action_sizes in by_sigma.values():
+        sizes = list(action_sizes.values())
+        fails += sum(sizes) - max(sizes)
+
+    N_expanded = int(multipliers.sum())
+    return fails, N_expanded
+
+
 @dataclass
 class OnsetResult:
     distance: int
-    onset: int                 # D/2 for even D
+    onset: int                 # w0 = ceil(D/2): D/2 for even D, (D+1)/2 for odd D
     n_min_logicals: int        # |L(D)| found
-    fail_count: int            # |F(D/2)|
+    fail_count: int            # |F(w0)|
     n_expanded: int            # N in the expanded representation
-    onset_fraction: float      # f*(D/2) = |F(D/2)| / C(N, D/2)
+    onset_fraction: float      # f*(w0) = |F(w0)| / C(N, w0)
+    n_min_logicals_Dp1: Optional[int] = None   # |L(D+1)| used for the odd-D onset (None for even D)
 
 
 def optimal_onset_fraction(
@@ -1141,18 +1254,28 @@ def optimal_onset_fraction(
     *,
     distance: Optional[int] = None,
     logicals: Optional[Set[FrozenSet[int]]] = None,
+    logicals_Dp1: Optional[Set[FrozenSet[int]]] = None,
     osd_order: int = 10,
     max_iter: int = 200,
     max_trials: int = 2000,
     seed: Optional[int] = None,
     sector: Optional[int] = None,
+    mitm_max_choose: int = 5_000_000,
 ) -> OnsetResult:
-    """Exact optimal onset fraction f*(D/2) for a circuit with even distance (§4.3).
+    """Exact optimal onset fraction f*(w0), w0 = ⌈D/2⌉, for even OR odd circuit distance.
 
-    Convenience wrapper: computes D (if not given), searches L(D) (if not given),
-    then evaluates |F(D/2)| via :func:`min_weight_fail_count`. The result anchors
-    the Technique-I ansatz fit via ``w0=onset`` and ``f0=onset_fraction``. ``sector``
-    restricts to a single CSS detector sector (see :func:`dem_check_action_matrices`).
+    Convenience wrapper: computes D (if not given), searches L(D) (if not given), then evaluates the
+    optimal min-weight fail count |F(w0)| and f*(w0) = |F(w0)| / C(N, w0). The result anchors the
+    Technique-I ansatz fit via ``w0=onset`` and ``f0=onset_fraction``.
+
+    * **Even D** — Proposition 1 (§4.3) via :func:`min_weight_fail_count`; onset weight w0 = D/2.
+    * **Odd D** — Appendix A.6 via :func:`min_weight_fail_count_odd`; onset weight w0 = (D+1)/2. This
+      additionally needs ``L(D+1)``, enumerated exactly with :func:`find_weight_logicals_mitm` (or pass
+      ``logicals_Dp1``). The MITM enumerates ``C(N, w0)`` subsets, so the odd-D path is for SMALL
+      systems; ``mitm_max_choose`` guards the cost.
+
+    ``sector`` restricts to a single CSS detector sector (see :func:`dem_check_action_matrices`).
+    With complete logical sets the result is exact; with partial sets it is a lower bound on |F(w0)|.
     """
     H, A, mult, priors = dem_check_action_matrices(circuit, sector=sector)
     if distance is None:
@@ -1163,17 +1286,26 @@ def optimal_onset_fraction(
             circuit, distance, max_trials=max_trials, osd_order=osd_order,
             max_iter=max_iter, priors=priors, seed=seed, sector=sector,
         )
-    fails, n_exp = min_weight_fail_count(H, A, logicals, mult)
-    half = distance // 2
-    # C(N_expanded, D/2) via log-gamma to avoid overflow on large N.
     from scipy.special import gammaln
-    log_choose = gammaln(n_exp + 1) - gammaln(half + 1) - gammaln(n_exp - half + 1)
+    if distance % 2 == 0:
+        w0 = distance // 2
+        fails, n_exp = min_weight_fail_count(H, A, logicals, mult)
+        n_Dp1 = None
+    else:
+        w0 = (distance + 1) // 2
+        if logicals_Dp1 is None:
+            logicals_Dp1 = find_weight_logicals_mitm(H, A, distance + 1, max_choose=mitm_max_choose)
+        fails, n_exp = min_weight_fail_count_odd(H, A, logicals, logicals_Dp1, mult)
+        n_Dp1 = len(logicals_Dp1)
+    # C(N_expanded, w0) via log-gamma to avoid overflow on large N.
+    log_choose = gammaln(n_exp + 1) - gammaln(w0 + 1) - gammaln(n_exp - w0 + 1)
     f_star = fails / np.exp(log_choose)
     return OnsetResult(
         distance=distance,
-        onset=half,
+        onset=w0,
         n_min_logicals=len(logicals),
         fail_count=fails,
         n_expanded=n_exp,
         onset_fraction=float(f_star),
+        n_min_logicals_Dp1=n_Dp1,
     )
