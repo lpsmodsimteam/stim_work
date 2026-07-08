@@ -980,7 +980,8 @@ def main() -> None:
     ap.add_argument("--code", choices=sorted(CODES), default=None,
                     help="bivariate-bicycle code (default bb72=BB(6); bb144=BB(12)). Sets rounds=d "
                          "unless --rounds is given.")
-    ap.add_argument("--noise-model", choices=["full", "cz", "meas", "prep", "idle"], default=None,
+    ap.add_argument("--noise-model", default=None,
+                    choices=["full", "cz", "meas", "prep", "idle", "gate_idle", "meas_idle"],
                     help="isolate ONE physical noise channel (default full symmetric): cz=two-qubit gate "
                          "(DEPOLARIZE2), meas=measurement, prep=reset/state-prep, idle=idle-data. Filters "
                          "the circuit at the same base rate; feeds every technique.")

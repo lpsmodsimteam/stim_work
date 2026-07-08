@@ -37,7 +37,8 @@ the *same* [[18,4,4]] code:
 | **CZ only** | `DEPOLARIZE2` (two-qubit `CX` gate depolarizing) |
 | **meas only** | `X_ERROR` immediately **before** a measurement `M` |
 | **prep only** | `X_ERROR` immediately **after** a reset `R` (state preparation) |
-| **idle only** | `DEPOLARIZE1` on **idle data qubits** (while ancillas are reset/measured) |
+| **gate idle** | `DEPOLARIZE1` on data during the one **CX layer** each data qubit sits out |
+| **meas idle** | `DEPOLARIZE1` on data during the **ancilla measure+reset stage** |
 
 We isolate a channel by **filtering noise instructions** on one `symmetric(p)` circuit — so every variant
 uses the *identical* per-location rate `p` (a clean apples-to-apples comparison) — via
@@ -51,14 +52,19 @@ two-qubit depolarizing.)
 **Idle occupancy.** In the depth-7 schedule each data qubit is idle in **2 of the 8 rounds** per syndrome
 cycle — round 7 (all data idle while ancillas are measured/reset) plus exactly one of rounds 0/6 (it is
 busy on a `CX` in the other; rounds 1–5 keep every qubit busy). So a data qubit picks up idle
-`DEPOLARIZE1(p)` **twice per cycle**, an idle-error probability of `1−(1−p)² ≈ 2p` (not `3p`).""")
+`DEPOLARIZE1(p)` **twice per cycle**, an idle-error probability of `1−(1−p)² ≈ 2p` (not `3p`).
+We treat the two slots as **separate channels** (`gate_idle` / `meas_idle`, split by schedule
+position): on hardware the measure+reset dead time is much longer than a gate, so the two idles
+have very different physical rates. The builder's single M/R-stage `DEPOLARIZE1` covers the
+*combined* measure+reset dead time; reset is gate-duration-like by convention, so device-faithful
+duration weighting (t_meas ≫ t_gate) belongs on the `meas_idle` rate.""")
 
 # ---------------------------------------------------------------------------
 md("""## Setup — the code, the noise filter, and the three models""")
 
 code('''import numpy as np, matplotlib.pyplot as plt, stim
 from bb_code_sim import (BBCodeParams, BBCodeSimulator, RelayBPDecoder,
-                         NOISE_CHANNEL_PREDICATES, filter_noise_channel)
+                         NOISE_CHANNEL_PREDICATES, NOISE_INSTRUCTIONS, filter_noise_channel)
 from surface_code_sim import ErrorModel
 from min_weight import (dem_check_action_matrices, compute_distance, optimal_onset_fraction,
                         find_weight_logicals_mitm, find_all_min_weight_logicals)
@@ -78,15 +84,58 @@ MC_SCALE = 0.15
 # M = meas; DEPOLARIZE1 not post-H = idle; DEPOLARIZE2 = two-qubit gate) — they encode the layout
 # of build_bb_circuit, so they live in src next to it.
 MODELS = {"full symmetric": None, "CZ only": "cz", "meas only": "meas",
-          "prep only": "prep", "idle only": "idle"}
+          "prep only": "prep", "gate idle": "gate_idle", "meas idle": "meas_idle"}
 COLORS = {"full symmetric": "crimson", "CZ only": "navy", "meas only": "seagreen",
-          "prep only": "darkorange", "idle only": "purple"}
+          "prep only": "darkorange", "gate idle": "purple", "meas idle": "mediumvioletred"}
 def make_circuit(model, p):
     return filter_noise_channel(BBCodeSimulator(P).build_circuit(ErrorModel.symmetric(p), rounds=ROUNDS),
                                 MODELS[model])
 
 for name in MODELS:
     print(f"{name:16s}: {make_circuit(name, P_REF).detector_error_model().num_errors} DEM mechanisms")''')
+
+# ===========================================================================
+md(r"""## §0 — The syndrome-extraction schedule, up close
+
+One cycle of the extraction circuit, layer by layer, for two data qubits (one per block) and one
+ancilla of each type — derived from the built circuit itself, so it is exactly the layout the
+noise-channel predicates key on. Inline `·channel` tags show how each noise instruction is
+classified (`cz` / `meas` / `prep` / `gate_idle` / `meas_idle`): each data qubit is busy in six
+of the seven CX layers, idles through the one it sits out (`·gate_idle`), and idles again while
+the ancillas are measured and reset (`·meas_idle`).""")
+
+code('''watch = {0: "data q0 (L)", 9: "data q9 (R)", 18: "X-anc q18", 27: "Z-anc q27"}
+c = make_circuit("full symmetric", P_REF)
+insts = list(c.flattened())
+CH = {k: v for k, v in NOISE_CHANNEL_PREDICATES.items() if k != "idle"}   # idle = union of the split
+timeline = {q: [] for q in watch}
+layer = 0
+for i, inst in enumerate(insts):
+    if inst.name == "TICK":
+        layer += 1
+        continue
+    prev = insts[i - 1] if i > 0 else None
+    nxt = insts[i + 1] if i + 1 < len(insts) else None
+    if inst.name == "CX":
+        t = [x.value for x in inst.targets_copy()]
+        for a, b in zip(t[::2], t[1::2]):
+            if a in watch: timeline[a].append((layer, f"CX→{b}"))
+            if b in watch: timeline[b].append((layer, f"CX←{a}"))
+    elif inst.name in ("H", "M", "R"):
+        for x in inst.targets_copy():
+            if x.value in watch: timeline[x.value].append((layer, inst.name))
+    elif inst.name in NOISE_INSTRUCTIONS:
+        ch = next((k for k, pred in CH.items() if pred(inst, prev, nxt)), None)
+        tag = f"·{ch}" if ch else "·(1q gate)"          # post-H DEPOLARIZE1 = 1q-gate noise, no channel
+        for x in inst.targets_copy():
+            if x.value in watch: timeline[x.value].append((layer, tag))
+
+n_show = 12                                             # ~one full cycle of layers
+print(f"{'layer':>5} | " + " | ".join(f"{v:^24}" for v in watch.values()))
+print("-" * (8 + 27 * len(watch)))
+for L in range(n_show):
+    row = [" ".join(s for l, s in timeline[q] if l == L) or "—" for q in watch]
+    print(f"{L:>5} | " + " | ".join(f"{r:^24}" for r in row))''')
 
 # ===========================================================================
 md(r"""## §1 — Technique II: distance, onset, perfect-decoder floor (per model)
@@ -214,14 +263,15 @@ models (`keep = not channel`) through the same pipeline.
 The ablated distances are a structural diagnostic: if dropping channel *i* restores `D=4`, then
 channel *i* participates in **every** weight-3 hook; if `D` stays 3, the hooks survive without it.""")
 
-code('''ABLATED = {"no CZ": "cz", "no meas": "meas", "no prep": "prep", "no idle": "idle"}
+code('''ABLATED = {"no CZ": "cz", "no meas": "meas", "no prep": "prep",
+           "no gate idle": "gate_idle", "no meas idle": "meas_idle"}
 def make_ablated_circuit(name, p):
     drop = NOISE_CHANNEL_PREDICATES[ABLATED[name]]
     return filter_noise_channel(BBCodeSimulator(P).build_circuit(ErrorModel.symmetric(p), rounds=ROUNDS),
                                 lambda i, pr, nx: not drop(i, pr, nx))
 
 tech2_abl = {}
-print(f"{'model':10s} {'D':>2} {'w0':>3} {'#DEM':>6} {'|L(D)|':>8} {'f0*':>10}   hook diagnosis")
+print(f"{'model':13s} {'D':>2} {'w0':>3} {'#DEM':>6} {'|L(D)|':>8} {'f0*':>10}   hook diagnosis")
 for name in ABLATED:
     c = make_ablated_circuit(name, P_REF); D = compute_distance(c).distance
     LD = enumerate_LD(c, D)
@@ -229,7 +279,7 @@ for name in ABLATED:
     tech2_abl[name] = dict(D=D, LD=LD, onset=onset)
     diag = ("restores D=4 -> channel is in EVERY weight-3 hook" if D == 4
             else "still D=3 -> hooks survive without this channel" if D == 3 else "")
-    print(f"{name:10s} {D:2d} {onset.onset:3d} {c.detector_error_model().num_errors:6d} "
+    print(f"{name:13s} {D:2d} {onset.onset:3d} {c.detector_error_model().num_errors:6d} "
           f"{onset.n_min_logicals:8d} {onset.onset_fraction:10.3e}   {diag}")''')
 
 code('''tech1_abl, mc_abl = {}, {}
@@ -242,7 +292,7 @@ for name in ABLATED:
     tech1_abl[name] = dict(spec=spec, fit=fit,
                            LER=np.asarray(logical_error_rate_from_ansatz(fit, list(p_grid))))
     mc_abl[name] = {p: direct_mc(make_ablated_circuit(name, p), s) for p, s in mc_pts.items()}
-    print(f"{name:10s}: f5 fit cost={fit.cost:.2f}   MC LER(p={min(mc_pts)}) = "
+    print(f"{name:13s}: f5 fit cost={fit.cost:.2f}   MC LER(p={min(mc_pts)}) = "
           f"{mc_abl[name][min(mc_pts)][0]:.3e}")''')
 
 # ===========================================================================
@@ -292,8 +342,9 @@ def crossing_p(pg, y1, y2):          # p where y1(p)=y2(p), log-log interpolated
 def pseudo_threshold(pg, LER):       # break-even LER(p)=p (single-code threshold stand-in)
     return crossing_p(pg, LER, np.asarray(pg))
 
-CHANNELS = ["CZ only", "meas only", "prep only", "idle only"]
-ABL_OF = {"CZ only": "no CZ", "meas only": "no meas", "prep only": "no prep", "idle only": "no idle"}
+CHANNELS = ["CZ only", "meas only", "prep only", "gate idle", "meas idle"]
+ABL_OF = {"CZ only": "no CZ", "meas only": "no meas", "prep only": "no prep",
+          "gate idle": "no gate idle", "meas idle": "no meas idle"}
 
 L_full = ler_at(tech1["full symmetric"], P_STAR)
 S_full = split_at("full symmetric", P_STAR)
@@ -314,11 +365,14 @@ for ch, iso, marg, iso_split, pth in rows:
 mixing = 1.0 - sum(r[1] for r in rows)
 spam_iso = sum(r[1] for r in rows if r[0] in ("meas only", "prep only"))
 spam_marg = sum(r[2] for r in rows if r[0] in ("meas only", "prep only"))
+idle_iso = sum(r[1] for r in rows if "idle" in r[0])
+idle_marg = sum(r[2] for r in rows if "idle" in r[0])
 print(f"{'mixing':12s} {mixing:9.3f}                      (1 - sum isolated: cross-channel faults)")
 print(f"{'SPAM':12s} {spam_iso:9.3f} {'':10s} {spam_marg:9.3f}      (meas + prep combined)")
+print(f"{'idle total':12s} {idle_iso:9.3f} {'':10s} {idle_marg:9.3f}      (gate + meas idle combined)")
 print(f"sum(marginal) = {sum(r[2] for r in rows):.3f}  (>1 <=> shared mixed faults; Google renormalizes)")
 print(f"Willow-form sum: {sum(P_STAR / r[4] for r in rows if r[4]):.3f} = "
-      + " + ".join(f"{P_STAR/r[4]:.3f} ({r[0].split()[0]})" for r in rows if r[4])
+      + " + ".join(f"{P_STAR/r[4]:.3f} ({r[0].replace(' only', '')})" for r in rows if r[4])
       + ("   [all terms < 1: genuinely sub-threshold]"
          if all(P_STAR / r[4] < 1 for r in rows if r[4])
          else "   [WARNING: a term >= 1 — p* is not below every pseudo-threshold]"))''')

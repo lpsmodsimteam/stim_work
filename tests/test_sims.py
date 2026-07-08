@@ -179,3 +179,26 @@ def test_is_matches_direct_mc():
     assert diff < 4 * se, f"IS={result.P_logical[0]:.4f}, MC={direct.logical_error_rate:.4f}, diff/SE={diff/se:.1f}"
 
 
+
+
+def test_idle_channel_split_partitions_idle():
+    """gate_idle and meas_idle must partition 'idle' exactly (disjoint, union-complete) on a
+    built BB circuit; [[18,4,4]] at 2 cycles has 18+18 locations per cycle of each kind."""
+    from bb_code_sim import BB_18_4_4, NOISE_CHANNEL_PREDICATES
+
+    c = BBCodeSimulator(BB_18_4_4).build_circuit(ErrorModel.symmetric(0.01), rounds=2)
+    insts = list(c.flattened())
+    idle, gate, meas = (NOISE_CHANNEL_PREDICATES[k] for k in ("idle", "gate_idle", "meas_idle"))
+    n_gate = n_meas = 0
+    for i, inst in enumerate(insts):
+        if inst.name != "DEPOLARIZE1":
+            continue
+        prev = insts[i - 1] if i > 0 else None
+        nxt = insts[i + 1] if i + 1 < len(insts) else None
+        g, m, u = gate(inst, prev, nxt), meas(inst, prev, nxt), idle(inst, prev, nxt)
+        assert not (g and m), "gate_idle and meas_idle overlap"
+        assert (g or m) == u, "split does not partition 'idle'"
+        k = len(inst.targets_copy())
+        n_gate += k * g
+        n_meas += k * m
+    assert (n_gate, n_meas) == (36, 36)   # 2 cycles x 18 locations each

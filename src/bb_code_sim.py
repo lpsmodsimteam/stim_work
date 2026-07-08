@@ -630,6 +630,16 @@ NOISE_CHANNEL_PREDICATES = {
     "meas": lambda i, p, n: i.name == "X_ERROR" and n is not None and n.name == "M",        # before a measurement
     "prep": lambda i, p, n: i.name == "X_ERROR" and p is not None and p.name == "R",        # after a reset
     "idle": lambda i, p, n: i.name == "DEPOLARIZE1" and not (p is not None and p.name == "H"),  # idle data (not post-H)
+    # Sub-channels of 'idle', split by schedule position (gate_idle ∪ meas_idle == idle, disjoint):
+    # gate_idle = data idling through a CX layer it sits out (anchored on the CX or its trailing
+    # DEPOLARIZE2); meas_idle = data idling through the ancilla measure+reset stage (anchored on the
+    # M/R or the prep X_ERROR that follows the reset). The builder models the COMBINED M+R dead time
+    # as this single DEPOLARIZE1 — by convention the reset dead time is gate-duration-like, so
+    # device-faithful duration weighting (t_meas >> t_gate) belongs on the meas_idle rate.
+    "gate_idle": lambda i, p, n: (i.name == "DEPOLARIZE1"
+                                  and p is not None and p.name in ("CX", "DEPOLARIZE2")),
+    "meas_idle": lambda i, p, n: (i.name == "DEPOLARIZE1"
+                                  and p is not None and p.name in ("R", "M", "X_ERROR")),
 }
 
 
