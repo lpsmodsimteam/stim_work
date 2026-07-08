@@ -53,6 +53,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import stim
 
 # Force UTF-8 stdout/stderr: this job prints μ/→/← in progress lines, and the default
 # Windows console encoding (cp1252) raises UnicodeEncodeError on them — which would crash
@@ -117,6 +118,11 @@ class Config:
     # 1.0 = symmetric (paper default). The fail-fast reweighting is rate-agnostic, so a fixed ratio
     # swept by overall strength p stays a valid single-parameter family — no downstream change.
     p_meas_factor: float = 1.0
+    # Optional single-channel noise isolation (None/'full' = symmetric). Filters instructions on the
+    # built circuit to one physical channel at the SAME base rate: 'cz' (two-qubit DEPOLARIZE2),
+    # 'meas'/'prep' (X_ERROR before M / after R), 'idle' (DEPOLARIZE1 not right after H). Applied in
+    # build_circuit, so every technique (I/II/III) sees the filtered circuit.
+    noise_model: Optional[str] = None
     rounds: int = BB_72_12_6.distance    # syndrome rounds (= d for the memory experiment)
 
     # Relay-BP decoder settings (paper §2.4 for BB(6): γ0=0.125, leg1=80 it,
@@ -178,6 +184,12 @@ class Config:
     # directly instead of re-running the multi-minute BP-OSD search (which plateaus ~0.5% low).
     mw_f0_override: Optional[float] = 2.3239e-5
     mw_w0_override: Optional[int] = 3
+    # II.3 feasibility cap: the exact Proposition-1 onset fraction (even D) enumerates every
+    # weight-D/2 restriction of every min-weight logical — ~C(D, D/2)·|L(D)| subsets. For large
+    # even D with a big L(D) (the cz channel: D=22, |L(D)|=17856 → ~1.3e10 restrictions) this OOMs
+    # and never finishes. Above this cap, skip the exact enumeration and leave f0 unpinned (same as
+    # the odd-D branch); for bb144 an unpinned onset is the correct choice anyway (see run_technique_i).
+    mw_prop1_max_restrictions: int = 100_000_000
 
     # Decoder-convergence diagnostic (--decoder-conv): Relay-BP LER vs # legs on the full DEM.
     dconv_p: float = 0.005               # near-threshold rate with plenty of failures
@@ -257,11 +269,35 @@ def make_decoder(cfg: Config) -> RelayBPDecoder:
     )
 
 
+_NOISE = {"DEPOLARIZE1", "DEPOLARIZE2", "X_ERROR", "Y_ERROR", "Z_ERROR", "PAULI_CHANNEL_1", "PAULI_CHANNEL_2"}
+_NOISE_PRED = {
+    "cz":   lambda i, p, n: i.name == "DEPOLARIZE2",                                       # two-qubit gate
+    "meas": lambda i, p, n: i.name == "X_ERROR" and n is not None and n.name == "M",        # before a measurement
+    "prep": lambda i, p, n: i.name == "X_ERROR" and p is not None and p.name == "R",        # after a reset
+    "idle": lambda i, p, n: i.name == "DEPOLARIZE1" and not (p is not None and p.name == "H"),  # idle data (not post-H)
+}
+def _filter_noise(circ, model):
+    """Isolate one physical noise channel by filtering instructions on the built circuit (same base rate)."""
+    keep = _NOISE_PRED.get(model)
+    if keep is None:                       # None / 'full' / unknown -> full symmetric (no filtering)
+        return circ
+    insts = list(circ.flattened()); out = stim.Circuit()
+    for i, inst in enumerate(insts):
+        if inst.name in _NOISE:
+            prev = insts[i - 1] if i > 0 else None
+            nxt = insts[i + 1] if i + 1 < len(insts) else None
+            if not keep(inst, prev, nxt):
+                continue
+        out.append(inst)
+    return out
+
+
 def build_circuit(cfg: Config):
-    """The cfg.code (default BB(6)=[[72,12,6]]) memory circuit at p_ref with cfg.rounds rounds.
+    """The cfg.code (default BB(6)=[[72,12,6]]) memory circuit at p_ref with cfg.rounds rounds,
+    optionally filtered to a single noise channel (cfg.noise_model). Every technique reads this.
     Measurement error is p_meas_factor * p_phys (1.0 = symmetric)."""
     em = ErrorModel(p_phys=cfg.p_ref, p_meas=cfg.p_ref * cfg.p_meas_factor)
-    return BBCodeSimulator(cfg.code).build_circuit(em, rounds=cfg.rounds)
+    return _filter_noise(BBCodeSimulator(cfg.code).build_circuit(em, rounds=cfg.rounds), cfg.noise_model)
 
 
 # ================================ checkpoint I/O ==================================
@@ -556,25 +592,48 @@ def run_technique_ii(cfg: Config, outdir: pathlib.Path) -> dict:
         "n_systematic": int(n_sys), "max_trials": int(cfg.mw_max_trials),
         "single_sector": bool(cfg.mw_single_sector), "distance": int(D), "final": int(ld_comp),
     })
+    # Persist the L(D) supports so the exact onset fraction (II.3) can be computed offline — even
+    # when the inline Proposition-1 enumeration is skipped below for being too large (e.g. cz:
+    # D=22, |L(D)|=17856 → ~1.3e10 restrictions). Tiny: |L(D)|×D ints. All supports have weight D,
+    # so a rectangular int array round-trips cleanly.
+    try:
+        _ld_arr = (np.array([sorted(s) for s in logicals], dtype=np.int32)
+                   if logicals else np.empty((0, 0), dtype=np.int32))
+        np.savez(outdir / "logicals_LD.npz", supports=_ld_arr, distance=int(D),
+                 single_sector=bool(cfg.mw_single_sector),
+                 sector=int(cfg.mw_sector_type) if cfg.mw_single_sector else -1)
+    except Exception as _exc:                       # best-effort; never let persistence kill the run
+        print(f"  [II.2] WARNING: could not persist L(D) supports ({_exc})", flush=True)
     ld_exp = expanded_logical_count(logicals, mult)
     print(f"  [II.2] |L(D)| compressed={ld_comp}, expanded={ld_exp:.4g} "
           f"(paper {PAPER_LD_EXP:.3g})   ({time.perf_counter() - t1:.0f}s)", flush=True)
 
     half = (D + 1) // 2          # onset weight w0 = ceil(D/2) (correct for even AND odd D)
-    if logicals and D % 2 == 0:
-        # Even D: exact onset failure fraction f*(D/2) via Proposition 1.
-        print("  [II.3] exact onset fraction f*(D/2) via Proposition 1 ...", flush=True)
+    # Feasibility of the exact Proposition-1 enumeration: ~C(D, D/2)·|L(D)| weight-D/2 restrictions.
+    from math import comb
+    restr_est = comb(D, half) * ld_comp if (logicals and D % 2 == 0) else 0
+    if logicals and D % 2 == 0 and restr_est <= cfg.mw_prop1_max_restrictions:
+        # Even D, tractable: exact onset failure fraction f*(D/2) via Proposition 1.
+        print(f"  [II.3] exact onset fraction f*(D/2) via Proposition 1 "
+              f"(~{restr_est:.2g} restrictions) ...", flush=True)
         fails, n_exp = min_weight_fail_count(H, A, logicals, mult)
         log_choose = gammaln(n_exp + 1) - gammaln(half + 1) - gammaln(n_exp - half + 1)
         f_star = float(fails / np.exp(log_choose))
     else:
-        # Odd D, or no weight-D logicals found by the search: the even-D Proposition-1 onset
-        # fraction does not apply / there is nothing to count. Report |L(D)| as a lower bound and
-        # leave f0 unpinned so Technique I FITS w0/f0 from the IS spectrum instead of pinning a
-        # wrong value — and so a multi-hour run never dies here on an empty list.
+        # Odd D, no weight-D logicals found, OR an even-D enumeration too large to run (e.g. cz:
+        # D=22, |L(D)|=17856 → ~1.3e10 restrictions → OOM). In all three cases the exact onset
+        # fraction is unavailable/inapplicable, so report |L(D)| as a lower bound and leave f0
+        # unpinned — Technique I then FITS w0/f0 from the IS spectrum instead of pinning a wrong
+        # value, and a multi-hour run never dies here.
         n_exp = int(mult.sum())
         fails, f_star = 0, None
-        why = "no weight-D logicals found" if not logicals else f"D={D} is odd (Prop. 1 is even-D only)"
+        if not logicals:
+            why = "no weight-D logicals found"
+        elif D % 2 != 0:
+            why = f"D={D} is odd (Prop. 1 is even-D only)"
+        else:
+            why = (f"D={D} even but ~{restr_est:.2g} restrictions exceed cap "
+                   f"{cfg.mw_prop1_max_restrictions:.2g} (exact onset infeasible)")
         print(f"  [II.3] {why} → onset fraction unpinned (f0=None)", flush=True)
 
     out = {
@@ -972,6 +1031,10 @@ def main() -> None:
     ap.add_argument("--code", choices=sorted(CODES), default=None,
                     help="bivariate-bicycle code (default bb72=BB(6); bb144=BB(12)). Sets rounds=d "
                          "unless --rounds is given.")
+    ap.add_argument("--noise-model", choices=["full", "cz", "meas", "prep", "idle"], default=None,
+                    help="isolate ONE physical noise channel (default full symmetric): cz=two-qubit gate "
+                         "(DEPOLARIZE2), meas=measurement, prep=reset/state-prep, idle=idle-data. Filters "
+                         "the circuit at the same base rate; feeds every technique.")
     ap.add_argument("--p-meas-factor", type=float, default=None,
                     help="measurement error = factor * gate error (1.0 = symmetric, default). "
                          "Asymmetric (e.g. 5) is rate-agnostic for the reweighting; clears the "
@@ -999,6 +1062,8 @@ def main() -> None:
               f"(RAYON_NUM_THREADS={n}, mw_workers≤{n})")
 
     cfg = Config.smoke() if args.smoke else Config.production()
+    if args.noise_model is not None:
+        cfg.noise_model = None if args.noise_model == "full" else args.noise_model
     if args.code is not None:
         cfg.code, cfg.code_label = CODES[args.code]
         if args.rounds is None: cfg.rounds = cfg.code.distance   # default rounds = code distance
