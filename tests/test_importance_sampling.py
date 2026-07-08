@@ -79,3 +79,21 @@ def test_P_ansatz_matches_brute_transform():
             for w in range(3, N + 1)
         )
         assert g == pytest.approx(brute, rel=1e-9)
+
+
+def test_adaptive_early_stop_skips_deep_zero_bins():
+    """stop_after_zero_bins: an empty max-budget bin ends the descent; lower weights are omitted
+    from the spectrum (equivalent to sampling them: zero-failure bins reweight to exactly 0).
+    Surface d=5 + MWPM: min-weight decoding makes f(1)=f(2)=0 exactly (onset w0=3)."""
+    from surface_code_sim import SurfaceCodeSimulator, ErrorModel, PyMatchingDecoder
+    from importance_sampling import importance_sample_adaptive
+
+    circ = SurfaceCodeSimulator(distance=5).build_circuit(ErrorModel.symmetric(0.01), rounds=2)
+    res = importance_sample_adaptive(circ, PyMatchingDecoder(), p_ref=0.01, p_values=[0.01],
+                                     weights=list(range(1, 9)), target_failures=20,
+                                     shots_min=4, shots_max=200,
+                                     stop_after_zero_bins=1, seed=0)
+    ws = list(res.spectrum.weights)
+    assert 1 not in ws                       # skipped: descent stopped at the first empty clamp bin
+    assert any(F > 0 for F in res.spectrum.failures)      # the sampled part saw real failures
+    assert res.P_logical[0] > 0

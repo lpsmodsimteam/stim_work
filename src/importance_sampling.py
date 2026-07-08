@@ -636,6 +636,7 @@ def importance_sample_adaptive(
     predict_window: int = 3,
     q_base: Optional[float] = None,
     seed: Optional[int] = None,
+    stop_after_zero_bins: Optional[int] = None,
 ) -> ImportanceSamplingResult:
     """Weight-stratified IS with adaptive 'hit N failures per weight' shot allocation.
 
@@ -643,7 +644,15 @@ def importance_sample_adaptive(
     f(w) to expect ~`target_failures` failures (clamped to [shots_min, shots_max]).
     Returns the same ImportanceSamplingResult as :func:`importance_sample`, with
     per-weight `trials` reflecting the adaptive allocation (so the reweighted SE is
-    per-weight correct)."""
+    per-weight correct).
+
+    ``stop_after_zero_bins``: once that many CONSECUTIVE weights (descending) return
+    zero failures at the full ``shots_max`` budget, the remaining (lower) weights are
+    skipped and omitted from the spectrum. A zero-failure bin contributes exactly 0 to
+    the reweighting — identical to not sampling it — and f(w) only shrinks with w, so
+    below a run of empty max-budget bins the sweep is pure cost: sub-onset bins of a
+    large code would otherwise each burn the full clamp (e.g. ~10 bins x shots_max
+    below the observable onset)."""
     rng = np.random.default_rng(seed)
     probs, det_mat, obs_mat = _parse_dem(circuit)
     col_to_mech, q_base, _ = _expand(probs, q_base)
@@ -656,17 +665,23 @@ def importance_sample_adaptive(
     measured_f: Dict[int, float] = {}
     F_by: Dict[int, int] = {}
     T_by: Dict[int, int] = {}
+    zero_run = 0
     for w in sorted(weights, reverse=True):
         f_pred = predict_failure_fraction(measured_f, w, predict_window)
         T_w = shots_to_hit_failures(f_pred, target_failures, shots_min, shots_max)
         F = _sample_failures_at_weight(det_mat, obs_mat, col_to_mech, w, T_w, decoder, rng)
         F_by[w], T_by[w] = F, T_w
         measured_f[w] = F / T_w if T_w else 0.0
+        if stop_after_zero_bins is not None:
+            zero_run = zero_run + 1 if (F == 0 and T_w >= shots_max) else 0
+            if zero_run >= stop_after_zero_bins:
+                break               # everything below is even deeper sub-onset: skip it
 
+    sampled = [w for w in weights if w in T_by]
     spectrum = FailureSpectrum(
-        weights=weights,
-        trials=[T_by[w] for w in weights],
-        failures=[F_by[w] for w in weights],
+        weights=sampled,
+        trials=[T_by[w] for w in sampled],
+        failures=[F_by[w] for w in sampled],
         n_expanded=N_exp,
         q_base=q_base,
         p_ref=p_ref,
@@ -678,7 +693,7 @@ def importance_sample_adaptive(
     log_1mq = np.log1p(-q_targets)
     P_logical = np.zeros_like(p_arr)
     var = np.zeros_like(p_arr)
-    for w in weights:
+    for w in sampled:
         T, F = T_by[w], F_by[w]
         f = F / T if T > 0 else 0.0
         f_se = np.sqrt(f * (1.0 - f) / T) if T > 0 else 0.0

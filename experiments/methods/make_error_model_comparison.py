@@ -450,12 +450,15 @@ for name in MODELS:
     mu_ref = sum(e.args_copy()[0] for e in c.detector_error_model().flattened() if e.type == "error")
     w_hi = int(np.ceil((mu := mu_ref * p_grid.max() / P_REF) + 4 * np.sqrt(mu)))
     W = list(range(1, 16)) + list(range(16, w_hi + 1, 2))   # stride-2 tail: f5 pools weights, halves the cost
-    # Adaptive allocation matters doubly here: it skims the saturated tail AND pours shots (up to
-    # shots_max) into the near-onset bins — precisely the bins that decide the reweighted Λ(p*)
-    # (zero-failure onset bins would make ε72 a lower bound and Λ an upper bound).
+    # Adaptive allocation skims the saturated tail and pours shots into the near-onset bins that
+    # decide the reweighted Λ(p*). stop_after_zero_bins caps the DEEP sub-onset cost: below the
+    # observable onset every bin would otherwise burn the full shots_max chasing failures that
+    # cannot be resolved at this budget anyway (they need ~1e6+ shots) — three consecutive empty
+    # max-budget bins end the descent. Zero/skipped bins contribute exactly 0 to the reweighting
+    # either way, so ε72 at very low p is a LOWER bound (Λ an upper bound) — compare Λ vs Λ(fit).
     spec = importance_sample_adaptive(c, RelayBPDecoder(), p_ref=P_REF, p_values=[P_REF],
-                                      weights=W, target_failures=100, shots_max=30_000,
-                                      seed=4).spectrum
+                                      weights=W, target_failures=100, shots_max=10_000,
+                                      stop_after_zero_bins=3, seed=4).spectrum
     fit = fit_failure_spectrum(spec, K=c.num_observables, model="f5", w0=None, f0=None)
     tech1_72[name] = dict(spec=spec, fit=fit,
                           LER=np.asarray(logical_error_rate_from_ansatz(fit, list(p_grid))))
