@@ -68,6 +68,11 @@ from splitting import replica_exchange_estimate
 P = BBCodeParams(l=3, m=3, a_exps=[(1, 0), (0, 0), (0, 2)], b_exps=[(0, 1), (0, 0), (2, 0)], distance=4)
 P_REF, ROUNDS = 0.01, 2
 
+# Direct-MC budget knob: scales the §4/§5 MC shot counts. After the reweighting fix the MC points
+# only VALIDATE the curves (the budget itself never reads them), so 0.15 (~seconds-minutes, wider
+# error bars) is the iteration default; set 1.0 for full-fidelity anchors and the §4 overlay.
+MC_SCALE = 0.15
+
 # Channels are isolated by position-filtering ONE symmetric(p) circuit at the same base rate p.
 # bb_code_sim.filter_noise_channel owns the position predicates (X_ERROR after R = prep, before
 # M = meas; DEPOLARIZE1 not post-H = idle; DEPOLARIZE2 = two-qubit gate) — they encode the layout
@@ -163,7 +168,8 @@ code('''def direct_mc(circ, shots):
     f = np.any(d.decode_batch(det) != obs, axis=1); m = f.mean()
     return m, (max(m, 1e-9) * (1 - m) / shots) ** 0.5
 
-mc_pts = {0.012: 80_000, 0.008: 120_000, 0.005: 200_000, 0.003: 300_000}
+mc_pts = {p: int(s * MC_SCALE) for p, s in
+          {0.012: 80_000, 0.008: 120_000, 0.005: 200_000, 0.003: 300_000}.items()}
 mc = {name: {p: direct_mc(make_circuit(name, p), s) for p, s in mc_pts.items()} for name in MODELS}
 
 print("   p        " + "".join(f"{n:>15}" for n in MODELS))
