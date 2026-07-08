@@ -62,7 +62,7 @@ from bb_code_sim import (BBCodeParams, BBCodeSimulator, RelayBPDecoder,
 from surface_code_sim import ErrorModel
 from min_weight import (dem_check_action_matrices, compute_distance, optimal_onset_fraction,
                         find_weight_logicals_mitm, find_all_min_weight_logicals)
-from importance_sampling import importance_sample, fit_failure_spectrum, logical_error_rate_from_ansatz
+from importance_sampling import importance_sample_adaptive, fit_failure_spectrum, logical_error_rate_from_ansatz
 from splitting import replica_exchange_estimate
 
 P = BBCodeParams(l=3, m=3, a_exps=[(1, 0), (0, 0), (0, 2)], b_exps=[(0, 1), (0, 0), (2, 0)], distance=4)
@@ -118,16 +118,21 @@ Importance-sample the failure spectrum `f(w)` and fit the f5 ansatz (onset `w₀
 fit finds the good minimum), then reweight to `LER(p)` over the grid.""")
 
 code('''p_grid = np.geomspace(1e-4, 0.013, 40)
+# Adaptive 'hit N failures per weight' allocation: target 200 failures matches flat-6000's
+# precision at the budget-critical onset bin (f(2)~0.03 -> ~160 failures) at ~4x fewer shots —
+# the 200/f(w) schedule concentrates shots at the onset and skims the saturated high-f tail.
 tech1 = {}
 for name in MODELS:
     c = make_circuit(name, P_REF)
-    spec = importance_sample(c, RelayBPDecoder(), p_ref=P_REF, p_values=[P_REF],
-                             weights=list(range(1, 11)), shots_per_weight=6000, seed=1).spectrum
-    fw = np.array([F / T for F, T in zip(spec.failures, spec.trials)])
+    spec = importance_sample_adaptive(c, RelayBPDecoder(), p_ref=P_REF, p_values=[P_REF],
+                                      weights=list(range(1, 11)), target_failures=200,
+                                      shots_max=30_000, seed=1).spectrum
+    fw = dict(zip(spec.weights, np.asarray(spec.failures) / np.asarray(spec.trials)))
     fit = fit_failure_spectrum(spec, K=c.num_observables, model="f5", w0=None, f0=None)
     LER = np.asarray(logical_error_rate_from_ansatz(fit, list(p_grid)))
     tech1[name] = dict(spec=spec, fw=fw, fit=fit, LER=LER)
-    print(f"{name:16s}: measured f(2)={fw[1]:.4f}   f5 fit cost={fit.cost:.2f}")''')
+    print(f"{name:16s}: measured f(2)={fw[2]:.4f} ({sum(spec.trials)} shots total)   "
+          f"f5 fit cost={fit.cost:.2f}")''')
 
 # ===========================================================================
 md(r"""## §3 — Technique III: replica-exchange splitting (per model)
@@ -215,13 +220,15 @@ for name in ABLATED:
 code('''tech1_abl, mc_abl = {}, {}
 for name in ABLATED:
     c = make_ablated_circuit(name, P_REF)
-    spec = importance_sample(c, RelayBPDecoder(), p_ref=P_REF, p_values=[P_REF],
-                             weights=list(range(1, 11)), shots_per_weight=6000, seed=3).spectrum
+    spec = importance_sample_adaptive(c, RelayBPDecoder(), p_ref=P_REF, p_values=[P_REF],
+                                      weights=list(range(1, 11)), target_failures=200,
+                                      shots_max=30_000, seed=3).spectrum
     fit = fit_failure_spectrum(spec, K=c.num_observables, model="f5", w0=None, f0=None)
     tech1_abl[name] = dict(spec=spec, fit=fit,
                            LER=np.asarray(logical_error_rate_from_ansatz(fit, list(p_grid))))
     mc_abl[name] = {p: direct_mc(make_ablated_circuit(name, p), s) for p, s in mc_pts.items()}
-    print(f"{name:10s}: f5 fit cost={fit.cost:.2f}   MC LER(p=0.005)={mc_abl[name][0.005][0]:.3e}")''')
+    print(f"{name:10s}: f5 fit cost={fit.cost:.2f}   MC LER(p={max(mc_pts)}) = "
+          f"{mc_abl[name][max(mc_pts)][0]:.3e}")''')
 
 # ===========================================================================
 md(r"""## §6 — The error budget (Willow-style)
@@ -359,21 +366,25 @@ for name in MODELS:
     print(f"{name:16s} {tech2_72[name]:2d}")''')
 
 code('''tech1_72, mc72 = {}, {}
-mc72_pts = {0.008: 40_000, 0.004: 80_000}
+mc72_pts = {0.008: 10_000}               # one slim anchor: MC only decorates the §7.4 plot now
 for name in MODELS:
     c = make_circuit72(name, P_REF)
     # Weight window from the binomial mass: μ(p) = E[#faults] = Σ DEM error probs, rescaled to p.
     mu_ref = sum(e.args_copy()[0] for e in c.detector_error_model().flattened() if e.type == "error")
     w_hi = int(np.ceil((mu := mu_ref * p_grid.max() / P_REF) + 4 * np.sqrt(mu)))
     W = list(range(1, 16)) + list(range(16, w_hi + 1, 2))   # stride-2 tail: f5 pools weights, halves the cost
-    spec = importance_sample(c, RelayBPDecoder(), p_ref=P_REF, p_values=[P_REF],
-                             weights=W, shots_per_weight=3000, seed=4).spectrum
+    # Adaptive allocation matters doubly here: it skims the saturated tail AND pours shots (up to
+    # shots_max) into the near-onset bins — precisely the bins that decide the reweighted Λ(p*)
+    # (zero-failure onset bins would make ε72 a lower bound and Λ an upper bound).
+    spec = importance_sample_adaptive(c, RelayBPDecoder(), p_ref=P_REF, p_values=[P_REF],
+                                      weights=W, target_failures=100, shots_max=30_000,
+                                      seed=4).spectrum
     fit = fit_failure_spectrum(spec, K=c.num_observables, model="f5", w0=None, f0=None)
     tech1_72[name] = dict(spec=spec, fit=fit,
                           LER=np.asarray(logical_error_rate_from_ansatz(fit, list(p_grid))))
     mc72[name] = {p: direct_mc(make_circuit72(name, p), s) for p, s in mc72_pts.items()}
-    print(f"{name:16s}: weights 1..{w_hi} ({len(W)} sampled), f5 cost={fit.cost:.2f}, "
-          f"MC LER(0.008)={mc72[name][0.008][0]:.3e}", flush=True)''')
+    print(f"{name:16s}: weights 1..{w_hi} ({len(W)} sampled, {sum(spec.trials)} shots), "
+          f"f5 fit cost={fit.cost:.2f}, MC LER(0.008)={mc72[name][0.008][0]:.3e}", flush=True)''')
 
 code('''def per_round(LER, rounds):
     return 1.0 - (1.0 - np.clip(LER, 0.0, 1.0 - 1e-12)) ** (1.0 / rounds)
