@@ -202,3 +202,27 @@ def test_idle_channel_split_partitions_idle():
         n_gate += k * g
         n_meas += k * m
     assert (n_gate, n_meas) == (36, 36)   # 2 cycles x 18 locations each
+
+
+def test_scale_noise_channels():
+    """scale_noise_channels({'meas': 5, 'meas_idle': 5}): exactly those channels' probabilities
+    x5, everything else bit-identical, instruction sequence preserved (composable with filters)."""
+    from bb_code_sim import BB_18_4_4, NOISE_CHANNEL_PREDICATES, NOISE_INSTRUCTIONS, scale_noise_channels
+
+    c = BBCodeSimulator(BB_18_4_4).build_circuit(ErrorModel.symmetric(0.01), rounds=2)
+    s = scale_noise_channels(c, {"meas": 5.0, "meas_idle": 5.0})
+    a, b = list(c.flattened()), list(s.flattened())
+    assert len(a) == len(b)
+    meas, midle = NOISE_CHANNEL_PREDICATES["meas"], NOISE_CHANNEL_PREDICATES["meas_idle"]
+    n_scaled = 0
+    for i, (ia, ib) in enumerate(zip(a, b)):
+        assert ia.name == ib.name
+        if ia.name not in NOISE_INSTRUCTIONS:
+            continue
+        prev = a[i - 1] if i > 0 else None
+        nxt = a[i + 1] if i + 1 < len(a) else None
+        fac = 5.0 if (meas(ia, prev, nxt) or midle(ia, prev, nxt)) else 1.0
+        for x, y in zip(ia.gate_args_copy(), ib.gate_args_copy()):
+            assert y == pytest.approx(fac * x)
+        n_scaled += fac != 1.0
+    assert n_scaled > 0

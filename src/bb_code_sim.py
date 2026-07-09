@@ -643,6 +643,37 @@ NOISE_CHANNEL_PREDICATES = {
 }
 
 
+def scale_noise_channels(circuit: stim.Circuit, factors: Dict[str, float]) -> stim.Circuit:
+    """Rescale the probabilities of selected noise channels on a built circuit.
+
+    ``factors`` maps channel keys of :data:`NOISE_CHANNEL_PREDICATES` (or custom callables
+    ``keep(inst, prev, nxt) -> bool``) to multiplicative factors, e.g. ``{"meas": 5.0,
+    "meas_idle": 5.0}`` for a device-like operating point where measurement errors and the
+    measure/reset dead-time idle run hotter than the gates. Instructions are rescaled in place
+    (none added or removed), so positional classification — and composition with
+    :func:`filter_noise_channel` — still works on the result. Invalid probabilities (>channel
+    maximum) are left for stim to reject loudly rather than silently clipped.
+    """
+    preds = [((NOISE_CHANNEL_PREDICATES[k] if isinstance(k, str) else k), float(f))
+             for k, f in factors.items()]
+    insts = list(circuit.flattened())
+    out = stim.Circuit()
+    for i, inst in enumerate(insts):
+        if inst.name in NOISE_INSTRUCTIONS:
+            prev = insts[i - 1] if i > 0 else None
+            nxt = insts[i + 1] if i + 1 < len(insts) else None
+            fac = 1.0
+            for pred, f in preds:
+                if pred(inst, prev, nxt):
+                    fac *= f
+            if fac != 1.0:
+                out.append(inst.name, inst.targets_copy(),
+                           [a * fac for a in inst.gate_args_copy()])
+                continue
+        out.append(inst)
+    return out
+
+
 def filter_noise_channel(circuit: stim.Circuit, channel) -> stim.Circuit:
     """Isolate one physical noise channel by filtering instructions on a built circuit.
 

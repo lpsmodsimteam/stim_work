@@ -63,8 +63,8 @@ duration weighting (t_meas ≫ t_gate) belongs on the `meas_idle` rate.""")
 md("""## Setup — the code, the noise filter, and the three models""")
 
 code('''import numpy as np, matplotlib.pyplot as plt, stim
-from bb_code_sim import (BBCodeParams, BBCodeSimulator, RelayBPDecoder,
-                         NOISE_CHANNEL_PREDICATES, NOISE_INSTRUCTIONS, filter_noise_channel)
+from bb_code_sim import (BBCodeParams, BBCodeSimulator, RelayBPDecoder, NOISE_CHANNEL_PREDICATES,
+                         NOISE_INSTRUCTIONS, filter_noise_channel, scale_noise_channels)
 from surface_code_sim import ErrorModel
 from min_weight import (dem_check_action_matrices, compute_distance, optimal_onset_fraction,
                         find_weight_logicals_mitm, find_all_min_weight_logicals)
@@ -613,6 +613,84 @@ print("ratio > 1: shared mixed faults counted once per participant (as in §6's 
 print("a NEGATIVE contribution means removing that channel HURT the suppression ratio — e.g. a")
 print("channel whose faults the big code handles better than the small one.")''')
 
+# ===========================================================================
+md(r"""## §8 — A second operating point: meas & meas-idle ×5
+
+Everything above is a **sensitivity analysis at one base point in rate-space** — the symmetric ray
+where every channel runs at the same p. The budget fractions are components of a gradient of
+`1/Λ` (and of LER), and gradients depend on where you evaluate them. Real devices don't sit on
+the symmetric ray: measurement error and the measure/reset dead-time idle typically run several
+times hotter than gates. Here we re-evaluate at a device-like point — **meas and meas_idle at
+5×p, everything else at p** (`scale_noise_channels`) — and redo the marginal budget and Λ.
+
+Two economies: (i) the **isolated** curves need no resampling — `f(w)` is rate-independent, so
+channel i at rate `rᵢ·p` is just `reweight_spectrum(spec_i, [rᵢ·p])`; only the full and ablated
+*mixes* (whose channel composition changes) are new sweeps. (ii) Ablating channel i from the
+asymmetric mix composes the existing tools: `filter_noise_channel(scale_noise_channels(...))`.
+Convention: `p` remains the base rate of the un-boosted channels, so `p*` comparisons across
+§6/§8 are at equal gate noise.""")
+
+code('''SCALE = {"meas": 5.0, "meas_idle": 5.0}
+
+def make_full_asym(code_params, rounds, p):
+    return scale_noise_channels(
+        BBCodeSimulator(code_params).build_circuit(ErrorModel.symmetric(p), rounds=rounds), SCALE)
+
+def make_abl_asym(code_params, rounds, ch, p):
+    drop = NOISE_CHANNEL_PREDICATES[ch]
+    return filter_noise_channel(make_full_asym(code_params, rounds, p),
+                                lambda i, pr, nx: not drop(i, pr, nx))
+
+def adaptive_sweep(c, seed):
+    mu_ref = sum(e.args_copy()[0] for e in c.detector_error_model().flattened() if e.type == "error")
+    w_hi = int(np.ceil((mu := mu_ref * p_grid.max() / P_REF) + 4 * np.sqrt(mu)))
+    W = list(range(1, 16)) + list(range(16, w_hi + 1, 2))
+    return importance_sample_adaptive(c, DEC(), p_ref=P_REF, p_values=[P_REF], weights=W,
+                                      target_failures=100, shots_max=10_000,
+                                      stop_after_zero_bins=3, seed=seed).spectrum
+
+asym = {}
+for label, (cp, rr) in {"18": (P, ROUNDS), "72": (BB_72_4_8, ROUNDS72)}.items():
+    asym[("full", label)] = adaptive_sweep(make_full_asym(cp, rr, P_REF), seed=6)
+    print(f"[{label}] full asym: {sum(asym[('full', label)].trials)} shots", flush=True)
+    for abl_name, ch in ABLATED.items():
+        asym[(abl_name, label)] = adaptive_sweep(make_abl_asym(cp, rr, ch, P_REF), seed=6)
+        print(f"[{label}] {abl_name}: {sum(asym[(abl_name, label)].trials)} shots", flush=True)''')
+
+code('''# The budget at the asymmetric point. Isolated fractions reuse the §2 spectra, reweighted at
+# each channel's OWN rate (r_i * p*); marginals come from the new asymmetric ablated mixes.
+R_OF = {"CZ only": 1.0, "meas only": 5.0, "prep only": 1.0, "gate idle": 1.0, "meas idle": 5.0}
+L_asym = float(reweight_spectrum(asym[("full", "18")], [P_STAR]).P_logical[0])
+rows8 = []
+for ch in CHANNELS:
+    iso = float(reweight_spectrum(tech1[ch]["spec"], [R_OF[ch] * P_STAR]).P_logical[0]) / L_asym
+    marg = 1.0 - float(reweight_spectrum(asym[(ABL_OF[ch], "18")], [P_STAR]).P_logical[0]) / L_asym
+    rows8.append((ch, iso, marg))
+mix8 = 1.0 - sum(r[1] for r in rows8)
+sym = {r[0]: (r[1], r[2]) for r in rows}                 # §6's symmetric-point rows for comparison
+print(f"budget at the ASYMMETRIC point (meas, meas_idle ×5), p* = {P_STAR}:")
+print(f"LER_full = {L_asym:.3e}  (symmetric point: {L_full:.3e} — the ×5 mix costs "
+      f"{L_asym/L_full:.1f}× in error rate)")
+print(f"{'channel':12s} {'isolated':>9} {'marginal':>9}   vs symmetric {'iso':>6} {'marg':>6}")
+for ch, iso, marg in rows8:
+    print(f"{ch:12s} {iso:9.3f} {marg:9.3f}                {sym[ch][0]:6.3f} {sym[ch][1]:6.3f}")
+print(f"{'mixing':12s} {mix8:9.3f}                        {mixing:6.3f}")
+print(f"sum(marginal) = {sum(r[2] for r in rows8):.3f}   (symmetric: {sum(r[2] for r in rows):.3f})")''')
+
+code('''# Λ at the asymmetric point + its marginal decomposition (both codes' asymmetric ablations).
+lam8 = eps_at({"spec": asym[("full", "18")]}, P_LAM, ROUNDS) / eps_at({"spec": asym[("full", "72")]}, P_LAM, ROUNDS72)
+inv8 = 1.0 / lam8
+print(f"Λ_full(p*={P_LAM}) at the ×5 point: {lam8:.3g}   (symmetric: {lam_full:.3g})"
+      f"   per-step λ = {np.sqrt(lam8):.3g} (symmetric: {np.sqrt(lam_full):.3g})")
+print(f"{'channel':12s} {'Λ_no-i':>10} {'contribution':>13} {'share':>7}")
+for ch in CHANNELS:
+    lam_no = (eps_at({"spec": asym[(ABL_OF[ch], "18")]}, P_LAM, ROUNDS)
+              / eps_at({"spec": asym[(ABL_OF[ch], "72")]}, P_LAM, ROUNDS72))
+    contrib = inv8 - 1.0 / lam_no
+    print(f"{ch:12s} {lam_no:10.3g} {contrib:13.3e} {contrib/inv8:7.2f}")
+print("read against §7.5: how the gradient of 1/Λ rotates when the noise mix moves from the")
+print("symmetric ray to a device-like ray (meas-type channels 5× hotter).")''')
+
 # ---------------------------------------------------------------------------
 md(r"""## Takeaways
 
@@ -642,6 +720,10 @@ md(r"""## Takeaways
 * **The Willow identity `1/Λ ≈ Σᵢ p/p_th,i` is the §7 punchline**: how far the sum falls short of
   `1/Λ_full` measures exactly how much the mixed-channel faults (the §1 `D=3` hook, invisible to
   every isolated channel) break the additive budget.
+* **The whole budget is a gradient at a base point (§8).** Re-evaluating at a device-like ray
+  (meas + meas-idle ×5) shows how the decomposition rotates with the noise mix. The isolated
+  basis reweights analytically to any rate vector (`f(w)` is rate-independent); only the full and
+  ablated mixes need resampling — which is what makes multi-point sensitivity maps affordable.
 
 *Generated by `make_error_model_comparison.py`.*""")
 
