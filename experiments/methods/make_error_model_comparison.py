@@ -1,20 +1,20 @@
-"""Generate error_model_comparison_18_4_4.ipynb (source only; cells are NOT executed here).
+"""Generate error_model_comparison_18_4_4.ipynb — a REPORT over cached runner results.
 
-An experiment notebook built on the three-techniques tutorial: it compares how the FULL circuit noise
-of the Kunlun [[18,4,4]] code decomposes into its parts — full symmetric vs. measurement-only vs.
-two-qubit(CX)-gate-only — using Technique II (min-weight onset), Technique I (failure-spectrum ansatz),
-Technique III (replica-exchange splitting), and direct Monte-Carlo, all on the same code.
+The notebook no longer runs any simulation. All sampling lives in
+``run_error_model_comparison.py``, which caches one JSON per task under
+``runs/error_model_comparison_18_4_4/`` (rerunning only what is missing or whose config
+changed, and recording per-task wall time). The notebook generated here LOADS those files
+and renders the tables and plots: the only computation it does is cheap analysis —
+binomial reweighting of the stored spectra, crossings, and error propagation — so it
+re-executes in seconds and needs neither stim nor a decoder.
 
-§5 adds the leave-one-out ABLATION models (all-but-one channel) — the marginal contributions Google's
-Willow error budget is built from — and §6 assembles the Willow-style budget: isolated vs marginal
-fractions of LER_full, the mixing bucket, per-channel pseudo-thresholds, and the Σ p/p_th terms.
-
-§7 computes the TRUE Λ: the five channels rerun on the same-polynomial sibling BB_72_4_8 (d: 4→8,
-rounds ∝ d, per-round ε), per-channel thresholds from the ε18=ε72 crossings, Λ(p) curves, the
-per-(+2)-step λ = √Λ, and the Willow identity check 1/Λ vs Σ p/p_th.
-
-Noise channels are isolated by FILTERING instructions on one symmetric(p) circuit, so every variant
-shares the identical per-location rate p (apples-to-apples). Run top-to-bottom in the `qec` kernel.
+Contents (unchanged story): §0 schedule, §1 Technique II per channel, §2 Technique I
+spectra, §3 splitting, §4 direct-MC overlay, §5 leave-one-out ablations, §6 the
+Willow-style budget, §7 the true Λ against [[72,4,8]], §7.5 marginal Λ, §8 the
+asymmetric operating point. New in the report: a per-section runner-time table, and the
+Λ-share boxes (§7.5, §8) carry propagated standard errors plus a zero-failure-bin bound —
+a NEGATIVE share is now printed with the evidence for whether it is real or an estimator
+artifact of the under-resolved 72-code onset bins.
 """
 import json
 from repo_paths import REPO_ROOT
@@ -25,10 +25,10 @@ def code(s): cells.append({"cell_type": "code", "execution_count": None,
                            "metadata": {}, "outputs": [], "source": s})
 
 # ===========================================================================
-md(r"""# Error-model experiments on the Kunlun **[[18,4,4]]**
+md(r"""# Error-model experiments on the Kunlun **[[18,4,4]]** — report
 
 How does the full circuit noise decompose into its parts? Using the three fail-fast techniques (from
-`three_techniques_18_4_4.ipynb`) **together with direct Monte-Carlo**, we compare three error models on
+`three_techniques_18_4_4.ipynb`) **together with direct Monte-Carlo**, we compare the error models on
 the *same* [[18,4,4]] code:
 
 | model | noise kept |
@@ -40,151 +40,153 @@ the *same* [[18,4,4]] code:
 | **gate idle** | `DEPOLARIZE1` on data during the one **CX layer** each data qubit sits out |
 | **meas idle** | `DEPOLARIZE1` on data during the **ancilla measure+reset stage** |
 
-We isolate a channel by **filtering noise instructions** on one `symmetric(p)` circuit — so every variant
-uses the *identical* per-location rate `p` (a clean apples-to-apples comparison) — via
-`bb_code_sim.filter_noise_channel`, whose predicates live next to the circuit builder whose layout they encode.
-Two channels share an instruction name and are split by **position**: `X_ERROR` is a *preparation* error
-right after an `R` and a *measurement* error right before an `M`; `DEPOLARIZE1` is an *idle* error (on the
-data qubits, which sit idle during ancilla reset/measurement) except right after an `H`, where it is the
-single-qubit *gate* error on the X-ancillas. (The two-qubit gates are `CX`; "CZ only" isolates their
-two-qubit depolarizing.)
+Channels are isolated by **filtering noise instructions** on one `symmetric(p)` circuit — every variant
+uses the *identical* per-location rate `p` — via `bb_code_sim.filter_noise_channel` (predicates live
+next to the circuit builder whose layout they encode). `X_ERROR` splits by position into *prep* (after
+`R`) and *meas* (before `M`); `DEPOLARIZE1` is *idle* noise except right after an `H` (the 1q-gate
+error), split into `gate_idle` / `meas_idle` by schedule position.
 
-**Idle occupancy.** In the depth-7 schedule each data qubit is idle in **2 of the 8 rounds** per syndrome
-cycle — round 7 (all data idle while ancillas are measured/reset) plus exactly one of rounds 0/6 (it is
-busy on a `CX` in the other; rounds 1–5 keep every qubit busy). So a data qubit picks up idle
-`DEPOLARIZE1(p)` **twice per cycle**, an idle-error probability of `1−(1−p)² ≈ 2p` (not `3p`).
-We treat the two slots as **separate channels** (`gate_idle` / `meas_idle`, split by schedule
-position): on hardware the measure+reset dead time is much longer than a gate, so the two idles
-have very different physical rates. The builder's single M/R-stage `DEPOLARIZE1` covers the
-*combined* measure+reset dead time; reset is gate-duration-like by convention, so device-faithful
-duration weighting (t_meas ≫ t_gate) belongs on the `meas_idle` rate.""")
+**Idle occupancy.** In the depth-7 schedule each data qubit is idle in **2 of the 8 rounds** per
+syndrome cycle — round 7 (all data idle while ancillas are measured/reset) plus exactly one of rounds
+0/6. So a data qubit picks up idle `DEPOLARIZE1(p)` **twice per cycle** (`1−(1−p)² ≈ 2p`, not `3p`).
+The two slots are **separate channels**: on hardware the measure+reset dead time is much longer than a
+gate, so device-faithful duration weighting (t_meas ≫ t_gate) belongs on the `meas_idle` rate.
+
+**This notebook is a report.** Every simulation result is loaded from
+`runs/error_model_comparison_18_4_4/`, produced (and cached task-by-task) by
+`experiments/methods/run_error_model_comparison.py`. To refresh the data, run that script — it
+recomputes only tasks whose cache is missing or whose configuration changed — then re-execute this
+notebook (seconds; it needs neither stim nor a decoder).""")
 
 # ---------------------------------------------------------------------------
-md("""## Setup — the code, the noise filter, and the three models""")
+md("""## Setup — load the cached runner results""")
 
-code('''import numpy as np, matplotlib.pyplot as plt, stim
-from bb_code_sim import (BBCodeParams, BBCodeSimulator, RelayBPDecoder, NOISE_CHANNEL_PREDICATES,
-                         NOISE_INSTRUCTIONS, filter_noise_channel, scale_noise_channels)
-from surface_code_sim import ErrorModel
-from min_weight import (dem_check_action_matrices, compute_distance, optimal_onset_fraction,
-                        find_weight_logicals_mitm, find_all_min_weight_logicals)
-from importance_sampling import importance_sample_adaptive, fit_failure_spectrum, logical_error_rate_from_ansatz
-from splitting import replica_exchange_estimate
+code(r'''import json, numpy as np, matplotlib.pyplot as plt
+from IPython.display import SVG, display
+from repo_paths import run_dir
+from importance_sampling import FailureSpectrum, reweight_spectrum
 
-P = BBCodeParams(l=3, m=3, a_exps=[(1, 0), (0, 0), (0, 2)], b_exps=[(0, 1), (0, 0), (2, 0)], distance=4)
-P_REF, ROUNDS = 0.01, 2
+RESULTS = run_dir("error_model_comparison_18_4_4")
 
-# Direct-MC budget knob: scales the §4/§5 MC shot counts. After the reweighting fix the MC points
-# only VALIDATE the curves (the budget itself never reads them), so 0.15 (~seconds-minutes, wider
-# error bars) is the iteration default; set 1.0 for full-fidelity anchors and the §4 overlay.
-MC_SCALE = 0.15
+def load_meta(name):
+    return json.loads((RESULTS / f"{name}.json").read_text(encoding="utf-8"))
+def load(name):
+    return load_meta(name)["result"]
+def slug(name):
+    return name.replace(" ", "_")
+def spectrum_of(r):                       # rebuild the measured spectrum from its JSON fields
+    return FailureSpectrum(**r["spectrum"])
 
-# The ONE decoder used by every sampling cell in this notebook. Paper-style Relay legs at
-# num_sets=5: measured strictly better AND faster than the speed-tuned RelayBPDecoder default,
-# which misconverges on ~1% of weight-2 gate_idle syndromes on [[72,4,8]] — BELOW the
-# perfect-decoder onset — inflating ε72 at low p and faking Λ<1 for that channel. More legs
-# tighten mid-weight f(w) further (f(20): 0.15→0.07 at num_sets=20, ~3× cost; 600 = paper
-# production, ~18×). Λ compares the two codes, so both MUST use the same decoder: change it HERE.
-def DEC():
-    return RelayBPDecoder(gamma0=0.125, pre_iter=80, num_sets=5, set_max_iter=60,
-                          gamma_dist_interval=(-0.24, 0.66), stop_nconv=3)
-
-# Channels are isolated by position-filtering ONE symmetric(p) circuit at the same base rate p.
-# bb_code_sim.filter_noise_channel owns the position predicates (X_ERROR after R = prep, before
-# M = meas; DEPOLARIZE1 not post-H = idle; DEPOLARIZE2 = two-qubit gate) — they encode the layout
-# of build_bb_circuit, so they live in src next to it.
-MODELS = {"full symmetric": None, "CZ only": "cz", "meas only": "meas",
-          "prep only": "prep", "gate idle": "gate_idle", "meas idle": "meas_idle"}
+MAN = load("config__manifest")
+CFG = load_meta("config__manifest")["config"]
+P_REF, ROUNDS, ROUNDS72 = CFG["p_ref"], CFG["rounds"], CFG["rounds72"]
+p_grid = np.geomspace(CFG["p_grid"]["lo"], CFG["p_grid"]["hi"], CFG["p_grid"]["n"])
+MODELS, ABLATED, CHANNELS = MAN["models"], MAN["ablated"], MAN["channels"]
+ABL_OF = dict(zip(CHANNELS, ABLATED))     # "CZ only" -> "no CZ", ... (matching runner order)
+P_STAR, P_LAM, R_OF = MAN["p_star"], MAN["p_lam"], MAN["r_of"]
 COLORS = {"full symmetric": "crimson", "CZ only": "navy", "meas only": "seagreen",
           "prep only": "darkorange", "gate idle": "purple", "meas idle": "mediumvioletred"}
-def make_circuit(model, p):
-    return filter_noise_channel(BBCodeSimulator(P).build_circuit(ErrorModel.symmetric(p), rounds=ROUNDS),
-                                MODELS[model])
 
+# --- runner timing: every task file records its wall time -------------------------------
+TIMES = {f.stem: {k: json.loads(f.read_text(encoding="utf-8"))[k] for k in ("elapsed_s", "finished_at")}
+         for f in sorted(RESULTS.glob("*.json"))}
+def section_time(*groups):
+    ms = [v for k, v in TIMES.items() if k.split("__")[0] in groups]
+    if not ms:
+        return "⏱ runner: no cached tasks found for this section"
+    tot = sum(m["elapsed_s"] for m in ms)
+    return f"⏱ runner: {tot:,.0f} s wall over {len(ms)} tasks (newest {max(m['finished_at'] for m in ms)})"
+
+# --- estimators shared by the sections ---------------------------------------------------
+def per_round(LER, rounds):
+    return 1.0 - (1.0 - np.clip(LER, 0.0, 1.0 - 1e-12)) ** (1.0 / rounds)
+
+def rw_stats(spec, p):
+    """Reweighted-measured-spectrum LER at scalar p: (value, statistical SE, zero-bin headroom).
+
+    SE propagates the per-bin binomial errors of the sampled f(w). `headroom` is how much the
+    value could RISE if every sampled-but-zero-failure bin actually sat at its rule-of-three
+    upper bound f(w) < 3/T(w): sub-onset zero bins carry exactly 0 into the reweighting, so the
+    value is a lower bound and `headroom` is the size of that truncation exposure at this p.
+    """
+    v = reweight_spectrum(spec, [p])
+    up = FailureSpectrum(weights=spec.weights, trials=spec.trials,
+                         failures=[f if f > 0 else min(3, t) for f, t in zip(spec.failures, spec.trials)],
+                         n_expanded=spec.n_expanded, q_base=spec.q_base, p_ref=spec.p_ref)
+    head = float(reweight_spectrum(up, [p]).P_logical[0]) - float(v.P_logical[0])
+    return float(v.P_logical[0]), float(v.P_logical_se[0]), head
+
+def eps_stats(spec, p, rounds):
+    """Per-round ε at p with SE and zero-bin headroom (delta method through 1-(1-L)^{1/r})."""
+    L, se, head = rw_stats(spec, p)
+    g = (1.0 - min(L, 1.0 - 1e-12)) ** (1.0 / rounds - 1.0) / rounds
+    return float(per_round(np.asarray([L]), rounds)[0]), g * se, g * head
+
+def inv_lambda_stats(spec18, spec72, p):
+    """1/Λ = ε72/ε18 at p: (value, SE, low, high) — low/high span the zero-bin truncation."""
+    e18, s18, h18 = eps_stats(spec18, p, ROUNDS)
+    e72, s72, h72 = eps_stats(spec72, p, ROUNDS72)
+    inv = e72 / e18
+    se = inv * float(np.hypot(s18 / e18, s72 / e72))
+    return inv, se, e72 / (e18 + h18), (e72 + h72) / e18
+
+def crossing_p(pg, y1, y2):          # p where y1(p)=y2(p), log-log interpolated (None if never)
+    r = np.log(y1) - np.log(y2)
+    s = np.nonzero(np.diff(np.sign(r)) != 0)[0]
+    if s.size == 0:
+        return None
+    i = s[-1]; t = r[i] / (r[i] - r[i + 1])
+    return float(np.exp(np.log(pg[i]) + t * (np.log(pg[i + 1]) - np.log(pg[i]))))
+
+def pseudo_threshold(pg, LER):       # break-even LER(p)=p (single-code threshold stand-in)
+    return crossing_p(pg, LER, np.asarray(pg))
+
+dem = load("setup__dem_counts")
 for name in MODELS:
-    print(f"{name:16s}: {make_circuit(name, P_REF).detector_error_model().num_errors} DEM mechanisms")''')
+    print(f"{name:16s}: {dem[name]} DEM mechanisms")''')
+
+code(r'''# How long each section's simulations took in the runner (cached wall time, sequential).
+SECTIONS = [("setup + §0 schedule",      ["setup", "schedule"]),
+            ("§1 distances/onsets",      ["tech2"]),
+            ("§2 spectra (Technique I)", ["tech1"]),
+            ("§3 splitting",             ["tech3"]),
+            ("§4 direct MC",             ["mc"]),
+            ("§5 ablations (18)",        ["tech2_abl", "tech1_abl", "mc_abl"]),
+            ("§7 [[72,4,8]] sweeps",     ["tech2_72", "tech1_72", "mc72"]),
+            ("§7.5 72-code ablations",   ["tech1_72_abl"]),
+            ("§8 asymmetric point",      ["asym"])]
+print(f"{'section':28s} {'tasks':>5} {'wall time':>12}   newest result")
+grand = 0.0
+for label, groups in SECTIONS:
+    ms = [v for k, v in TIMES.items() if k.split("__")[0] in groups]
+    tot = sum(m["elapsed_s"] for m in ms); grand += tot
+    newest = max((m["finished_at"] for m in ms), default="—")
+    print(f"{label:28s} {len(ms):5d} {tot:11,.1f}s   {newest}")
+print(f"{'TOTAL':28s} {'':5s} {grand:11,.1f}s   (§6 is pure analysis — no runner tasks)")''')
 
 # ===========================================================================
 md(r"""## §0 — The syndrome-extraction schedule, up close
 
 One cycle of the extraction circuit, layer by layer, for two data qubits (one per block) and one
-ancilla of each type — derived from the built circuit itself, so it is exactly the layout the
-noise-channel predicates key on. Inline `·channel` tags show how each noise instruction is
-classified (`cz` / `meas` / `prep` / `gate_idle` / `meas_idle`): each data qubit is busy in six
-of the seven CX layers, idles through the one it sits out (`·gate_idle`), and idles again while
-the ancillas are measured and reset (`·meas_idle`). The second cell renders the NOISY one-cycle
-schedule as a stim `timeline-svg` diagram, sliced to a closed 7-qubit star — one data qubit plus
-its six check ancillas, gates kept only when both endpoints are inside — so every rail shown is
-fully involved and the labelled noise boxes are readable.""")
+ancilla of each type — derived from the built circuit itself (by the runner), so it is exactly the
+layout the noise-channel predicates key on. Inline `·channel` tags show how each noise instruction is
+classified (`cz` / `meas` / `prep` / `gate_idle` / `meas_idle`): each data qubit is busy in six of
+the seven CX layers, idles through the one it sits out (`·gate_idle`), and idles again while the
+ancillas are measured and reset (`·meas_idle`). The second cell renders the NOISY one-cycle schedule
+as a stim `timeline-svg` diagram, sliced to a closed 7-qubit star — one data qubit plus its six check
+ancillas, gates kept only when both endpoints are inside — so every rail shown is fully involved and
+the labelled noise boxes are readable.""")
 
-code('''watch = {0: "data q0 (L)", 9: "data q9 (R)", 18: "X-anc q18", 27: "Z-anc q27"}
-c = make_circuit("full symmetric", P_REF)
-insts = list(c.flattened())
-CH = {k: v for k, v in NOISE_CHANNEL_PREDICATES.items() if k != "idle"}   # idle = union of the split
-timeline = {q: [] for q in watch}
-layer = 0
-for i, inst in enumerate(insts):
-    if inst.name == "TICK":
-        layer += 1
-        continue
-    prev = insts[i - 1] if i > 0 else None
-    nxt = insts[i + 1] if i + 1 < len(insts) else None
-    if inst.name == "CX":
-        t = [x.value for x in inst.targets_copy()]
-        for a, b in zip(t[::2], t[1::2]):
-            if a in watch: timeline[a].append((layer, f"CX→{b}"))
-            if b in watch: timeline[b].append((layer, f"CX←{a}"))
-    elif inst.name in ("H", "M", "R"):
-        for x in inst.targets_copy():
-            if x.value in watch: timeline[x.value].append((layer, inst.name))
-    elif inst.name in NOISE_INSTRUCTIONS:
-        ch = next((k for k, pred in CH.items() if pred(inst, prev, nxt)), None)
-        tag = f"·{ch}" if ch else "·(1q gate)"          # post-H DEPOLARIZE1 = 1q-gate noise, no channel
-        for x in inst.targets_copy():
-            if x.value in watch: timeline[x.value].append((layer, tag))
+code(r'''print(load("schedule__table")["table"])
+print()
+print(section_time("setup", "schedule"))''')
 
-n_show = 12                                             # ~one full cycle of layers
-print(f"{'layer':>5} | " + " | ".join(f"{v:^24}" for v in watch.values()))
-print("-" * (8 + 27 * len(watch)))
-for L in range(n_show):
-    row = [" ".join(s for l, s in timeline[q] if l == L) or "—" for q in watch]
-    print(f"{L:>5} | " + " | ".join(f"{r:^24}" for r in row))''')
-
-code('''# A closed SLICE of the NOISY circuit: ONE data qubit + its six check ancillas (3 X + 3 Z),
-# keeping only instructions whose endpoints are ALL inside the slice — so no half-empty
-# "context" rails. Caveat: the ancilla rails show only their coupling to the watched data qubit
-# (their other five CXs are cropped). The labelled noise boxes (DEP1 = gate/meas idle + post-H
-# 1q-gate noise, DEP2 = cz, ERR = prep/meas X_ERROR) sit exactly where the table's ·channel
-# tags put them.
-noisy = BBCodeSimulator(P).build_circuit(ErrorModel.symmetric(P_REF), rounds=1)
-DATA_Q = 0
-star = {DATA_Q}
-for inst in noisy.flattened():
-    if inst.name == "CX":
-        t = [x.value for x in inst.targets_copy()]
-        for a, b in zip(t[::2], t[1::2]):
-            if DATA_Q in (a, b):
-                star |= {a, b}
-print(f"slice: data q{DATA_Q} + its checks {sorted(star - {DATA_Q})}")
-sl = stim.Circuit()
-for inst in noisy.flattened():
-    nm = inst.name
-    if nm in ("DETECTOR", "OBSERVABLE_INCLUDE", "QUBIT_COORDS", "SHIFT_COORDS"):
-        continue
-    if nm == "TICK":
-        sl.append("TICK")
-        continue
-    t = [x.value for x in inst.targets_copy()]
-    args = inst.gate_args_copy()
-    if nm in ("CX", "DEPOLARIZE2"):
-        pairs = [(a, b) for a, b in zip(t[::2], t[1::2]) if a in star and b in star]
-        if pairs:
-            sl.append(nm, [q for ab in pairs for q in ab], args)
-    else:
-        keep = [q for q in t if q in star]
-        if keep:
-            sl.append(nm, keep, args)
-sl.diagram("timeline-svg")''')
+code(r'''# The labelled noise boxes (DEP1 = gate/meas idle + post-H 1q-gate noise, DEP2 = cz,
+# ERR = prep/meas X_ERROR) sit exactly where the table's ·channel tags put them. Caveat: the
+# ancilla rails show only their coupling to the watched data qubit (other CXs are cropped).
+star = load("schedule__star_svg")
+print(f"slice: data q{star['data_q']} + its checks {star['star']}")
+display(SVG(star["svg"]))''')
 
 # ===========================================================================
 md(r"""## §1 — Technique II: distance, onset, perfect-decoder floor (per model)
@@ -193,106 +195,70 @@ For each model: circuit fault distance `D`, onset weight `w₀=⌈D/2⌉`, the e
 perfect-decoder onset fraction `f₀*`. The four *isolated* channels (CZ / meas / prep / idle) each turn
 out to have **even** distance 4 (the code distance) — so `f₀*` is exact via Proposition 1 — while the **full**
 model has **odd** distance 3: only *combining* channels makes the weight-3 hook that drops it below the
-code distance (Appendix A.6 route for `f₀*`). We enumerate `L(D)` with the ldpc-free half-MITM for even
+code distance (Appendix A.6 route for `f₀*`). `L(D)` is enumerated with the ldpc-free half-MITM for even
 `D` (robust) and the coset search for odd `D`.""")
 
-code('''def enumerate_LD(circuit, D):
-    """Complete L(D): half-MITM for even D (exact, no ldpc); parallel coset enumeration for odd D."""
-    if D % 2 != 0:
-        return find_all_min_weight_logicals(circuit, D, budget_per_coset=40)
-    H, A, mult, priors = dem_check_action_matrices(circuit)
-    return find_weight_logicals_mitm(H, A, D)
-
-tech2 = {}
+code(r'''tech2 = {name: load(f"tech2__{slug(name)}") for name in MODELS}
 print(f"{'model':16s} {'D':>2} {'w0':>3} {'#DEM':>6} {'|L(D)|':>8} {'f0*':>8}   route")
 for name in MODELS:
-    c = make_circuit(name, P_REF); D = compute_distance(c).distance
-    LD = enumerate_LD(c, D)
-    onset = optimal_onset_fraction(c, distance=D, logicals=LD)
-    tech2[name] = dict(D=D, LD=LD, onset=onset)
-    route = "Prop.1 (even D)" if D % 2 == 0 else "App.A.6 (odd D)"
-    print(f"{name:16s} {D:2d} {onset.onset:3d} {c.detector_error_model().num_errors:6d} "
-          f"{onset.n_min_logicals:8d} {onset.onset_fraction:8.4f}   {route}")''')
+    t = tech2[name]
+    print(f"{name:16s} {t['D']:2d} {t['w0']:3d} {t['n_dem']:6d} {t['n_LD']:8d} {t['f0']:8.4f}   {t['route']}")
+print()
+print(section_time("tech2"))''')
 
 # ===========================================================================
 md(r"""## §2 — Technique I: failure-spectrum ansatz (per model)
 
-Importance-sample the failure spectrum `f(w)` and fit the f5 ansatz (onset `w₀` left free — the multistart
-fit finds the good minimum), then reweight to `LER(p)` over the grid.""")
+The runner importance-samples the failure spectrum `f(w)` (adaptive 'hit N failures per weight'
+allocation; the weight window is sized per model from the binomial mass at the top of the `p` grid,
+so the reweighted curves carry no truncation sag anywhere on the grid) and fits the f5 ansatz (onset
+`w₀` left free). The report loads both: the measured spectrum drives every point value below (via
+binomial reweighting), the fit supplies the smooth `LER(p)` curves.""")
 
-code('''# Grid top at 0.04 so the weak channels' break-even crossings (split idles ~0.012-0.02) land
-# IN-grid instead of reporting a bound; the per-model weight windows auto-size from p_grid.max(),
-# and the adaptive allocator makes the extra saturated-tail bins nearly free (~200 shots each).
-p_grid = np.geomspace(1e-4, 0.04, 44)
-# Adaptive 'hit N failures per weight' allocation: target 200 failures matches flat-6000's
-# precision at the budget-critical onset bin (f(2)~0.03 -> ~160 failures) at ~4x fewer shots —
-# the 200/f(w) schedule concentrates shots at the onset and skims the saturated high-f tail.
-# The weight window is sized per model from the binomial mass at the TOP of the p grid
-# (w_hi = μ + 4√μ, floored at 10), so the reweighted curves carry no truncation sag anywhere
-# on the grid — the extra saturated-tail weights cost only ~200-400 shots each under adaptive.
-def weight_window(c):
-    mu_ref = sum(e.args_copy()[0] for e in c.detector_error_model().flattened() if e.type == "error")
-    mu = mu_ref * p_grid.max() / P_REF
-    return list(range(1, max(10, int(np.ceil(mu + 4 * np.sqrt(mu)))) + 1))
-
-tech1 = {}
+code(r'''tech1 = {}
 for name in MODELS:
-    c = make_circuit(name, P_REF)
-    W = weight_window(c)
-    spec = importance_sample_adaptive(c, DEC(), p_ref=P_REF, p_values=[P_REF],
-                                      weights=W, target_failures=200,
-                                      shots_max=30_000, seed=1).spectrum
-    fw = dict(zip(spec.weights, np.asarray(spec.failures) / np.asarray(spec.trials)))
-    fit = fit_failure_spectrum(spec, K=c.num_observables, model="f5", w0=None, f0=None)
-    LER = np.asarray(logical_error_rate_from_ansatz(fit, list(p_grid)))
-    tech1[name] = dict(spec=spec, fw=fw, fit=fit, LER=LER)
-    print(f"{name:16s}: w=1..{W[-1]}, measured f(2)={fw[2]:.4f} ({sum(spec.trials)} shots total)   "
-          f"f5 fit cost={fit.cost:.2f}")''')
+    r = load(f"tech1__{slug(name)}")
+    tech1[name] = dict(spec=spectrum_of(r), LER=np.asarray(r["LER_fit"]), cost=r["fit"]["cost"], W=r["W"])
+    print(f"{name:16s}: w=1..{r['W'][-1]}, measured f(2)={tech1[name]['spec'].f(2):.4f} "
+          f"({r['shots']} shots total)   f5 fit cost={r['fit']['cost']:.2f}")
+print()
+print(section_time("tech1"))''')
 
 # ===========================================================================
 md(r"""## §3 — Technique III: replica-exchange splitting (per model)
 
 Splitting reaches deep into the rare regime, seeded by each model's exact `L(D)` from §1.""")
 
-code('''tech3 = {}
+code(r'''tech3 = {}
 for name in MODELS:
-    c = make_circuit(name, P_REF); info = tech2[name]
-    temper, diag = replica_exchange_estimate(
-        c, DEC(), p_ref=P_REF, p_high=0.015, p_low=1e-4, n_levels=16,
-        n_walkers=8, local_steps=5, n_sweeps=80, burn_in=20, anchor_shots=4000,
-        distance=info["D"], seed=2, single_sector=False, mw_supports=list(info["LD"]), verbose=False)
-    sp = np.asarray(temper.p_ladder)[::-1]; sP = np.asarray(temper.P_logical)[::-1]
-    tech3[name] = dict(sp=sp, sP=sP)
-    swmin, swmax = min(diag["swap_accept"]), max(diag["swap_accept"])
-    print(f"{name:16s}: swap-accept {swmin:.2f}..{swmax:.2f}   P(1e-4)={sP[0]:.2e}")''')
+    r = load(f"tech3__{slug(name)}")
+    tech3[name] = dict(sp=np.asarray(r["sp"]), sP=np.asarray(r["sP"]))
+    print(f"{name:16s}: swap-accept {r['swap_min']:.2f}..{r['swap_max']:.2f}   P(1e-4)={r['sP'][0]:.2e}")
+print()
+print(section_time("tech3"))''')
 
 # ===========================================================================
 md(r"""## §4 — Direct Monte-Carlo + overlay
 
-Direct-MC ground truth at moderate `p`, overlaid with all three techniques for the three models. Per
-model the ansatz line, the splitting squares, and the MC circles should coincide where they overlap.""")
+Direct-MC ground truth at moderate `p`, overlaid with all three techniques. Per model the ansatz
+line, the splitting squares, and the MC circles should coincide where they overlap. (MC only
+*validates* the curves — the budget never reads it — so the runner's `MC_SCALE` trades error-bar
+width for minutes.)""")
 
-code('''def direct_mc(circ, shots):
-    d = DEC(); d.setup(circ)
-    det, obs = circ.compile_detector_sampler().sample(shots, separate_observables=True)
-    f = np.any(d.decode_batch(det) != obs, axis=1); m = f.mean()
-    return m, (max(m, 1e-9) * (1 - m) / shots) ** 0.5
-
-mc_pts = {p: int(s * MC_SCALE) for p, s in
-          {0.03: 40_000, 0.012: 80_000, 0.008: 120_000, 0.005: 200_000, 0.003: 300_000}.items()}
-mc = {name: {p: direct_mc(make_circuit(name, p), s) for p, s in mc_pts.items()} for name in MODELS}
-
+code(r'''mc = {name: {float(p): v for p, v in load(f"mc__{slug(name)}")["points"].items()} for name in MODELS}
+mc_pts = sorted(next(iter(mc.values())))
 print("   p        " + "".join(f"{n:>15}" for n in MODELS))
-for p in mc_pts:
+for p in sorted(mc_pts, reverse=True):
     print(f"  {p:.3f}   " + "".join(f"{mc[n][p][0]:>15.3e}" for n in MODELS))
+print()
+print(section_time("mc"))
 
 fig, ax = plt.subplots(figsize=(9, 6))
 for name in MODELS:
     col = COLORS[name]
     ax.plot(p_grid, tech1[name]["LER"], "-", color=col, lw=2, label=f"{name}")
     ax.plot(tech3[name]["sp"], tech3[name]["sP"], "s", color=col, ms=4, mfc="none")
-    mp = sorted(mc[name])
-    ax.errorbar(mp, [mc[name][p][0] for p in mp], yerr=[mc[name][p][1] for p in mp],
+    ax.errorbar(mc_pts, [mc[name][p][0] for p in mc_pts], yerr=[mc[name][p][1] for p in mc_pts],
                 fmt="o", color=col, capsize=3, zorder=5)
 ax.plot([], [], "-", color="gray", label="Technique I: f5 ansatz")
 ax.plot([], [], "s", color="gray", mfc="none", label="Technique III: splitting")
@@ -309,43 +275,29 @@ Google's Willow error budget (arXiv:2408.13687) is built from **marginal** contr
 scale) one error component in simulation and measure how much the logical error rate drops. The
 channel-*isolated* circuits of §1–§4 cannot provide this: §1 showed every isolated channel has even
 distance **4** while the full model has odd distance **3**, so the dominant low-`p` failures are
-**mixed-channel** faults that no isolated circuit contains. Here we run the four **all-but-one**
+**mixed-channel** faults that no isolated circuit contains. The runner puts the five **all-but-one**
 models (`keep = not channel`) through the same pipeline.
 
 The ablated distances are a structural diagnostic: if dropping channel *i* restores `D=4`, then
 channel *i* participates in **every** weight-3 hook; if `D` stays 3, the hooks survive without it.""")
 
-code('''ABLATED = {"no CZ": "cz", "no meas": "meas", "no prep": "prep",
-           "no gate idle": "gate_idle", "no meas idle": "meas_idle"}
-def make_ablated_circuit(name, p):
-    drop = NOISE_CHANNEL_PREDICATES[ABLATED[name]]
-    return filter_noise_channel(BBCodeSimulator(P).build_circuit(ErrorModel.symmetric(p), rounds=ROUNDS),
-                                lambda i, pr, nx: not drop(i, pr, nx))
-
-tech2_abl = {}
+code(r'''tech2_abl = {name: load(f"tech2_abl__{slug(name)}") for name in ABLATED}
 print(f"{'model':13s} {'D':>2} {'w0':>3} {'#DEM':>6} {'|L(D)|':>8} {'f0*':>10}   hook diagnosis")
 for name in ABLATED:
-    c = make_ablated_circuit(name, P_REF); D = compute_distance(c).distance
-    LD = enumerate_LD(c, D)
-    onset = optimal_onset_fraction(c, distance=D, logicals=LD)
-    tech2_abl[name] = dict(D=D, LD=LD, onset=onset)
-    diag = ("restores D=4 -> channel is in EVERY weight-3 hook" if D == 4
-            else "still D=3 -> hooks survive without this channel" if D == 3 else "")
-    print(f"{name:13s} {D:2d} {onset.onset:3d} {c.detector_error_model().num_errors:6d} "
-          f"{onset.n_min_logicals:8d} {onset.onset_fraction:10.3e}   {diag}")''')
+    t = tech2_abl[name]
+    diag = ("restores D=4 -> channel is in EVERY weight-3 hook" if t["D"] == 4
+            else "still D=3 -> hooks survive without this channel" if t["D"] == 3 else "")
+    print(f"{name:13s} {t['D']:2d} {t['w0']:3d} {t['n_dem']:6d} {t['n_LD']:8d} {t['f0']:10.3e}   {diag}")''')
 
-code('''tech1_abl, mc_abl = {}, {}
+code(r'''tech1_abl, mc_abl = {}, {}
 for name in ABLATED:
-    c = make_ablated_circuit(name, P_REF)
-    spec = importance_sample_adaptive(c, DEC(), p_ref=P_REF, p_values=[P_REF],
-                                      weights=weight_window(c), target_failures=200,
-                                      shots_max=30_000, seed=3).spectrum
-    fit = fit_failure_spectrum(spec, K=c.num_observables, model="f5", w0=None, f0=None)
-    tech1_abl[name] = dict(spec=spec, fit=fit,
-                           LER=np.asarray(logical_error_rate_from_ansatz(fit, list(p_grid))))
-    mc_abl[name] = {p: direct_mc(make_ablated_circuit(name, p), s) for p, s in mc_pts.items()}
-    print(f"{name:13s}: f5 fit cost={fit.cost:.2f}   MC LER(p={min(mc_pts)}) = "
-          f"{mc_abl[name][min(mc_pts)][0]:.3e}")''')
+    r = load(f"tech1_abl__{slug(name)}")
+    tech1_abl[name] = dict(spec=spectrum_of(r), LER=np.asarray(r["LER_fit"]), cost=r["fit"]["cost"])
+    mc_abl[name] = {float(p): v for p, v in load(f"mc_abl__{slug(name)}")["points"].items()}
+    print(f"{name:13s}: f5 fit cost={r['fit']['cost']:.2f}   MC LER(p={min(mc_abl[name])}) = "
+          f"{mc_abl[name][min(mc_abl[name])][0]:.3e}")
+print()
+print(section_time("tech2_abl", "tech1_abl", "mc_abl"))''')
 
 # ===========================================================================
 md(r"""## §6 — The error budget (Willow-style)
@@ -355,73 +307,53 @@ honesty notes for a **single** code:
 
 * There is no Λ (it is a ratio between code *sizes*); the single-code stand-in for `p_th,i` is the
   channel **pseudo-threshold** — the break-even `p` where `LER_i(p) = p`. A *true* Λ needs the
-  same-polynomial `(l,m)=(6,6)` sibling **[[72,4,8]]** (`A=1+x+y²`, `B=1+y+x²`, exact d=8).
+  same-polynomial `(l,m)=(6,6)` sibling **[[72,4,8]]** (`A=1+x+y²`, `B=1+y+x²`, exact d=8) — §7.
 * Two decompositions of `LER_full` are shown, and they differ by construction:
   **isolated** `LER_i/LER_full` (misses mixed faults; the deficit is the **mixing bucket**) and
   **marginal** `1 − LER_{no i}/LER_full` (Google's convention; Σ typically **exceeds 1** because a
   mixed fault is killed by removing *any* of its participant channels, so it is counted in each).
-  SPAM = meas + prep (their linear budget terms add).""")
+  SPAM = meas + prep (their linear budget terms add).
 
-code('''# Budget operating point: DEEP in the suppression regime — below every channel's pseudo-threshold
-# (the lowest, CZ, is ~1.5e-3, so 5e-4 sits ~3x under it and 12-25x under the rest). Direct MC is
-# impractical down here (LERs ~1e-4..1e-6), so the cross-check column is Technique III SPLITTING
-# (§3 reaches p=1e-4) instead of MC; §4 already validated ansatz-vs-MC at moderate p.
-P_STAR = 5e-4
+Point values at `p*` come from the MEASURED spectra, binomially reweighted — NOT from the f5 fits
+(independently-fitted extrapolations drift apart model-to-model down here and can even invert the
+full-vs-ablated ordering into negative "marginals"). The fits still supply the curve-wide
+pseudo-thresholds, where they are anchored. The marginal column carries the propagated binomial
+`±σ`. Cross-check column: Technique III splitting (§3 reaches p=1e-4; direct MC is impractical at
+LERs of 1e-4..1e-6).""")
 
-# Point values at p* come from the MEASURED spectra, binomially reweighted — NOT from the f5
-# fits. The per-model weight windows cover every onset (w0=2, f(1)=0) AND the binomial mass over
-# the whole grid, so the reweighting is exact-in-expectation everywhere; independently-fitted
-# (w0, f0, shape) EXTRAPOLATIONS drift
-# apart model-to-model down here and can even invert the full-vs-ablated ordering (negative
-# "marginals"). The fits still supply the curve-wide pseudo-thresholds, where they are anchored.
-from importance_sampling import reweight_spectrum
-
-def ler_at(d, p):                    # reweighted measured spectrum at scalar p (no extrapolation)
+code(r'''def ler_at(d, p):                    # reweighted measured spectrum at scalar p (no extrapolation)
     return float(reweight_spectrum(d["spec"], [p]).P_logical[0])
 
 def split_at(name, p):               # Technique-III splitting estimate at p (log-log interpolated)
     sp, sP = tech3[name]["sp"], tech3[name]["sP"]
     return float(np.exp(np.interp(np.log(p), np.log(sp), np.log(sP))))
 
-def crossing_p(pg, y1, y2):          # p where y1(p)=y2(p), log-log interpolated (None if never)
-    r = np.log(y1) - np.log(y2)
-    s = np.nonzero(np.diff(np.sign(r)) != 0)[0]
-    if s.size == 0:
-        return None
-    i = s[-1]; t = r[i] / (r[i] - r[i + 1])
-    return float(np.exp(np.log(pg[i]) + t * (np.log(pg[i + 1]) - np.log(pg[i]))))
-
-def pseudo_threshold(pg, LER):       # break-even LER(p)=p (single-code threshold stand-in)
-    return crossing_p(pg, LER, np.asarray(pg))
-
-CHANNELS = ["CZ only", "meas only", "prep only", "gate idle", "meas idle"]
-ABL_OF = {"CZ only": "no CZ", "meas only": "no meas", "prep only": "no prep",
-          "gate idle": "no gate idle", "meas idle": "no meas idle"}
-
-L_full = ler_at(tech1["full symmetric"], P_STAR)
+L_full, L_full_se, _ = rw_stats(tech1["full symmetric"]["spec"], P_STAR)
 S_full = split_at("full symmetric", P_STAR)
 rows = []
 for ch in CHANNELS:
     iso = ler_at(tech1[ch], P_STAR) / L_full
-    marg = 1.0 - ler_at(tech1_abl[ABL_OF[ch]], P_STAR) / L_full   # reweighted spectra: no fit drift
+    La, La_se, _ = rw_stats(tech1_abl[ABL_OF[ch]]["spec"], P_STAR)
+    marg = 1.0 - La / L_full
+    marg_se = (La / L_full) * float(np.hypot(La_se / La, L_full_se / L_full))
     iso_split = split_at(ch, P_STAR) / S_full
     pth = pseudo_threshold(p_grid, tech1[ch]["LER"])
-    rows.append((ch, iso, marg, iso_split, pth))
+    rows.append((ch, iso, marg, iso_split, pth, marg_se))
 
 print(f"error budget at p* = {P_STAR}   (LER_full: reweighted {L_full:.3e}, splitting {S_full:.3e})")
-print(f"{'channel':12s} {'isolated':>9} {'iso(split)':>10} {'marginal':>9} {'p_pth':>9} {'p*/p_pth':>9}")
-for ch, iso, marg, iso_split, pth in rows:
+print(f"{'channel':12s} {'isolated':>9} {'iso(split)':>10} {'marginal':>9} {'±σ':>6} {'p_pth':>9} {'p*/p_pth':>9}")
+for ch, iso, marg, iso_split, pth, mse in rows:
     pths = f"{pth:.4f}" if pth else f">{p_grid.max():.3g}"      # no break-even crossing in-grid
     term = f"{P_STAR/pth:.3f}" if pth else f"<{P_STAR/p_grid.max():.3f}"   # bound, not a blank
-    print(f"{ch:12s} {iso:9.3f} {iso_split:10.3f} {marg:9.3f} {pths:>9} {term:>9}")
+    print(f"{ch:12s} {iso:9.3f} {iso_split:10.3f} {marg:9.3f} {mse:6.3f} {pths:>9} {term:>9}")
 mixing = 1.0 - sum(r[1] for r in rows)
 spam_iso = sum(r[1] for r in rows if r[0] in ("meas only", "prep only"))
 spam_marg = sum(r[2] for r in rows if r[0] in ("meas only", "prep only"))
 idle_iso = sum(r[1] for r in rows if "idle" in r[0])
 idle_marg = sum(r[2] for r in rows if "idle" in r[0])
-print(f"{'mixing':12s} {mixing:9.3f}                      (1 - sum isolated: cross-channel faults)")
-print(f"{'SPAM':12s} {spam_iso:9.3f} {'':10s} {spam_marg:9.3f}      (meas + prep combined)")
-print(f"{'idle total':12s} {idle_iso:9.3f} {'':10s} {idle_marg:9.3f}      (gate + meas idle combined)")
+print(f"{'mixing':12s} {mixing:9.3f}                             (1 - sum isolated: cross-channel faults)")
+print(f"{'SPAM':12s} {spam_iso:9.3f} {'':10s} {spam_marg:9.3f}         (meas + prep combined)")
+print(f"{'idle total':12s} {idle_iso:9.3f} {'':10s} {idle_marg:9.3f}         (gate + meas idle combined)")
 print(f"sum(marginal) = {sum(r[2] for r in rows):.3f}  (>1 <=> shared mixed faults; Google renormalizes)")
 print(f"Willow-form sum: {sum(P_STAR / r[4] for r in rows if r[4]):.3f} = "
       + " + ".join(f"{P_STAR/r[4]:.3f} ({r[0].replace(' only', '')})" for r in rows if r[4])
@@ -429,11 +361,10 @@ print(f"Willow-form sum: {sum(P_STAR / r[4] for r in rows if r[4]):.3f} = "
          if all(P_STAR / r[4] < 1 for r in rows if r[4])
          else "   [WARNING: a term >= 1 — p* is not below every pseudo-threshold]"))''')
 
-code('''fig, (axL, axR) = plt.subplots(1, 2, figsize=(12, 4.5))
+code(r'''fig, (axL, axR) = plt.subplots(1, 2, figsize=(12, 4.5))
 # left: marginal budget fractions vs p — REWEIGHTED measured spectra (solid), the same estimator
 # as the table/bars at p*, so the panels agree. The f5-fit version is kept as faint dashed lines
-# (unclipped) to make the low-p extrapolation drift visible instead of hiding it. The per-model
-# weight windows cover the binomial mass over the whole grid, so there is no truncation sag.
+# (unclipped) to make the low-p extrapolation drift visible instead of hiding it.
 Lf_rw = reweight_spectrum(tech1["full symmetric"]["spec"], p_grid).P_logical
 Lf_fit = tech1["full symmetric"]["LER"]
 for ch in CHANNELS:
@@ -443,7 +374,7 @@ for ch in CHANNELS:
 axL.plot([], [], "--", color="gray", lw=1, alpha=0.6, label="f5-fit version (drifts at low p)")
 axL.axhline(0.0, color="gray", lw=0.8)
 axL.set_xscale("log"); axL.set_xlabel("physical error rate p")
-axL.set_ylabel("marginal fraction  1 − LER$_{no\\,i}$/LER$_{full}$")
+axL.set_ylabel("marginal fraction  1 − LER$_{no\,i}$/LER$_{full}$")
 axL.axvline(P_STAR, color="gray", ls=":", lw=1); axL.legend(fontsize=8); axL.grid(alpha=0.3)
 # right: the budget bar chart at p*
 labels = [r[0] for r in rows] + ["mixing"]
@@ -451,7 +382,8 @@ iso_v  = [r[1] for r in rows] + [mixing]
 marg_v = [r[2] for r in rows] + [np.nan]
 x = np.arange(len(labels))
 axR.bar(x - 0.2, iso_v, 0.4, label="isolated (channel-only)")
-axR.bar(x + 0.2, marg_v, 0.4, label="marginal (leave-one-out)")
+axR.bar(x + 0.2, marg_v, 0.4, yerr=[r[5] for r in rows] + [np.nan], capsize=3,
+        label="marginal (leave-one-out)")
 axR.set_xticks(x, labels, rotation=20); axR.set_ylabel(f"fraction of LER_full at p*={P_STAR}")
 axR.legend(fontsize=8); axR.grid(alpha=0.3, axis="y")
 fig.suptitle("Kunlun [[18,4,4]] — Willow-style error budget"); plt.tight_layout(); plt.show()''')
@@ -471,86 +403,61 @@ The channel crossings `ε₁₈,ᵢ = ε₇₂,ᵢ` are the *true* per-channel t
 Willow budget divides by. No exact `f₀*` at this size (the `L(D)`/`L(D+1)` enumerations are the
 bb144-regime problem) — the Λ budget doesn't need it.
 
-**Cost.** This section reruns the five channels on a 144-qubit circuit — expect **one to two
-hours**; each cell checkpoints nothing, so run it when the kernel can sit.""")
+**Cost.** The 144-qubit sweeps are the expensive part of the runner (order an hour+), which is
+exactly why they are cached per task: a re-run of `run_error_model_comparison.py` touches them only
+if their config changed. `--boost72` buys the 72-code spectra 2× target failures and 5× shots —
+see the §7.5 box for when that is worth it.""")
 
-code('''from bb_code_sim import BB_72_4_8
-
-ROUNDS72 = BB_72_4_8.distance // 2       # rounds ∝ distance (the d=4 run above used d/2 = 2)
-def make_circuit72(model, p):
-    return filter_noise_channel(BBCodeSimulator(BB_72_4_8).build_circuit(ErrorModel.symmetric(p), rounds=ROUNDS72),
-                                MODELS[model])
-
-tech2_72 = {}
+code(r'''tech2_72 = {name: load(f"tech2_72__{slug(name)}")["D"] for name in MODELS}
 print(f"{'model':16s} {'D':>2}   (circuit fault distance, BP-OSD upper bound; f0 unpinned at this size)")
 for name in MODELS:
-    tech2_72[name] = compute_distance(make_circuit72(name, P_REF)).distance
     print(f"{name:16s} {tech2_72[name]:2d}")''')
 
-code('''tech1_72, mc72 = {}, {}
-mc72_pts = {0.008: 10_000}               # one slim anchor: MC only decorates the §7.4 plot now
+code(r'''tech1_72, mc72 = {}, {}
 for name in MODELS:
-    c = make_circuit72(name, P_REF)
-    # Weight window from the binomial mass: μ(p) = E[#faults] = Σ DEM error probs, rescaled to p.
-    mu_ref = sum(e.args_copy()[0] for e in c.detector_error_model().flattened() if e.type == "error")
-    w_hi = int(np.ceil((mu := mu_ref * p_grid.max() / P_REF) + 4 * np.sqrt(mu)))
-    W = list(range(1, 16)) + list(range(16, w_hi + 1, 2))   # stride-2 tail: f5 pools weights, halves the cost
-    # Adaptive allocation skims the saturated tail and pours shots into the near-onset bins that
-    # decide the reweighted Λ(p*). stop_after_zero_bins caps the DEEP sub-onset cost: below the
-    # observable onset every bin would otherwise burn the full shots_max chasing failures that
-    # cannot be resolved at this budget anyway (they need ~1e6+ shots) — three consecutive empty
-    # max-budget bins end the descent. Zero/skipped bins contribute exactly 0 to the reweighting
-    # either way, so ε72 at very low p is a LOWER bound (Λ an upper bound) — compare Λ vs Λ(fit).
-    spec = importance_sample_adaptive(c, DEC(), p_ref=P_REF, p_values=[P_REF],
-                                      weights=W, target_failures=100, shots_max=10_000,
-                                      stop_after_zero_bins=3, seed=4).spectrum
-    fit = fit_failure_spectrum(spec, K=c.num_observables, model="f5", w0=None, f0=None)
-    tech1_72[name] = dict(spec=spec, fit=fit,
-                          LER=np.asarray(logical_error_rate_from_ansatz(fit, list(p_grid))))
-    mc72[name] = {p: direct_mc(make_circuit72(name, p), s) for p, s in mc72_pts.items()}
-    print(f"{name:16s}: weights 1..{w_hi} ({len(W)} sampled, {sum(spec.trials)} shots), "
-          f"f5 fit cost={fit.cost:.2f}, MC LER(0.008)={mc72[name][0.008][0]:.3e}", flush=True)''')
+    r = load(f"tech1_72__{slug(name)}")
+    tech1_72[name] = dict(spec=spectrum_of(r), LER=np.asarray(r["LER_fit"]), cost=r["fit"]["cost"])
+    mc72[name] = {float(p): v for p, v in load(f"mc72__{slug(name)}")["points"].items()}
+    n_planned, n_sampled = len(r["W"]), len(r["spectrum"]["weights"])
+    print(f"{name:16s}: weights 1..{r['W'][-1]} ({n_sampled}/{n_planned} sampled, {r['shots']} shots), "
+          f"f5 fit cost={r['fit']['cost']:.2f}, MC LER(0.008)={mc72[name][0.008][0]:.3e}")
+print()
+print(section_time("tech2_72", "tech1_72", "mc72"))''')
 
-code('''def per_round(LER, rounds):
-    return 1.0 - (1.0 - np.clip(LER, 0.0, 1.0 - 1e-12)) ** (1.0 / rounds)
-
-eps18 = {m: per_round(tech1[m]["LER"], ROUNDS) for m in MODELS}
+code(r'''eps18 = {m: per_round(tech1[m]["LER"], ROUNDS) for m in MODELS}
 eps72 = {m: per_round(tech1_72[m]["LER"], ROUNDS72) for m in MODELS}
 
-# Λ evaluation point — matches the §6 budget's p*, deep in the suppression regime (well below every
-# crossing). Point-Λ uses the REWEIGHTED measured spectra (both codes sampled from w=1 through their
-# onsets), avoiding cross-fit extrapolation drift; the f5-based value is printed as a cross-check.
-# Honesty note: if the [[72,4,8]] onset bins saw ZERO failures at these shots, the reweighted ε72 is
-# a lower bound → Λ an upper bound (a large reweighted-vs-fit gap flags exactly this).
-P_LAM = 5e-4
-from importance_sampling import reweight_spectrum
-
-def eps_at(d, p, rounds):            # per-round ε from the reweighted measured spectrum
-    return float(per_round(reweight_spectrum(d["spec"], [p]).P_logical, rounds)[0])
-
+# Λ evaluation point — matches the §6 budget's p*, deep in the suppression regime. Point-Λ uses
+# the REWEIGHTED measured spectra (both codes sampled from w=1 through their onsets), avoiding
+# cross-fit extrapolation drift; the f5-based value is printed as a cross-check. The ±σ column
+# propagates the binomial errors of both spectra. Honesty note: zero-failure onset bins make the
+# reweighted ε72 a lower bound → Λ an upper bound (a large reweighted-vs-fit gap flags this; the
+# §7.5 box quantifies it per channel via the rule-of-three zero-bin headroom).
 i_lam = int(np.argmin(np.abs(p_grid - P_LAM)))
-rows7 = []
-print(f"{'channel':16s} {'p_th (ε18=ε72)':>15} {'Λ(p*)':>9} {'Λ(fit)':>9} {'p*/p_th':>9}     (p* = {P_LAM})")
+rows7, inv7 = [], {}
+print(f"{'channel':16s} {'p_th (ε18=ε72)':>15} {'Λ(p*)':>9} {'±σ':>8} {'Λ(fit)':>9} {'p*/p_th':>9}     (p* = {P_LAM})")
 for m in MODELS:
     pth = crossing_p(p_grid, eps18[m], eps72[m])
-    lam = eps_at(tech1[m], P_LAM, ROUNDS) / eps_at(tech1_72[m], P_LAM, ROUNDS72)
+    inv, inv_se, inv_lo, inv_hi = inv_lambda_stats(tech1[m]["spec"], tech1_72[m]["spec"], P_LAM)
+    inv7[m] = (inv, inv_se, inv_lo, inv_hi)
+    lam, lam_se = 1.0 / inv, inv_se / inv**2
     lam_fit = float(eps18[m][i_lam] / eps72[m][i_lam])
     rows7.append((m, pth, lam))
     pths = f"{pth:.4f}" if pth else f">{p_grid.max():.3g}"
     term = f"{P_LAM/pth:.3f}" if pth else f"<{P_LAM/p_grid.max():.3f}"
-    print(f"{m:16s} {pths:>15} {lam:9.3g} {lam_fit:9.3g} {term:>9}")
+    print(f"{m:16s} {pths:>15} {lam:9.3g} {lam_se:8.2g} {lam_fit:9.3g} {term:>9}")
 
 lam_full = dict((m, l) for m, _, l in rows7)["full symmetric"]
-print(f"\\nΛ_full(p*) = {lam_full:.3g}  →  per-(+2-distance)-step λ = √Λ = {np.sqrt(lam_full):.3g}  (d: 4→8 is two steps)")
+print(f"\nΛ_full(p*) = {lam_full:.3g}  →  per-(+2-distance)-step λ = √Λ = {np.sqrt(lam_full):.3g}  (d: 4→8 is two steps)")
 inv_lam = 1.0 / lam_full
 terms = {m: P_LAM / pth for m, pth, _ in rows7 if pth is not None and m != "full symmetric"}
 spam_term = terms.get("meas only", 0) + terms.get("prep only", 0)
 print(f"Willow identity check at p*: 1/Λ_full = {inv_lam:.3f}  vs  Σᵢ p*/p_th,i = {sum(terms.values()):.3f}"
-      f"   (CZ {terms.get('CZ only', float('nan')):.3f}, SPAM {spam_term:.3f}, idle {terms.get('idle only', float('nan')):.3f})")
+      f"   (CZ {terms.get('CZ only', float('nan')):.3f}, SPAM {spam_term:.3f})")
 print("residual = mixed-channel faults (isolated channels cannot see them — see §1/§5); "
       "Σ < 1/Λ_full means the additive budget under-covers by that share.")''')
 
-code('''fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
+code(r'''fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
 for m in MODELS:
     col = COLORS[m]
     axL.plot(p_grid, eps18[m], "-", color=col, lw=2, label=m)
@@ -567,8 +474,8 @@ axR.axhline(1.0, color="gray", lw=1); axR.axvline(P_LAM, color="gray", ls=":", l
 # √Λ = per-(+2-distance)-step suppression (d: 4→8 is two steps) — directly comparable to the
 # per-step λ Google quotes for the surface-code ladder (Willow: λ ≈ 2.14). λ=1 crossings = p_th.
 axR.set_xlabel("physical error rate p")
-axR.set_ylabel(r"$\\lambda(p) = \\sqrt{\\varepsilon_{18}/\\varepsilon_{72}}$  (per +2-distance step)")
-axR.set_title("per-step error suppression (crossings at $\\lambda=1$ = true $p_{th,i}$)")
+axR.set_ylabel(r"$\lambda(p) = \sqrt{\varepsilon_{18}/\varepsilon_{72}}$  (per +2-distance step)")
+axR.set_title("per-step error suppression (crossings at $\lambda=1$ = true $p_{th,i}$)")
 axR.legend(fontsize=8); axR.grid(alpha=0.3, which="both")
 plt.tight_layout(); plt.show()''')
 
@@ -578,40 +485,54 @@ md(r"""## §7.5 — Marginal Λ: the ablations on the larger code
 §7.3's Λᵢ used channel-*isolated* circuits — the clean per-channel suppression capability, but not
 a decomposition of Λ_full (the mixed-channel faults belong to no isolated circuit). Google's
 budget convention is *marginal*: ablate one component from the FULL circuit and measure the
-change. Here we run the five leave-one-out circuits on **[[72,4,8]]** (the 18-code ablations are
-§5's), form `Λ_no-i(p*) = ε₁₈,no-i/ε₇₂,no-i`, and read channel i's contribution to the full
+change. The runner runs the five leave-one-out circuits on **[[72,4,8]]** (the 18-code ablations
+are §5's); we form `Λ_no-i(p*) = ε₁₈,no-i/ε₇₂,no-i` and read channel i's contribution to the full
 suppression deficit as `1/Λ_full − 1/Λ_no-i`. The gap between Σ(contributions) and `1/Λ_full` is
-the Λ-space mixing — the same story §6 tells in LER-space, now for error suppression.""")
+the Λ-space mixing — the same story §6 tells in LER-space, now for error suppression.
 
-code('''tech1_72_abl = {}
-for name in ABLATED:
-    drop = NOISE_CHANNEL_PREDICATES[ABLATED[name]]
-    c = filter_noise_channel(BBCodeSimulator(BB_72_4_8).build_circuit(ErrorModel.symmetric(P_REF), rounds=ROUNDS72),
-                             lambda i, pr, nx: not drop(i, pr, nx))
-    mu_ref = sum(e.args_copy()[0] for e in c.detector_error_model().flattened() if e.type == "error")
-    w_hi = int(np.ceil((mu := mu_ref * p_grid.max() / P_REF) + 4 * np.sqrt(mu)))
-    W = list(range(1, 16)) + list(range(16, w_hi + 1, 2))
-    spec = importance_sample_adaptive(c, DEC(), p_ref=P_REF, p_values=[P_REF],
-                                      weights=W, target_failures=100, shots_max=10_000,
-                                      stop_after_zero_bins=3, seed=5).spectrum
-    tech1_72_abl[name] = dict(spec=spec)
-    print(f"{name:13s}: sampled {len(spec.weights)}/{len(W)} bins, {sum(spec.trials)} shots", flush=True)''')
+**Reading the signs.** Each contribution is a *difference of two noisy ratios*, so this box now
+carries the full uncertainty budget: `±σ` propagates the binomial errors of all four spectra, and
+the `[lo, hi]` interval additionally spans the **zero-bin truncation** — every sampled-but-empty
+weight bin priced at its rule-of-three upper bound `f(w) < 3/T`. A negative share is only *real*
+(a channel whose faults the big code handles better than the small one) if it stays negative
+within both; otherwise it is an estimator artifact of the under-resolved [[72,4,8]] onset bins —
+rerun the runner with `--boost72` to tighten exactly those.""")
 
-code('''inv_full = 1.0 / lam_full
-print(f"marginal Λ decomposition at p* = {P_LAM}   (Λ_full = {lam_full:.3g}, 1/Λ_full = {inv_full:.3e})")
-print(f"{'channel':12s} {'Λ_no-i(p*)':>11} {'1/Λ_no-i':>10} {'contribution':>13} {'share':>7}")
-contribs = {}
-for ch in CHANNELS:
-    abl = ABL_OF[ch]
-    lam_no = eps_at(tech1_abl[abl], P_LAM, ROUNDS) / eps_at(tech1_72_abl[abl], P_LAM, ROUNDS72)
-    contribs[ch] = inv_full - 1.0 / lam_no          # how much of the suppression deficit channel i owns
-    print(f"{ch:12s} {lam_no:11.3g} {1.0/lam_no:10.3e} {contribs[ch]:13.3e} {contribs[ch]/inv_full:7.2f}")
-tot = sum(contribs.values())
-print(f"\\nsum of marginal contributions = {tot:.3e}  vs  1/Λ_full = {inv_full:.3e}"
-      f"   (ratio {tot/inv_full:.2f})")
-print("ratio > 1: shared mixed faults counted once per participant (as in §6's Σ marginal > 1);")
-print("a NEGATIVE contribution means removing that channel HURT the suppression ratio — e.g. a")
-print("channel whose faults the big code handles better than the small one.")''')
+code(r'''tech1_72_abl = {name: dict(spec=spectrum_of(load(f"tech1_72_abl__{slug(name)}"))) for name in ABLATED}
+print(section_time("tech1_72_abl"))''')
+
+code(r'''def lambda_decomposition(spec18_full, spec72_full, spec18_of, spec72_of, p):
+    """The marginal-Λ box: contribution_i = 1/Λ_full − 1/Λ_no-i with ±σ and zero-bin interval."""
+    inv_f, se_f, lo_f, hi_f = inv_lambda_stats(spec18_full, spec72_full, p)
+    print(f"{'channel':12s} {'Λ_no-i(p*)':>11} {'1/Λ_no-i':>10} {'contribution':>13} {'±σ':>9} "
+          f"{'share':>7}   verdict")
+    tot = 0.0
+    for ch in CHANNELS:
+        inv_a, se_a, lo_a, hi_a = inv_lambda_stats(spec18_of(ch), spec72_of(ch), p)
+        c = inv_f - inv_a
+        sc = float(np.hypot(se_f, se_a))
+        c_lo, c_hi = lo_f - hi_a, hi_f - lo_a      # zero-bin truncation interval around c
+        tot += c
+        if abs(c) < 2 * sc:
+            verdict = "~0 within 2σ (noise)"
+        elif c_lo < 0.0 < c_hi:
+            verdict = "sign not robust to zero-bin truncation"
+        else:
+            verdict = "solid"
+        print(f"{ch:12s} {1.0/inv_a:11.3g} {inv_a:10.3e} {c:13.3e} {sc:9.2e} {c/inv_f:7.2f}   {verdict}")
+    print(f"\nsum of marginal contributions = {tot:.3e}  vs  1/Λ_full = {inv_f:.3e}"
+          f"   (ratio {tot/inv_f:.2f})")
+    print("ratio > 1: shared mixed faults counted once per participant (as in §6's Σ marginal > 1).")
+    print("A NEGATIVE contribution is physical only when 'solid': removing that channel genuinely")
+    print("HURT the suppression ratio (the big code handles its faults better than the small one).")
+    print("'~0' / 'not robust' rows are sampling artifacts — tighten with run_error_model_comparison")
+    print("--boost72 (2× failures, 5× shots on every 72-code spectrum feeding this box).")
+    return inv_f
+
+print(f"marginal Λ decomposition at p* = {P_LAM}   (Λ_full = {lam_full:.3g}, 1/Λ_full = {1/lam_full:.3e})")
+_ = lambda_decomposition(tech1["full symmetric"]["spec"], tech1_72["full symmetric"]["spec"],
+                         lambda ch: tech1_abl[ABL_OF[ch]]["spec"],
+                         lambda ch: tech1_72_abl[ABL_OF[ch]]["spec"], P_LAM)''')
 
 # ===========================================================================
 md(r"""## §8 — A second operating point: meas & meas-idle ×5
@@ -628,68 +549,46 @@ channel i at rate `rᵢ·p` is just `reweight_spectrum(spec_i, [rᵢ·p])`; only
 *mixes* (whose channel composition changes) are new sweeps. (ii) Ablating channel i from the
 asymmetric mix composes the existing tools: `filter_noise_channel(scale_noise_channels(...))`.
 Convention: `p` remains the base rate of the un-boosted channels, so `p*` comparisons across
-§6/§8 are at equal gate noise.""")
+§6/§8 are at equal gate noise. The Λ box carries the same `±σ` / zero-bin verdicts as §7.5.""")
 
-code('''SCALE = {"meas": 5.0, "meas_idle": 5.0}
+code(r'''asym = {}
+for label in ("18", "72"):
+    asym[("full", label)] = spectrum_of(load(f"asym__full_{label}"))
+    for abl_name in ABLATED:
+        asym[(abl_name, label)] = spectrum_of(load(f"asym__{slug(abl_name)}_{label}"))
+print(section_time("asym"))''')
 
-def make_full_asym(code_params, rounds, p):
-    return scale_noise_channels(
-        BBCodeSimulator(code_params).build_circuit(ErrorModel.symmetric(p), rounds=rounds), SCALE)
-
-def make_abl_asym(code_params, rounds, ch, p):
-    drop = NOISE_CHANNEL_PREDICATES[ch]
-    return filter_noise_channel(make_full_asym(code_params, rounds, p),
-                                lambda i, pr, nx: not drop(i, pr, nx))
-
-def adaptive_sweep(c, seed):
-    mu_ref = sum(e.args_copy()[0] for e in c.detector_error_model().flattened() if e.type == "error")
-    w_hi = int(np.ceil((mu := mu_ref * p_grid.max() / P_REF) + 4 * np.sqrt(mu)))
-    W = list(range(1, 16)) + list(range(16, w_hi + 1, 2))
-    return importance_sample_adaptive(c, DEC(), p_ref=P_REF, p_values=[P_REF], weights=W,
-                                      target_failures=100, shots_max=10_000,
-                                      stop_after_zero_bins=3, seed=seed).spectrum
-
-asym = {}
-for label, (cp, rr) in {"18": (P, ROUNDS), "72": (BB_72_4_8, ROUNDS72)}.items():
-    asym[("full", label)] = adaptive_sweep(make_full_asym(cp, rr, P_REF), seed=6)
-    print(f"[{label}] full asym: {sum(asym[('full', label)].trials)} shots", flush=True)
-    for abl_name, ch in ABLATED.items():
-        asym[(abl_name, label)] = adaptive_sweep(make_abl_asym(cp, rr, ch, P_REF), seed=6)
-        print(f"[{label}] {abl_name}: {sum(asym[(abl_name, label)].trials)} shots", flush=True)''')
-
-code('''# The budget at the asymmetric point. Isolated fractions reuse the §2 spectra, reweighted at
+code(r'''# The budget at the asymmetric point. Isolated fractions reuse the §2 spectra, reweighted at
 # each channel's OWN rate (r_i * p*); marginals come from the new asymmetric ablated mixes.
-R_OF = {"CZ only": 1.0, "meas only": 5.0, "prep only": 1.0, "gate idle": 1.0, "meas idle": 5.0}
-L_asym = float(reweight_spectrum(asym[("full", "18")], [P_STAR]).P_logical[0])
+L_asym, L_asym_se, _ = rw_stats(asym[("full", "18")], P_STAR)
 rows8 = []
 for ch in CHANNELS:
     iso = float(reweight_spectrum(tech1[ch]["spec"], [R_OF[ch] * P_STAR]).P_logical[0]) / L_asym
-    marg = 1.0 - float(reweight_spectrum(asym[(ABL_OF[ch], "18")], [P_STAR]).P_logical[0]) / L_asym
-    rows8.append((ch, iso, marg))
+    La, La_se, _ = rw_stats(asym[(ABL_OF[ch], "18")], P_STAR)
+    marg = 1.0 - La / L_asym
+    marg_se = (La / L_asym) * float(np.hypot(La_se / La, L_asym_se / L_asym))
+    rows8.append((ch, iso, marg, marg_se))
 mix8 = 1.0 - sum(r[1] for r in rows8)
 sym = {r[0]: (r[1], r[2]) for r in rows}                 # §6's symmetric-point rows for comparison
 print(f"budget at the ASYMMETRIC point (meas, meas_idle ×5), p* = {P_STAR}:")
 print(f"LER_full = {L_asym:.3e}  (symmetric point: {L_full:.3e} — the ×5 mix costs "
       f"{L_asym/L_full:.1f}× in error rate)")
-print(f"{'channel':12s} {'isolated':>9} {'marginal':>9}   vs symmetric {'iso':>6} {'marg':>6}")
-for ch, iso, marg in rows8:
-    print(f"{ch:12s} {iso:9.3f} {marg:9.3f}                {sym[ch][0]:6.3f} {sym[ch][1]:6.3f}")
-print(f"{'mixing':12s} {mix8:9.3f}                        {mixing:6.3f}")
+print(f"{'channel':12s} {'isolated':>9} {'marginal':>9} {'±σ':>6}   vs symmetric {'iso':>6} {'marg':>6}")
+for ch, iso, marg, mse in rows8:
+    print(f"{ch:12s} {iso:9.3f} {marg:9.3f} {mse:6.3f}                {sym[ch][0]:6.3f} {sym[ch][1]:6.3f}")
+print(f"{'mixing':12s} {mix8:9.3f}                               {mixing:6.3f}")
 print(f"sum(marginal) = {sum(r[2] for r in rows8):.3f}   (symmetric: {sum(r[2] for r in rows):.3f})")''')
 
-code('''# Λ at the asymmetric point + its marginal decomposition (both codes' asymmetric ablations).
-lam8 = eps_at({"spec": asym[("full", "18")]}, P_LAM, ROUNDS) / eps_at({"spec": asym[("full", "72")]}, P_LAM, ROUNDS72)
-inv8 = 1.0 / lam8
-print(f"Λ_full(p*={P_LAM}) at the ×5 point: {lam8:.3g}   (symmetric: {lam_full:.3g})"
+code(r'''# Λ at the asymmetric point + its marginal decomposition (both codes' asymmetric ablations),
+# with the same ±σ and zero-bin verdicts as §7.5 — read the two boxes together to see how the
+# gradient of 1/Λ rotates when the noise mix moves from the symmetric ray to the device-like ray.
+inv8, inv8_se, _, _ = inv_lambda_stats(asym[("full", "18")], asym[("full", "72")], P_LAM)
+lam8 = 1.0 / inv8
+print(f"Λ_full(p*={P_LAM}) at the ×5 point: {lam8:.3g} ± {inv8_se/inv8**2:.2g}   (symmetric: {lam_full:.3g})"
       f"   per-step λ = {np.sqrt(lam8):.3g} (symmetric: {np.sqrt(lam_full):.3g})")
-print(f"{'channel':12s} {'Λ_no-i':>10} {'contribution':>13} {'share':>7}")
-for ch in CHANNELS:
-    lam_no = (eps_at({"spec": asym[(ABL_OF[ch], "18")]}, P_LAM, ROUNDS)
-              / eps_at({"spec": asym[(ABL_OF[ch], "72")]}, P_LAM, ROUNDS72))
-    contrib = inv8 - 1.0 / lam_no
-    print(f"{ch:12s} {lam_no:10.3g} {contrib:13.3e} {contrib/inv8:7.2f}")
-print("read against §7.5: how the gradient of 1/Λ rotates when the noise mix moves from the")
-print("symmetric ray to a device-like ray (meas-type channels 5× hotter).")''')
+_ = lambda_decomposition(asym[("full", "18")], asym[("full", "72")],
+                         lambda ch: asym[(ABL_OF[ch], "18")],
+                         lambda ch: asym[(ABL_OF[ch], "72")], P_LAM)''')
 
 # ---------------------------------------------------------------------------
 md(r"""## Takeaways
@@ -720,12 +619,18 @@ md(r"""## Takeaways
 * **The Willow identity `1/Λ ≈ Σᵢ p/p_th,i` is the §7 punchline**: how far the sum falls short of
   `1/Λ_full` measures exactly how much the mixed-channel faults (the §1 `D=3` hook, invisible to
   every isolated channel) break the additive budget.
+* **Λ shares are differences of noisy ratios — trust only flagged-solid signs (§7.5, §8).** Each
+  marginal contribution now carries a propagated `±σ` and a zero-bin truncation interval; a negative
+  share that is `~0 within 2σ` or `not robust to zero-bin truncation` is an artifact of the
+  under-resolved 72-code onset bins, not physics. `--boost72` in the runner tightens exactly those
+  spectra (and the cache means nothing else reruns).
 * **The whole budget is a gradient at a base point (§8).** Re-evaluating at a device-like ray
   (meas + meas-idle ×5) shows how the decomposition rotates with the noise mix. The isolated
   basis reweights analytically to any rate vector (`f(w)` is rate-independent); only the full and
   ablated mixes need resampling — which is what makes multi-point sensitivity maps affordable.
 
-*Generated by `make_error_model_comparison.py`.*""")
+*Report generated by `make_error_model_comparison.py`; data by `run_error_model_comparison.py`
+(cached per task under `runs/error_model_comparison_18_4_4/`).*""")
 
 # ===========================================================================
 nb = {"cells": cells,
