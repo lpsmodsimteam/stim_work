@@ -24,10 +24,14 @@ mw_systematic: true
 
 # Technique I / IS — adaptive, sweeping high->low and skipping ~3/4 of weights (onset ~46; the
 # ansatz interpolates the skipped weights). This is the user's validated adaptive sweep.
+# adaptive_failures raised 10->25 (2026-07-13): 10 failures/bin gave noise-limited marginal-Lambda
+# shares on the K=4 pair (every share ~0 within 2 sigma); 25 is the budget floor for W2 channel
+# marginals against this run. Low-w bins sit at shots_max either way, so cost grows only mid-band
+# (manifest walltime raised 48h->72h to match).
 weights_range: [5, 113]
 weight_stride: 4
 adaptive: true
-adaptive_failures: 10
+adaptive_failures: 25
 adaptive_shots_max: 1000000
 
 # Technique III — multi-seeded splitting. NOTE (docs/bb144_splitting_vs_is.md): single-flip mixing is

@@ -2,23 +2,245 @@
 # experiments/slurm/submit.sh sizes --array=0-(N-1) from len(configs).
 # Each entry is an independent, checkpoint-resumable job writing to its own runs/ dir.
 #
-# P0 (run tomorrow): bb6_memory, bb144_memory. Uncomment the seams when ready.
+# SUBMISSION DISCIPLINE (2026-07-13): always submit through
+#   bash experiments/slurm/submit.sh --only <substring> [--dry-run]
+# so a wave never resubmits an earlier wave's live entries. Indices are FROZEN for the
+# campaign — append new waves at the end, never reorder. mem: is per-entry (OOM guard;
+# Technique II forks the DEM across mw_workers).
+#
+# WAVE 1 (memory full-noise ladder, submit 2026-07-14): filter --only memory
+# WAVE 1b (LPU x1/z1 full-noise, submit 2026-07-14/15):  filter --only lpu
 configs:
-  - path: experiments/configs/bb6_memory.yaml
+  - path: experiments/configs/bb6_memory.yaml          # Fig-10 reproduction control
     cpus: 16
     time: "08:00:00"
-  - path: experiments/configs/bb144_memory.yaml
+    mem: "8G"
+  - path: experiments/configs/bb6_memory_m100.yaml     # K=12 ladder leg (decoder-unified)
+    cpus: 16
+    time: "12:00:00"
+    mem: "8G"
+  - path: experiments/configs/bb144_memory.yaml        # 72h: adaptive_failures 10->25
     cpus: 32
-    time: "48:00:00"
+    time: "72:00:00"
+    mem: "32G"
   # Two-gross [[288,12,18]] memory — 3x larger than BB(12); heavy (esp. Technique II at d~18).
   - path: experiments/configs/bb288_memory.yaml
     cpus: 48
     time: "96:00:00"
+    mem: "64G"
+  # LPU x1/z1 (WAVE 1b) — results QUARANTINED from memory comparisons until the TdG-vs-Bravyi
+  # presentation-equivalence test (G3a) resolves.
+  - path: experiments/configs/gross_lpu_x1.yaml
+    cpus: 16
+    time: "24:00:00"
+    mem: "16G"
+  - path: experiments/configs/gross_lpu_z1.yaml
+    cpus: 16
+    time: "24:00:00"
+    mem: "16G"
 
-  # --- seams (not P0) ---
-  # - path: experiments/configs/gross_lpu_x1.yaml
+  # =========== WAVE 2 (bb6+bb144 memory channels; submit ~2026-07-16 after G1+G2) ===========
+  # Uncomment this block on submit day; submit: submit.sh --only channels/bb6 --only channels/bb144
+  # - path: experiments/configs/channels/bb6_memory_m100__iso_cz.yaml
+  #   cpus: 16
+  #   time: "12:00:00"
+  #   mem: "8G"
+  # - path: experiments/configs/channels/bb6_memory_m100__abl_cz.yaml
+  #   cpus: 16
+  #   time: "06:00:00"
+  #   mem: "8G"
+  # - path: experiments/configs/channels/bb6_memory_m100__iso_meas.yaml
+  #   cpus: 16
+  #   time: "04:00:00"
+  #   mem: "8G"
+  # - path: experiments/configs/channels/bb6_memory_m100__abl_meas.yaml
+  #   cpus: 16
+  #   time: "12:00:00"
+  #   mem: "8G"
+  # - path: experiments/configs/channels/bb6_memory_m100__iso_prep.yaml
+  #   cpus: 16
+  #   time: "04:00:00"
+  #   mem: "8G"
+  # - path: experiments/configs/channels/bb6_memory_m100__abl_prep.yaml
+  #   cpus: 16
+  #   time: "12:00:00"
+  #   mem: "8G"
+  # - path: experiments/configs/channels/bb6_memory_m100__iso_gate_idle.yaml
+  #   cpus: 16
+  #   time: "06:00:00"
+  #   mem: "8G"
+  # - path: experiments/configs/channels/bb6_memory_m100__abl_gate_idle.yaml
+  #   cpus: 16
+  #   time: "12:00:00"
+  #   mem: "8G"
+  # - path: experiments/configs/channels/bb6_memory_m100__iso_meas_idle.yaml
+  #   cpus: 16
+  #   time: "06:00:00"
+  #   mem: "8G"
+  # - path: experiments/configs/channels/bb6_memory_m100__abl_meas_idle.yaml
+  #   cpus: 16
+  #   time: "12:00:00"
+  #   mem: "8G"
+  # - path: experiments/configs/channels/bb144_memory__iso_cz.yaml
+  #   cpus: 32
+  #   time: "72:00:00"
+  #   mem: "32G"
+  # - path: experiments/configs/channels/bb144_memory__abl_cz.yaml
+  #   cpus: 32
+  #   time: "36:00:00"
+  #   mem: "32G"
+  # - path: experiments/configs/channels/bb144_memory__iso_meas.yaml
+  #   cpus: 32
+  #   time: "08:00:00"
+  #   mem: "32G"
+  # - path: experiments/configs/channels/bb144_memory__abl_meas.yaml
+  #   cpus: 32
+  #   time: "72:00:00"
+  #   mem: "32G"
+  # - path: experiments/configs/channels/bb144_memory__iso_prep.yaml
+  #   cpus: 32
+  #   time: "08:00:00"
+  #   mem: "32G"
+  # - path: experiments/configs/channels/bb144_memory__abl_prep.yaml
+  #   cpus: 32
+  #   time: "72:00:00"
+  #   mem: "32G"
+  # - path: experiments/configs/channels/bb144_memory__iso_gate_idle.yaml
+  #   cpus: 32
+  #   time: "16:00:00"
+  #   mem: "32G"
+  # - path: experiments/configs/channels/bb144_memory__abl_gate_idle.yaml
+  #   cpus: 32
+  #   time: "72:00:00"
+  #   mem: "32G"
+  # - path: experiments/configs/channels/bb144_memory__iso_meas_idle.yaml
+  #   cpus: 32
+  #   time: "16:00:00"
+  #   mem: "32G"
+  # - path: experiments/configs/channels/bb144_memory__abl_meas_idle.yaml
+  #   cpus: 32
+  #   time: "72:00:00"
+  #   mem: "32G"
+
+  # =========== WAVE 3 (bb288 + LPU x1/z1 channels; submit ~2026-07-20 after G3) ===========
+  # Uncomment on submit day; submit: submit.sh --only channels/bb288 --only channels/gross_lpu
+  # - path: experiments/configs/channels/bb288_memory__iso_cz.yaml
+  #   cpus: 48
+  #   time: "96:00:00"
+  #   mem: "64G"
+  # - path: experiments/configs/channels/bb288_memory__abl_cz.yaml
+  #   cpus: 48
+  #   time: "48:00:00"
+  #   mem: "64G"
+  # - path: experiments/configs/channels/bb288_memory__iso_meas.yaml
+  #   cpus: 48
+  #   time: "12:00:00"
+  #   mem: "64G"
+  # - path: experiments/configs/channels/bb288_memory__abl_meas.yaml
+  #   cpus: 48
+  #   time: "96:00:00"
+  #   mem: "64G"
+  # - path: experiments/configs/channels/bb288_memory__iso_prep.yaml
+  #   cpus: 48
+  #   time: "12:00:00"
+  #   mem: "64G"
+  # - path: experiments/configs/channels/bb288_memory__abl_prep.yaml
+  #   cpus: 48
+  #   time: "96:00:00"
+  #   mem: "64G"
+  # - path: experiments/configs/channels/bb288_memory__iso_gate_idle.yaml
+  #   cpus: 48
+  #   time: "24:00:00"
+  #   mem: "64G"
+  # - path: experiments/configs/channels/bb288_memory__abl_gate_idle.yaml
+  #   cpus: 48
+  #   time: "96:00:00"
+  #   mem: "64G"
+  # - path: experiments/configs/channels/bb288_memory__iso_meas_idle.yaml
+  #   cpus: 48
+  #   time: "24:00:00"
+  #   mem: "64G"
+  # - path: experiments/configs/channels/bb288_memory__abl_meas_idle.yaml
+  #   cpus: 48
+  #   time: "96:00:00"
+  #   mem: "64G"
+  # - path: experiments/configs/channels/gross_lpu_x1__iso_cz.yaml
   #   cpus: 16
   #   time: "24:00:00"
-  # - path: experiments/configs/gross_lpu_z1.yaml
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_x1__abl_cz.yaml
+  #   cpus: 16
+  #   time: "12:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_x1__iso_meas.yaml
+  #   cpus: 16
+  #   time: "04:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_x1__abl_meas.yaml
   #   cpus: 16
   #   time: "24:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_x1__iso_prep.yaml
+  #   cpus: 16
+  #   time: "04:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_x1__abl_prep.yaml
+  #   cpus: 16
+  #   time: "24:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_x1__iso_gate_idle.yaml
+  #   cpus: 16
+  #   time: "08:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_x1__abl_gate_idle.yaml
+  #   cpus: 16
+  #   time: "24:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_x1__iso_meas_idle.yaml
+  #   cpus: 16
+  #   time: "08:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_x1__abl_meas_idle.yaml
+  #   cpus: 16
+  #   time: "24:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_z1__iso_cz.yaml
+  #   cpus: 16
+  #   time: "24:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_z1__abl_cz.yaml
+  #   cpus: 16
+  #   time: "12:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_z1__iso_meas.yaml
+  #   cpus: 16
+  #   time: "04:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_z1__abl_meas.yaml
+  #   cpus: 16
+  #   time: "24:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_z1__iso_prep.yaml
+  #   cpus: 16
+  #   time: "04:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_z1__abl_prep.yaml
+  #   cpus: 16
+  #   time: "24:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_z1__iso_gate_idle.yaml
+  #   cpus: 16
+  #   time: "08:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_z1__abl_gate_idle.yaml
+  #   cpus: 16
+  #   time: "24:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_z1__iso_meas_idle.yaml
+  #   cpus: 16
+  #   time: "08:00:00"
+  #   mem: "16G"
+  # - path: experiments/configs/channels/gross_lpu_z1__abl_meas_idle.yaml
+  #   cpus: 16
+  #   time: "24:00:00"
+  #   mem: "16G"

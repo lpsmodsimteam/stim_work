@@ -36,13 +36,22 @@ mw_decimate: true
 mw_decimate_max_odd: 3
 mw_search_rounds: 2
 
-# Technique I / IS — sweep the rising onset region (~110) up through the mass at p_hi (mu~150,
-# w_hi~200). Adaptive 'hit N failures', high->low; the f5 ansatz extrapolates the onset to low p.
-# shots_max bounded (the 288 decode is heavy) so near-onset weights don't run away.
-weights_range: [70, 205]
-weight_stride: 4
+# Technique I / IS — explicit weight plan (2026-07-13): CONTIGUOUS head 106..130 (stride 1)
+# through the rising onset, then 134..202 stride 4 through the mass at p_hi (mu~150, w_hi~200).
+# Rationale: a strided-only plan has no contiguous head, which invalidates binomially-reweighted
+# point values at low p (stride-gap undercount, ~stride x at high p; see K=4 fill_spectrum note)
+# and starves the onset bins that decide marginal-Lambda shares. The old [70,205] stride-4 plan's
+# sub-onset bins (70..102) are dropped: Technique II's even-D f0 pin anchors the ansatz below the
+# head exactly. Adaptive 'hit N failures', high->low; shots_max bounded (the 288 decode is heavy).
+# adaptive_failures 10->15: budget floor; noise-limited shares get a W4 boost pass (new config,
+# explicit onset weights, seed 43, pooled downstream — in-place raises DO NOT rerun done weights).
+weights: [106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120,
+          121, 122, 123, 124, 125, 126, 127, 128, 129, 130,
+          134, 138, 142, 146, 150, 154, 158, 162, 166, 170, 174, 178, 182, 186, 190,
+          194, 198, 202]
+weights_explicit: true
 adaptive: true
-adaptive_failures: 10
+adaptive_failures: 15
 adaptive_shots_min: 4
 adaptive_shots_max: 100000
 

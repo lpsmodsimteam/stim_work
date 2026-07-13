@@ -47,7 +47,8 @@ for _stream in (sys.stdout, sys.stderr):
 from scipy.special import gammaln
 
 from bb_code_sim import (BBCodeParams, BBCodeSimulator, BB_18_4_4, BB_72_12_6, BB_144_12_12,
-                         BB_288_12_18, RelayBPDecoder, BPOSDDecoder, BBPyMatchingDecoder)
+                         BB_288_12_18, RelayBPDecoder, BPOSDDecoder, BBPyMatchingDecoder,
+                         NOISE_CHANNEL_PREDICATES, filter_noise_channel)
 from surface_code_sim import ErrorModel
 from importance_sampling import (
     FailureSpectrum, ImportanceSamplingResult, _parse_dem, _expand, _sample_failures_at_weight,
@@ -138,6 +139,13 @@ class Config:
     rounds: Optional[int] = None          # default: code distance
     lpu_C: int = 10                       # LPU repeated-measurement rounds (lpu_* experiments)
     lpu_d_init: int = 12
+    # Five-channel budget campaigns: isolate ONE channel (noise_channel) or drop one channel,
+    # keeping the rest (ablate_channel = leave-one-out marginal). Mutually exclusive; applied to
+    # the built circuit AFTER the experiment builder — the full-noise path (both None) returns the
+    # builder's circuit untouched. Keys = bb_code_sim.NOISE_CHANNEL_PREDICATES minus 'idle' (use
+    # the gate_idle/meas_idle split; bare 'idle' would break the five-channel partition).
+    noise_channel: Optional[str] = None
+    ablate_channel: Optional[str] = None
 
     # --- Relay-BP decoder (paper Sec 2.4 BB(6) settings in production) ---
     relay_gamma0: float = 0.125
@@ -226,11 +234,22 @@ class Config:
     def resolved_outdir(self) -> pathlib.Path:
         if self.outdir:
             return pathlib.Path(self.outdir)
-        return RUNS / "framework" / self.code_name / self.experiment
+        suffix = (f"__iso_{self.noise_channel}" if self.noise_channel
+                  else f"__abl_{self.ablate_channel}" if self.ablate_channel else "")
+        return RUNS / "framework" / self.code_name / (self.experiment + suffix)
 
     def __post_init__(self):
         if self.rounds is None:
             self.rounds = self.code.distance
+        if self.noise_channel and self.ablate_channel:
+            raise SystemExit("noise_channel and ablate_channel are mutually exclusive "
+                             "(isolate one channel OR leave one out, not both)")
+        valid_channels = sorted(set(NOISE_CHANNEL_PREDICATES) - {"idle"})
+        for key in (self.noise_channel, self.ablate_channel):
+            if key is not None and key not in valid_channels:
+                raise SystemExit(
+                    f"unknown noise channel {key!r}; valid: {valid_channels} "
+                    "('idle' is the union of gate_idle+meas_idle — use the split channels)")
 
     @classmethod
     def smoke(cls, **over) -> "Config":
@@ -259,9 +278,17 @@ def make_decoder(cfg: Config):
 
 def build_circuit(cfg: Config):
     try:
-        return CIRCUIT_BUILDERS[cfg.experiment](cfg)
+        circ = CIRCUIT_BUILDERS[cfg.experiment](cfg)
     except KeyError:
         raise SystemExit(f"unknown experiment {cfg.experiment!r}; choices: {sorted(CIRCUIT_BUILDERS)}")
+    # Channel isolation/ablation for budget campaigns. Full-noise path (both None) returns the
+    # builder's circuit object untouched — guaranteed byte-identical to the pre-extension runner.
+    if cfg.noise_channel is None and cfg.ablate_channel is None:
+        return circ
+    if cfg.noise_channel:
+        return filter_noise_channel(circ, cfg.noise_channel)
+    drop = NOISE_CHANNEL_PREDICATES[cfg.ablate_channel]
+    return filter_noise_channel(circ, lambda i, p, n: not drop(i, p, n))
 
 
 def _technique_ii_circuit(cfg: Config):
@@ -788,6 +815,13 @@ def main(argv: Optional[List[str]] = None) -> None:
                               decoder_name=cfg.decoder_name, techniques=cfg.techniques,
                               split_method=cfg.split_method, mw_single_sector=cfg.mw_single_sector,
                               mw_f0_override=cfg.mw_f0_override, mw_w0_override=cfg.mw_w0_override,
+                              # Carry the Technique-II PRODUCTION path (decimation + fault
+                              # restriction): without these a bb288 smoke searches the full
+                              # rounds=18 circuit — unboundedly heavier than the real config's
+                              # restricted search, the opposite of a smoke.
+                              mw_decimate=cfg.mw_decimate, mw_decimate_max_odd=cfg.mw_decimate_max_odd,
+                              mw_search_rounds=cfg.mw_search_rounds,
+                              noise_channel=cfg.noise_channel, ablate_channel=cfg.ablate_channel,
                               outdir=cfg.outdir)
             cfg = sm
     elif args.smoke:

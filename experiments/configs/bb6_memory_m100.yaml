@@ -1,0 +1,44 @@
+# BB(6) = [[72,12,6]] memory — the K=12 LADDER LEG (decoder-unified with bb144/bb288).
+# bb6_memory.yaml (Fig-10 reproduction) inherits the dataclass default relay_num_sets=600 while
+# bb144/bb288 run the num_sets=100 family — a decoder mismatch that would contaminate every
+# Lambda(bb6->bb144) ratio (identical-decoder rule; Lambda<1 = decoder-degradation tell). This
+# config duplicates bb6_memory with EXACTLY the bb144/bb288 relay block and re-derives the
+# Technique-II onset under that decoder (no mw_f0_override — the 2.3239e-5 pin was enumerated
+# under the reference decoder; BB(6)'s search is minutes). All ladder Lambda ratios use THIS run;
+# bb6_memory.yaml stays untouched as the paper-reproduction control.
+label: bb6_memory_m100
+code_name: bb6
+experiment: memory
+decoder_name: relay
+techniques: [II, IS, I, III]
+split_method: multiseed
+outdir: runs/framework/bb6/memory_m100
+
+p_ref: 0.003
+ansatz_model: f5
+
+# Relay-BP — byte-for-byte the bb144/bb288 block.
+relay_gamma0: 0.125
+relay_pre_iter: 80
+relay_num_sets: 100
+relay_set_max_iter: 60
+relay_stop_nconv: 6
+
+# Technique II — full search (no pins): BB(6) D=6 is even, so Proposition 1 re-pins f0 under
+# the m100 decoder in minutes.
+mw_workers: 12
+mw_systematic: true
+
+# Technique I / IS — same sweep as bb6_memory.
+weights_range: [2, 60]
+adaptive: true
+adaptive_failures: 50
+adaptive_shots_max: 50000
+
+# Technique III — same splitting as bb6_memory.
+split_p_high: 0.006
+split_p_low: 0.003
+split_L: 12
+split_M: 3
+split_T_init: 100000
+split_ladder: eq18
