@@ -310,25 +310,31 @@ def schedule_table_body():
 
 
 def schedule_svg_body():
+    import re
     import stim
     # A closed SLICE of the NOISY circuit: ONE data qubit + its six check ancillas, keeping only
     # instructions whose endpoints are ALL inside the slice (ancilla rails show only their
     # coupling to the watched data qubit; their other five CXs are cropped). Star qubits are
     # renumbered to contiguous 0..6 — timeline-svg draws a rail for every index up to the max,
     # so keeping the original indices would render ~27 empty rails. `rails` maps back.
-    noisy = BBCodeSimulator(P).build_circuit(ErrorModel.symmetric(P_REF), rounds=1)
+    # TWO rounds, because the data meas_idle DEPOLARIZE1 only exists BETWEEN rounds (in the
+    # final round data qubits are measured right after the last CX layer — no idle slot).
+    noisy = BBCodeSimulator(P).build_circuit(ErrorModel.symmetric(P_REF), rounds=2)
+    insts = list(noisy.flattened())
     DATA_Q = 0
     star = {DATA_Q}
-    for inst in noisy.flattened():
+    for inst in insts:
         if inst.name == "CX":
             t = [x.value for x in inst.targets_copy()]
             for a, b in zip(t[::2], t[1::2]):
                 if DATA_Q in (a, b):
                     star |= {a, b}
     remap = {q: i for i, q in enumerate(sorted(star))}
+    CH = {k: v for k, v in NOISE_CHANNEL_PREDICATES.items() if k != "idle"}   # idle = split pair
     h_qubits = set()
     sl = stim.Circuit()
-    for inst in noisy.flattened():
+    chan_by_rail = {i: [] for i in remap.values()}   # temporal order of noise boxes per rail
+    for i, inst in enumerate(insts):
         nm = inst.name
         if nm in ("DETECTOR", "OBSERVABLE_INCLUDE", "QUBIT_COORDS", "SHIFT_COORDS"):
             continue
@@ -341,18 +347,56 @@ def schedule_svg_body():
             pairs = [(a, b) for a, b in zip(t[::2], t[1::2]) if a in star and b in star]
             if pairs:
                 sl.append(nm, [remap[q] for ab in pairs for q in ab], args)
+                if nm == "DEPOLARIZE2":
+                    for a, b in pairs:   # timeline-svg puts a 2q noise label on the BOTTOM rail
+                        chan_by_rail[max(remap[a], remap[b])].append("cz")
         else:
             keep = [q for q in t if q in star]
             if keep:
                 if nm == "H":
                     h_qubits |= set(keep)
                 sl.append(nm, [remap[q] for q in keep], args)
+                if nm in NOISE_INSTRUCTIONS:
+                    prev = insts[i - 1] if i > 0 else None
+                    nxt = insts[i + 1] if i + 1 < len(insts) else None
+                    ch = next((k for k, pred in CH.items() if pred(inst, prev, nxt)), "1q gate")
+                    for q in keep:
+                        chan_by_rail[remap[q]].append(ch)
+
+    # Patch the SVG: stim labels every noise box only with its probability ("0.01"), so all
+    # three DEPOLARIZE1 channels look identical. Replace each probability label with a colored
+    # channel tag. Geometry: rail i sits at y=64*(i+1), a box's label at rail_y+20; within one
+    # rail, temporal order == x order. Counts must match exactly or we abort (never mislabel).
+    TAG = {"cz": "cz", "meas": "meas", "prep": "prep", "gate_idle": "g-idle",
+           "meas_idle": "m-idle", "1q gate": "1q"}
+    CLR = {"cz": "navy", "meas": "seagreen", "prep": "darkorange", "gate_idle": "purple",
+           "meas_idle": "mediumvioletred", "1q gate": "gray"}
+    svg = str(sl.diagram("timeline-svg"))
+    prob = re.escape(f"{P_REF:g}")
+    pat = re.compile(r'<text ([^>]*?)>' + prob + r'</text>')
+    by_rail = {i: [] for i in chan_by_rail}
+    for m in pat.finditer(svg):
+        attrs = m.group(1)
+        x = float(re.search(r'x="([\d.]+)"', attrs).group(1))
+        y = float(re.search(r'y="([\d.]+)"', attrs).group(1))
+        by_rail[round((y - 20) / 64) - 1].append((x, m.span(), attrs))
+    for rail, boxes in by_rail.items():
+        if len(boxes) != len(chan_by_rail[rail]):
+            raise RuntimeError(f"rail {rail}: {len(boxes)} noise labels vs "
+                               f"{len(chan_by_rail[rail])} classified channels")
+    edits = []
+    for rail, boxes in by_rail.items():
+        for (x, span, attrs), ch in zip(sorted(boxes), chan_by_rail[rail]):
+            edits.append((span, f'<text {attrs} fill="{CLR[ch]}" font-weight="bold">{TAG[ch]}</text>'))
+    for (lo, hi), rep in sorted(edits, reverse=True):
+        svg = svg[:lo] + rep + svg[hi:]
+
     def label(q):
         return (f"data q{q}" if q == DATA_Q
                 else f"X-anc q{q}" if q in h_qubits else f"Z-anc q{q}")
     rails = [[remap[q], q, label(q)] for q in sorted(star)]
     return dict(data_q=DATA_Q, star=sorted(star - {DATA_Q}), rails=rails,
-                svg=str(sl.diagram("timeline-svg")))
+                channel_colors=CLR, svg=svg)
 
 
 # ---------------------------------------------------------------------------
@@ -368,7 +412,8 @@ def run_all(r: Runner, boost72=False):
     r.task("setup__dem_counts", dict(code=CODE18, p_ref=P_REF, rounds=ROUNDS, models=list(MODELS)),
            lambda: {name: make_circuit(name, P_REF).detector_error_model().num_errors for name in MODELS})
     r.task("schedule__table", dict(code=CODE18, p_ref=P_REF, rounds=ROUNDS, n_show=12), schedule_table_body)
-    r.task("schedule__star_svg", dict(code=CODE18, p_ref=P_REF, rounds=1, data_q=0, compact_rails=True),
+    r.task("schedule__star_svg", dict(code=CODE18, p_ref=P_REF, rounds=2, data_q=0, compact_rails=True,
+                                      channel_tags=True),
            schedule_svg_body)
 
     # §1 + §3 (tech3 needs tech2's D and L(D)); §2; §4

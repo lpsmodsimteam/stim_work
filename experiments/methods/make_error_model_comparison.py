@@ -181,13 +181,16 @@ code(r'''print(load("schedule__table")["table"])
 print()
 print(section_time("setup", "schedule"))''')
 
-code(r'''# The labelled noise boxes (DEP1 = gate/meas idle + post-H 1q-gate noise, DEP2 = cz,
-# ERR = prep/meas X_ERROR) sit exactly where the table's ·channel tags put them. Caveats: the
-# ancilla rails show only their coupling to the watched data qubit (other CXs are cropped),
-# and rails are renumbered 0..6 so uninvolved qubits don't render as empty rows — the mapping
-# back to the original circuit indices is printed here.
+code(r'''# Every noise box is tagged and colored by CHANNEL (stim itself labels noise only with its
+# probability — all three DEPOLARIZE1 channels would look identical): cz / meas / prep /
+# g-idle / m-idle / 1q (post-H 1q-gate noise, not a budget channel). All boxes are p=0.01.
+# TWO syndrome cycles are shown because the data m-idle slot only exists BETWEEN rounds; the
+# g-idle box is the lone DEP box on the data rail during its sat-out CX layer, right after
+# prep. Caveats: ancilla rails show only their coupling to the watched data qubit (other CXs
+# are cropped), and rails are renumbered 0..6 — the mapping back is printed here.
 star = load("schedule__star_svg")
 print("rails: " + "   ".join(f"q{new} = {lbl}" for new, old, lbl in star["rails"]))
+print("noise tags: " + "   ".join(f"{t} = {c}" for t, c in star["channel_colors"].items()))
 display(SVG(star["svg"]))''')
 
 # ===========================================================================
