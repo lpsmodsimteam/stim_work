@@ -20,4 +20,5 @@ outdir: runs/framework/bb144/lpu_z1__iso_gate_idle
 p_lo: 0.0005
 p_hi: 0.03
 weight_stride: 1
+pin_onset: false
 noise_channel: gate_idle

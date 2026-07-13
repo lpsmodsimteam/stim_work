@@ -14,6 +14,9 @@ p_ref: 0.002
 p_lo: 3.0e-4
 p_hi: 4.0e-3
 ansatz_model: f5
+pin_onset: false   # campaign convention: free ansatz onset (see bb6_memory_m100.yaml note);
+                   # D=18 is even so Tech II WOULD pin otherwise — the pin is untested for
+                   # Relay-BP misconvergence floors at this size.
 
 # Relay-BP (same family as BB(12); the 288 DEM is ~3x larger so each decode is heavier).
 relay_gamma0: 0.125

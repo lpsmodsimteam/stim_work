@@ -20,4 +20,5 @@ outdir: runs/framework/bb144/lpu_x1__iso_prep
 p_lo: 0.001
 p_hi: 0.05
 weight_stride: 1
+pin_onset: false
 noise_channel: prep

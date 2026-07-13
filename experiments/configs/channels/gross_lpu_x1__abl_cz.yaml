@@ -20,4 +20,5 @@ outdir: runs/framework/bb144/lpu_x1__abl_cz
 p_lo: 0.0003
 p_hi: 0.012
 weight_stride: 2
+pin_onset: false
 ablate_channel: cz

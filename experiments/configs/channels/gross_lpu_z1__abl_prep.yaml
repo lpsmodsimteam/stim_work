@@ -20,4 +20,5 @@ outdir: runs/framework/bb144/lpu_z1__abl_prep
 p_lo: 0.0003
 p_hi: 0.012
 weight_stride: 2
+pin_onset: false
 ablate_channel: prep

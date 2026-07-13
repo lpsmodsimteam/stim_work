@@ -20,4 +20,5 @@ outdir: runs/framework/bb144/lpu_x1__iso_cz
 p_lo: 0.0003
 p_hi: 0.015
 weight_stride: 2
+pin_onset: false
 noise_channel: cz

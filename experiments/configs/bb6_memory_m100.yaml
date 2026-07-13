@@ -16,6 +16,12 @@ outdir: runs/framework/bb6/memory_m100
 
 p_ref: 0.003
 ansatz_model: f5
+# K=4-campaign convention: the ansatz onset is left FREE (no perfect-decoder pin). Pinning
+# f(w0)=f0* assumes the decoder achieves the MLD floor at w0 — exactly the assumption the
+# [[72,4,8]] gate-idle misconvergence violated. Only bb6_memory.yaml (Fig-10 reproduction
+# control) pins, because pinning IS the paper's method there. Point values downstream come
+# from reweighted spectra either way.
+pin_onset: false
 
 # Relay-BP — byte-for-byte the bb144/bb288 block.
 relay_gamma0: 0.125

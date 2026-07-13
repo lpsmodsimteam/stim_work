@@ -9,6 +9,7 @@ split_method: multiseed
 
 p_ref: 0.003
 ansatz_model: f5
+pin_onset: false   # campaign convention: free ansatz onset (see bb6_memory_m100.yaml note)
 
 # Relay-BP tuned for BB(12) (the user's validated settings: fewer relay legs than BB(6)).
 relay_gamma0: 0.125

@@ -98,6 +98,10 @@ def make_clone(parent_name: str, parent: dict, model: str) -> dict:
         "weight_stride": stride,
         "adaptive": True,
         "adaptive_failures": cls["failures"][tier],
+        # campaign convention: FREE ansatz onset — even-D channels would otherwise pin
+        # f(w0) to the perfect-decoder floor, hiding any decoder misconvergence there
+        # (the [[72,4,8]] gate-idle lesson). Reweighted point values are unaffected.
+        "pin_onset": False,
         ("noise_channel" if kind == "iso" else "ablate_channel"): ch,
     })
     return cfg
