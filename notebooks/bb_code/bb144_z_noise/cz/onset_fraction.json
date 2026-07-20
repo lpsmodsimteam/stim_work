@@ -1,0 +1,14 @@
+{
+  "noise_model": "cz",
+  "sector": 0,
+  "distance": 22,
+  "onset": 11,
+  "n_min_logicals": 17856,
+  "n_min_logicals_expanded": 1.392416530719812e+33,
+  "n_expanded": 117504,
+  "naive_restrictions": 12596193792.0,
+  "exact": false,
+  "unique_restrictions_lower_bound": 80419248,
+  "onset_fraction_upper_bound": 8.531377873633617e-39,
+  "onset_fraction": null
+}

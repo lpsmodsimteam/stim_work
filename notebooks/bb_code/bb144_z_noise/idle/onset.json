@@ -1,0 +1,11 @@
+{
+  "onset": 5,
+  "last_zero": 4,
+  "w_hi": 57,
+  "n_expanded": 5040,
+  "q_base": 0.0019999999999999515,
+  "suggested_weights": [
+    4,
+    57
+  ]
+}

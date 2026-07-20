@@ -1,0 +1,15 @@
+{
+  "rounds": 12,
+  "single_sector": true,
+  "sector_type": 0,
+  "method": "search",
+  "distance": 11,
+  "distance_is_bound": true,
+  "onset": 6,
+  "n_compressed": 8784,
+  "n_expanded": 180648,
+  "n_min_logicals": 1440,
+  "n_min_logicals_expanded": 159299249125018919040,
+  "fail_count": 0,
+  "onset_fraction": null
+}
