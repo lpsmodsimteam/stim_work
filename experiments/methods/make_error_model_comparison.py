@@ -106,8 +106,10 @@ def rw_stats(spec, p):
 
     SE propagates the per-bin binomial errors of the sampled f(w). `headroom` is how much the
     value could RISE if every sampled-but-zero-failure bin actually sat at its rule-of-three
-    upper bound f(w) < 3/T(w): sub-onset zero bins carry exactly 0 into the reweighting, so the
-    value is a lower bound and `headroom` is the size of that truncation exposure at this p.
+    upper bound f(w) < 3/T(w). EVERY zero bin is priced, including those below tech2's D:
+    D is the PERFECT-decoder floor, but the actual decoder miscorrects (returns a wrong-coset
+    correction heavier than the fault) at rates the spectra measure directly — e.g. f(1) > 0 on
+    the full 18-code mix — so an empty low-w bin is unresolved statistics, not a structural zero.
     """
     v = reweight_spectrum(spec, [p])
     up = FailureSpectrum(weights=spec.weights, trials=spec.trials,
@@ -218,7 +220,19 @@ The runner importance-samples the failure spectrum `f(w)` (adaptive 'hit N failu
 allocation; the weight window is sized per model from the binomial mass at the top of the `p` grid,
 so the reweighted curves carry no truncation sag anywhere on the grid) and fits the f5 ansatz (onset
 `w₀` left free). The report loads both: the measured spectrum drives every point value below (via
-binomial reweighting), the fit supplies the smooth `LER(p)` curves.""")
+binomial reweighting), the fit supplies the smooth `LER(p)` curves.
+
+**Decoder convention (device calibration).** Every estimator in this report shares ONE decoder
+(Relay-BP, `num_sets=20`) whose priors are frozen from the task's noise model built at the
+**evaluation point** `p* = 5×10⁻⁴` (`DECODER_P` in the runner) — not at the sampling reference
+`p_ref = 0.01`. This is the device convention: a real decoder is calibrated to device rates.
+It matters because wrong-coset *pair* explanations scale ∼p² against a true single fault's ∼p —
+at p_ref-priors, meas-pair explanations of the ×5 mix's weight-1 CZ hooks were up to 7.5× likelier
+than the truth (Bayes-rational misdecodes); calibrated at `p*` the same decoder catches every
+single fault (breakeven `p ≈ 1.3×10⁻³`). `f(w)` remains rate-independent because the decoder is
+*fixed* — but curves above breakeven (the direct-MC anchors, the threshold crossings) describe a
+decoder deliberately miscalibrated for that regime, so expect slightly elevated MC points and
+slightly lower pseudo-thresholds than a per-point-calibrated decoder would give.""")
 
 code(r'''tech1 = {}
 for name in MODELS:
@@ -429,6 +443,96 @@ for name in MODELS:
 print()
 print(section_time("tech2_72", "tech1_72", "mc72"))''')
 
+md(r"""### The measured failure spectra — every one of them, both codes
+
+Every point value, budget fraction, and Λ in §6–§8 is a binomial reweighting of a sampled
+spectrum, and the spectra are where estimator pathologies hide — so *all* of them are plotted
+here (6 models + 5 leave-one-out mixes + 6 asymmetric mixes, per code). Reading guide: the
+dashed line is the full model's tech2 minimum failing weight `D` — the **perfect-decoder**
+floor. Dots *below* it are **decoder-in-the-loop failures**, and their weight tells you which
+kind: from `w₀ = ⌈D/2⌉` up they are irreducible coset ambiguity (any decoder can be forced to
+misjudge them); *below* `w₀` they are decoder artifacts, and this report has eliminated both
+known kinds — BP symmetry traps (fixed by `num_sets=20`) and prior-mismatch misdecodes of
+trace-free hooks (fixed by calibrating the decoder at `p*` instead of `p_ref` — see the §2
+decoder-convention note). A dot reappearing below `w₀` after a decoder or budget change is a
+regression in one of those two categories. The thin dashed curves are the **f5 ansatz** (Eq. 10
+of the paper; stored fits for the models, fitted here on the cached bins for the mixes): it is
+identically zero below its fitted `w₀`, so a dot the dashed curve structurally cannot reach is
+outside the ansatz family — the decoder-floor signature at a glance. **× marks** are sampled
+bins with zero observed failures (drawn at `1/(2T)`): empty low-`w` bins are what the §7.5/§8
+truncation interval prices at `3/T`, so watch them whenever budgets change. The alternating
+high-`w` gaps are the stride-2 tail sampling (see §8.4's `fill_spectrum`).""")
+
+code(r'''# ALL measured spectra in the report — every number in §6–§8 reweights one of these curves,
+# so every one of them gets eyeballed here. Panels: rows = isolated+full models / leave-one-out
+# mixes / asymmetric ×5 mixes; cols = [[18,4,4]] / [[72,4,8]]. Loaded straight from the cache
+# (independent of the per-section cells below; curves whose task is not cached yet are listed
+# as missing instead of crashing the figure). Dots: f(w)/T(w) where failures were observed;
+# × = sampled zero bins (at 1/(2T)); thin dashed curve = f5 ansatz (stored fit where the runner
+# fitted one, else fitted here on the cached bins); dashed vertical = the full model's tech2 D,
+# the PERFECT-decoder floor. The ansatz is identically zero below its fitted w0 — a dot the
+# dashed curve cannot reach is outside the ansatz family, the decoder-floor signature. Check
+# that region whenever the decoder config or sampling budgets change.
+from importance_sampling import failure_spectrum_ansatz, fit_failure_spectrum
+
+def _plot_spec(ax, name, color, label):
+    try:
+        r = load(name)
+    except FileNotFoundError:
+        return label                               # not cached (e.g. stale-decoder quarantine)
+    s = spectrum_of(r)
+    w, f, t = (np.asarray(a) for a in (s.weights, s.failures, s.trials))
+    ax.plot(w[f > 0], (f / t)[f > 0], ".-", ms=4, lw=0.8, color=color, label=label)
+    z = f == 0
+    if z.any():
+        ax.plot(w[z], 0.5 / t[z], "x", color=color, alpha=0.4)
+    try:
+        if "fit" in r:
+            fw = lambda wg, r=r: failure_spectrum_ansatz(
+                wg, a=1.0 - 2.0 ** -r["K"], model=r["fit"]["model"], **r["fit"]["params"])
+        else:
+            fw = fit_failure_spectrum(s, K=r["K"], model="f5", w0=None, f0=None).f
+        wg = np.geomspace(1.0, float(w.max()), 200)
+        y = np.asarray(fw(wg))
+        ax.plot(wg[y > 0], y[y > 0], "--", lw=1.0, alpha=0.55, color=color)
+    except Exception:
+        pass                                       # too-sparse spectrum, no converged fit — dots only
+    return None
+
+ABL_COLOR = {abl: COLORS[ch] for ch, abl in ABL_OF.items()}
+FULLC = COLORS["full symmetric"]
+ROWS = [
+    ("isolated + full models",
+     [(f"tech1__{slug(m)}", COLORS[m], m) for m in MODELS],
+     [(f"tech1_72__{slug(m)}", COLORS[m], m) for m in MODELS]),
+    ("leave-one-out mixes",
+     [(f"tech1_abl__{slug(a)}", ABL_COLOR[a], a) for a in ABLATED],
+     [(f"tech1_72_abl__{slug(a)}", ABL_COLOR[a], a) for a in ABLATED]),
+    ("asymmetric ×5 mixes (meas, meas-idle ×5)",
+     [("asym__full_18", FULLC, "full ×5")] + [(f"asym__{slug(a)}_18", ABL_COLOR[a], a) for a in ABLATED],
+     [("asym__full_72", FULLC, "full ×5")] + [(f"asym__{slug(a)}_72", ABL_COLOR[a], a) for a in ABLATED]),
+]
+D_BY_COL = [load("tech2__full_symmetric")["D"], load("tech2_72__full_symmetric")["D"]]
+
+fig, axes = plt.subplots(3, 2, figsize=(13, 13), sharex="col", sharey=True)
+for r, (row_title, specs18, specs72) in enumerate(ROWS):
+    for c, specs in enumerate((specs18, specs72)):
+        ax = axes[r][c]
+        missing = [m for name, col, lbl in specs if (m := _plot_spec(ax, name, col, lbl))]
+        ax.axvline(D_BY_COL[c], color="k", ls="--", lw=0.8)
+        ax.set_xscale("log"); ax.set_yscale("log")
+        ax.set_title(f"{['[[18,4,4]]', '[[72,4,8]]'][c]} — {row_title}", fontsize=10)
+        ax.grid(alpha=0.3, which="both")
+        ax.legend(fontsize=7)
+        if missing:
+            ax.text(0.03, 0.03, "missing: " + ", ".join(missing), transform=ax.transAxes,
+                    fontsize=7, color="firebrick", va="bottom")
+    axes[r][0].set_ylabel("per-bin failure fraction  f(w)/T(w)")
+axes[0][0].plot([], [], "--", color="gray", lw=1, alpha=0.7, label="f5 ansatz")
+axes[0][0].legend(fontsize=7)
+axes[2][0].set_xlabel("fault weight w"); axes[2][1].set_xlabel("fault weight w")
+plt.tight_layout(); plt.show()''')
+
 code(r'''eps18 = {m: per_round(tech1[m]["LER"], ROUNDS) for m in MODELS}
 eps72 = {m: per_round(tech1_72[m]["LER"], ROUNDS72) for m in MODELS}
 
@@ -498,10 +602,16 @@ the Λ-space mixing — the same story §6 tells in LER-space, now for error sup
 **Reading the signs.** Each contribution is a *difference of two noisy ratios*, so this box now
 carries the full uncertainty budget: `±σ` propagates the binomial errors of all four spectra, and
 the `[lo, hi]` interval additionally spans the **zero-bin truncation** — every sampled-but-empty
-weight bin priced at its rule-of-three upper bound `f(w) < 3/T`. A negative share is only *real*
-(a channel whose faults the big code handles better than the small one) if it stays negative
-within both; otherwise it is an estimator artifact of the under-resolved [[72,4,8]] onset bins —
-rerun the runner with `--boost72` to tighten exactly those.""")
+weight bin priced at its rule-of-three upper bound `f(w) < 3/T`. That pricing deliberately
+includes the bins *below* tech2's D: D is the perfect-decoder floor, but the measured spectra
+show the actual decoder **miscorrects below it** (see the spectrum figure in §7 — `f(1) > 0` on
+the full 18-code mix under a p_ref-calibrated decoder), so an empty low-`w` 72-code bin is
+unresolved statistics, not a structural zero — and at low `p*` the reweighting is most sensitive
+to exactly those bins. A negative share is only *real* (a channel whose faults the big code
+handles better than the small one) if it stays negative within both; otherwise it is an estimator
+artifact of the under-resolved [[72,4,8]] low-weight bins. `--boost72` tightens the onset
+statistics; the truncation interval, however, shrinks only with more trials on the empty low-`w`
+bins themselves (3/T), not with more onset failures.""")
 
 code(r'''tech1_72_abl = {name: dict(spec=spectrum_of(load(f"tech1_72_abl__{slug(name)}"))) for name in ABLATED}
 print(section_time("tech1_72_abl"))''')

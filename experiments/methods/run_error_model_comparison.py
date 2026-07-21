@@ -57,14 +57,53 @@ MC_SCALE = 0.15
 MC_BASE_POINTS = {0.03: 40_000, 0.012: 80_000, 0.008: 120_000, 0.005: 200_000, 0.003: 300_000}
 MC72_POINTS = {0.008: 10_000}                 # one slim anchor for the §7.4 plot
 
-# The ONE decoder for every sampling task (paper-style Relay legs at num_sets=5 — see the
-# notebook's setup note: the speed-tuned default misconverges below the perfect-decoder
-# onset on [[72,4,8]] and fakes Λ<1). Λ compares codes, so both MUST use the same decoder.
-DEC_CFG = dict(gamma0=0.125, pre_iter=80, num_sets=5, set_max_iter=60,
-               gamma_dist_interval=(-0.24, 0.66), stop_nconv=3)
+# The ONE decoder for every sampling task. Λ compares codes, so both MUST use the same
+# decoder. History: the speed-tuned relay default misconverges below the perfect-decoder
+# onset on [[72,4,8]] and fakes Λ<1; num_sets=5 fixed that but still miscorrects 4 of the
+# 1062 single-fault syndromes on the full-symmetric 18-code (f(1) ≈ 5e-4 — a decoder floor,
+# linear in p, that dominates ε18 at p* = 5e-4; 3 of the 4 faults flip no logical at all —
+# the "correction" creates the error). num_sets=20/stop_nconv=5 decodes all 1062 singles
+# correctly at ~1.3x mean decode time (extra relay legs only run on hard syndromes). The ×5
+# asymmetric mix keeps a residual f(1) ≈ 4.7e-3 floor that NO decoder can remove: 9 of its 23
+# stubborn single-fault failures are ML-rational (wrong-coset pair mass 7.5x the true single
+# at the meas-heavy priors) — that part is physics of the operating point, not the decoder.
+DEC_CFG = dict(gamma0=0.125, pre_iter=80, num_sets=20, set_max_iter=60,
+               gamma_dist_interval=(-0.24, 0.66), stop_nconv=5)
 
-def DEC():
-    return RelayBPDecoder(**DEC_CFG)
+# Decoder CALIBRATION point (device convention). Sampling stays at P_REF (adaptive IS needs
+# failures), but the decoder's priors come from the same noise model built at the EVALUATION
+# rate p* — a real decoder is calibrated to device rates, not to a sampling artifact. This
+# matters because wrong-coset PAIR explanations scale ~p² against a true single's ~p: priors
+# at P_REF=0.01 made meas-pair explanations of the ×5-asym CZ hook 7.5× likelier than the
+# truth (a Bayes-rational misdecode); at p*=5e-4 that ratio is 0.38 and the same decoder
+# catches every single fault (breakeven p ≈ 1.3e-3). Flip side, stated in the report: curves
+# ABOVE breakeven (MC anchors, threshold crossings) now describe a decoder deliberately
+# miscalibrated for that regime. f(w) stays rate-independent — the decoder is still FIXED
+# (frozen calibration); it is frozen at p*, not at P_REF.
+DECODER_P = 5e-4
+
+class CalibratedRelayBP(RelayBPDecoder):
+    """Relay-BP whose priors are frozen from a calibration circuit (the task's noise model
+    built at DECODER_P), ignoring the circuit the samplers later hand to setup()."""
+
+    def __init__(self, calib_circuit, **cfg):
+        super().__init__(**cfg)
+        self._calib_circuit = calib_circuit
+        self._calibrated = False
+
+    def setup(self, circuit):
+        if not self._calibrated:
+            super().setup(self._calib_circuit)
+            self._calibrated = True
+
+    def setup_from_matrices(self, check_matrix, error_priors, observables_matrix):
+        if self._calibrated:
+            raise RuntimeError("CalibratedRelayBP: matrix re-setup would discard the frozen "
+                               "decoder_p calibration (sector-projected splitting unsupported)")
+        super().setup_from_matrices(check_matrix, error_priors, observables_matrix)
+
+def DEC(calib_circuit):
+    return CalibratedRelayBP(calib_circuit, **DEC_CFG)
 
 MODELS = {"full symmetric": None, "CZ only": "cz", "meas only": "meas",
           "prep only": "prep", "gate idle": "gate_idle", "meas idle": "meas_idle"}
@@ -236,9 +275,9 @@ def tech2_body(circ):
                 route="Prop.1 (even D)" if D % 2 == 0 else "App.A.6 (odd D)")
 
 
-def spectrum_body(circ, window, is_cfg, seed, with_fit=True):
+def spectrum_body(circ, window, is_cfg, seed, with_fit=True, *, calib):
     W = window(circ)
-    spec = importance_sample_adaptive(circ, DEC(), p_ref=P_REF, p_values=[P_REF],
+    spec = importance_sample_adaptive(circ, DEC(calib), p_ref=P_REF, p_values=[P_REF],
                                       weights=W, seed=seed, **is_cfg).spectrum
     out = dict(spectrum=spectrum_payload(spec), W=W, K=circ.num_observables,
                n_dem=circ.detector_error_model().num_errors, shots=int(sum(spec.trials)))
@@ -249,9 +288,9 @@ def spectrum_body(circ, window, is_cfg, seed, with_fit=True):
     return out
 
 
-def tech3_body(circ, D, LD):
+def tech3_body(circ, D, LD, calib):
     temper, diag = replica_exchange_estimate(
-        circ, DEC(), p_ref=P_REF, p_high=0.015, p_low=1e-4, n_levels=16,
+        circ, DEC(calib), p_ref=P_REF, p_high=0.015, p_low=1e-4, n_levels=16,
         n_walkers=8, local_steps=5, n_sweeps=80, burn_in=20, anchor_shots=4000,
         distance=D, seed=2, single_sector=False,
         mw_supports=[frozenset(s) for s in LD], verbose=False)
@@ -260,16 +299,19 @@ def tech3_body(circ, D, LD):
                 swap_min=float(min(diag["swap_accept"])), swap_max=float(max(diag["swap_accept"])))
 
 
-def direct_mc(circ, shots):
-    d = DEC(); d.setup(circ)
+def direct_mc(circ, shots, dec):
+    dec.setup(circ)                    # no-op once calibrated — priors stay at DECODER_P
     det, obs = circ.compile_detector_sampler().sample(shots, separate_observables=True)
-    f = np.any(d.decode_batch(det) != obs, axis=1); m = float(f.mean())
+    f = np.any(dec.decode_batch(det) != obs, axis=1); m = float(f.mean())
     return m, float((max(m, 1e-9) * (1 - m) / shots) ** 0.5)
 
-def mc_body(make, points):
+def mc_body(make, points, calib):
+    # ONE calibrated decoder across all MC points, matching the spectra/splitting curves it
+    # validates (an anchor decoded with per-point priors would not be the same system).
     out = {}
+    dec = DEC(calib)
     for pp, shots in points.items():
-        m, se = direct_mc(make(pp), shots)
+        m, se = direct_mc(make(pp), shots, dec)
         out[str(pp)] = [m, se, shots]
     return dict(points=out)
 
@@ -404,8 +446,9 @@ def schedule_svg_body():
 # ---------------------------------------------------------------------------
 def run_all(r: Runner, boost72=False):
     is72 = IS72_BOOST if boost72 else IS72
-    base18 = dict(code=CODE18, p_ref=P_REF, rounds=ROUNDS, decoder=DEC_CFG)
-    base72 = dict(code=CODE72, p_ref=P_REF, rounds=ROUNDS72, decoder=DEC_CFG)
+    dec_cfg = dict(**DEC_CFG, calibrated_at=DECODER_P)
+    base18 = dict(code=CODE18, p_ref=P_REF, rounds=ROUNDS, decoder=dec_cfg)
+    base72 = dict(code=CODE72, p_ref=P_REF, rounds=ROUNDS72, decoder=dec_cfg)
     grid = dict(p_grid=P_GRID, window=WINDOW_RULE)
     mc_pts = {p: int(s * MC_SCALE) for p, s in MC_BASE_POINTS.items()}
 
@@ -421,14 +464,17 @@ def run_all(r: Runner, boost72=False):
         t2 = r.task(f"tech2__{slug(name)}", dict(**base18, model=name, budget_per_coset=40),
                     lambda name=name: tech2_body(make_circuit(name, P_REF)))
         r.task(f"tech1__{slug(name)}", dict(**base18, **grid, model=name, **IS18, seed=1),
-               lambda name=name: spectrum_body(make_circuit(name, P_REF), weight_window_18, IS18, seed=1))
+               lambda name=name: spectrum_body(make_circuit(name, P_REF), weight_window_18, IS18, seed=1,
+                                               calib=make_circuit(name, DECODER_P)))
         if t2 is not None:
             r.task(f"tech3__{slug(name)}",
                    dict(**base18, model=name, p_high=0.015, p_low=1e-4, n_levels=16, n_walkers=8,
                         local_steps=5, n_sweeps=80, burn_in=20, anchor_shots=4000, seed=2, D=t2["D"]),
-                   lambda name=name, t2=t2: tech3_body(make_circuit(name, P_REF), t2["D"], t2["LD"]))
+                   lambda name=name, t2=t2: tech3_body(make_circuit(name, P_REF), t2["D"], t2["LD"],
+                                                       make_circuit(name, DECODER_P)))
         r.task(f"mc__{slug(name)}", dict(**base18, model=name, points=mc_pts, mc_scale=MC_SCALE),
-               lambda name=name: mc_body(lambda pp: make_circuit(name, pp), mc_pts))
+               lambda name=name: mc_body(lambda pp: make_circuit(name, pp), mc_pts,
+                                         make_circuit(name, DECODER_P)))
 
     # §5 ablations on the 18-code
     for name in ABLATED:
@@ -436,43 +482,49 @@ def run_all(r: Runner, boost72=False):
                lambda name=name: tech2_body(make_ablated_circuit(name, P_REF)))
         r.task(f"tech1_abl__{slug(name)}", dict(**base18, **grid, ablate=ABLATED[name], **IS18, seed=3),
                lambda name=name: spectrum_body(make_ablated_circuit(name, P_REF), weight_window_18,
-                                               IS18, seed=3))
+                                               IS18, seed=3, calib=make_ablated_circuit(name, DECODER_P)))
         r.task(f"mc_abl__{slug(name)}", dict(**base18, ablate=ABLATED[name], points=mc_pts, mc_scale=MC_SCALE),
-               lambda name=name: mc_body(lambda pp: make_ablated_circuit(name, pp), mc_pts))
+               lambda name=name: mc_body(lambda pp: make_ablated_circuit(name, pp), mc_pts,
+                                         make_ablated_circuit(name, DECODER_P)))
 
     # §7 the [[72,4,8]] sibling
     for name in MODELS:
         r.task(f"tech2_72__{slug(name)}", dict(**base72, model=name),
                lambda name=name: dict(D=compute_distance(make_circuit72(name, P_REF)).distance))
         r.task(f"tech1_72__{slug(name)}", dict(**base72, **grid, model=name, **is72, seed=4),
-               lambda name=name: spectrum_body(make_circuit72(name, P_REF), weight_window_72, is72, seed=4))
+               lambda name=name: spectrum_body(make_circuit72(name, P_REF), weight_window_72, is72, seed=4,
+                                               calib=make_circuit72(name, DECODER_P)))
         r.task(f"mc72__{slug(name)}", dict(**base72, model=name, points=MC72_POINTS),
-               lambda name=name: mc_body(lambda pp: make_circuit72(name, pp), MC72_POINTS))
+               lambda name=name: mc_body(lambda pp: make_circuit72(name, pp), MC72_POINTS,
+                                         make_circuit72(name, DECODER_P)))
 
     # §7.5 leave-one-out on the 72-code (spectra only; the Λ shares read these)
     for name in ABLATED:
         r.task(f"tech1_72_abl__{slug(name)}", dict(**base72, **grid, ablate=ABLATED[name], **is72, seed=5),
                lambda name=name: spectrum_body(make_ablated_circuit72(name, P_REF), weight_window_72,
-                                               is72, seed=5, with_fit=False))
+                                               is72, seed=5, with_fit=False,
+                                               calib=make_ablated_circuit72(name, DECODER_P)))
 
     # §8 the asymmetric operating point (meas, meas_idle x5), full + ablated, both codes.
     # NB: the stride-2 window + the 72-code budgets apply to BOTH codes here (as in the
     # original in-notebook sweep) — the asymmetric mixes are §8-only inputs.
     for label, (cp, rr, window, cfg) in {"18": (P, ROUNDS, weight_window_72, is72),
                                          "72": (BB_72_4_8, ROUNDS72, weight_window_72, is72)}.items():
-        base = dict(code=repr(cp), p_ref=P_REF, rounds=rr, decoder=DEC_CFG, scale=SCALE)
+        base = dict(code=repr(cp), p_ref=P_REF, rounds=rr, decoder=dec_cfg, scale=SCALE)
         r.task(f"asym__full_{label}", dict(**base, **grid, **cfg, seed=6),
                lambda cp=cp, rr=rr, window=window, cfg=cfg:
-                   spectrum_body(make_full_asym(cp, rr, P_REF), window, cfg, seed=6, with_fit=False))
+                   spectrum_body(make_full_asym(cp, rr, P_REF), window, cfg, seed=6, with_fit=False,
+                                 calib=make_full_asym(cp, rr, DECODER_P)))
         for abl_name, ch in ABLATED.items():
             r.task(f"asym__{slug(abl_name)}_{label}", dict(**base, **grid, **cfg, ablate=ch, seed=6),
                    lambda cp=cp, rr=rr, window=window, cfg=cfg, ch=ch:
-                       spectrum_body(make_abl_asym(cp, rr, ch, P_REF), window, cfg, seed=6, with_fit=False))
+                       spectrum_body(make_abl_asym(cp, rr, ch, P_REF), window, cfg, seed=6, with_fit=False,
+                                     calib=make_abl_asym(cp, rr, ch, DECODER_P)))
 
     # manifest: everything the report needs to interpret the files (written last = run complete)
     r.task("config__manifest",
            dict(code18=CODE18, code72=CODE72, p_ref=P_REF, rounds=ROUNDS, rounds72=ROUNDS72,
-                p_grid=P_GRID, mc_scale=MC_SCALE, decoder=DEC_CFG, scale=SCALE, boost72=boost72,
+                p_grid=P_GRID, mc_scale=MC_SCALE, decoder=dec_cfg, scale=SCALE, boost72=boost72,
                 is18=IS18, is72=is72, window=WINDOW_RULE),
            lambda: dict(models=list(MODELS), ablated=list(ABLATED), channels=list(MODELS)[1:],
                         p_star=5e-4, p_lam=5e-4,
