@@ -816,10 +816,12 @@ inv = {m: np.maximum(e72[m], TINY) / np.maximum(e18[m], TINY) for m in L18}
 
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
 for ch in CHANNELS:
-    a, col = ABL_OF[ch], COLORS[ch]
-    axL.plot(p_grid, 1.0 - L18[a] / L18["full"], "-", color=col, lw=2, label=ch)
+    # legend: plain channel names — every curve here is the LEAVE-ONE-OUT (no-i) marginal for
+    # that channel, not the isolated "<ch> only" model the §8.4 panels plot.
+    a, col, lbl = ABL_OF[ch], COLORS[ch], ch.replace(" only", "")
+    axL.plot(p_grid, 1.0 - L18[a] / L18["full"], "-", color=col, lw=2, label=lbl)
     axL.plot(p_grid, 1.0 - L72[a] / L72["full"], "--", color=col, lw=1.2)
-    axR.plot(p_grid, (inv["full"] - inv[a]) / inv["full"], "-", color=col, lw=2, label=ch)
+    axR.plot(p_grid, (inv["full"] - inv[a]) / inv["full"], "-", color=col, lw=2, label=lbl)
 axL.plot([], [], "-", color="gray", label="[[18,4,4]]")
 axL.plot([], [], "--", color="gray", label="[[72,4,8]]")
 for ax, ylab, title in [
