@@ -790,6 +790,50 @@ axR.set_title("per-step suppression DEFICIT on the ×5 ray ($1/\lambda=1$ crossi
 axR.legend(fontsize=8); axR.grid(alpha=0.3, which="both")
 plt.tight_layout(); plt.show()''')
 
+md(r"""### §8.5 — the marginal curves on the ×5 ray: which channel limits what, where
+
+§8.4's panels show channel-**isolated** curves (intrinsic capability; their crossings are the
+per-channel thresholds). These are the leave-one-out **marginal** curves — the §8 budget box and
+Λ box turned into functions of `p`, entirely from the cached asymmetric ablation spectra (no new
+sampling). Left: the LER marginal fraction `1 − LER_no-i/LER_full` per code (solid [[18,4,4]],
+dashed [[72,4,8]]). Right: each channel's share of the suppression deficit,
+`(1/Λ_full − 1/Λ_no-i)/(1/Λ_full)`. The ×5 story at a glance: the small code's error rate is
+meas-type-limited (meas & meas-idle dominate the left panel's solid curves), while the big code —
+and with it the Λ deficit — stays CZ-led (right panel). Curves get noisy where the 72-code
+spectra are onset-limited (low `p`, dashed curves and the right panel); the §8 boxes at `p*`
+carry the honest `±σ` for exactly these quantities — a share is only *real* if it verdicts solid
+there. The dotted vertical line marks `p*`.""")
+
+code(r'''# Marginal curves along the ×5 ray from the asymmetric ablation spectra (no new data):
+# LER fractions per code + 1/Λ deficit shares. The full mix is the reference; the y-range is
+# clamped — low-p excursions beyond it are onset-bin sampling noise, not physics (the §8 boxes
+# at p* carry the ±σ). fill_spectrum: §8.4's stride-2 tail pooling, needed at high p only.
+L18 = {m: reweight_spectrum(fill_spectrum(asym[(m, "18")]), p_grid).P_logical for m in ["full"] + list(ABLATED)}
+L72 = {m: reweight_spectrum(fill_spectrum(asym[(m, "72")]), p_grid).P_logical for m in ["full"] + list(ABLATED)}
+e18 = {m: per_round(L18[m], ROUNDS) for m in L18}
+e72 = {m: per_round(L72[m], ROUNDS72) for m in L72}
+inv = {m: np.maximum(e72[m], TINY) / np.maximum(e18[m], TINY) for m in L18}
+
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
+for ch in CHANNELS:
+    a, col = ABL_OF[ch], COLORS[ch]
+    axL.plot(p_grid, 1.0 - L18[a] / L18["full"], "-", color=col, lw=2, label=ch)
+    axL.plot(p_grid, 1.0 - L72[a] / L72["full"], "--", color=col, lw=1.2)
+    axR.plot(p_grid, (inv["full"] - inv[a]) / inv["full"], "-", color=col, lw=2, label=ch)
+axL.plot([], [], "-", color="gray", label="[[18,4,4]]")
+axL.plot([], [], "--", color="gray", label="[[72,4,8]]")
+for ax, ylab, title in [
+    (axL, "marginal LER fraction  $1 - \\mathrm{LER}_{no\\,i}/\\mathrm{LER}_{full}$",
+     "×5 ray: what limits each code's error rate"),
+    (axR, "share of deficit  $(1/\\Lambda_{full} - 1/\\Lambda_{no\\,i})\\,/\\,(1/\\Lambda_{full})$",
+     "×5 ray: what limits the suppression"),
+]:
+    ax.set_xscale("log"); ax.axhline(0.0, color="gray", lw=0.8)
+    ax.axvline(P_LAM, color="gray", ls=":", lw=1)
+    ax.set_xlabel("base physical error rate p"); ax.set_ylabel(ylab); ax.set_title(title)
+    ax.set_ylim(-1.2, 1.8); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+plt.tight_layout(); plt.show()''')
+
 # ---------------------------------------------------------------------------
 md(r"""## Takeaways
 
