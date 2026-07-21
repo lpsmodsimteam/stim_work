@@ -805,23 +805,47 @@ carry the honest `±σ` for exactly these quantities — a share is only *real* 
 there. The dotted vertical line marks `p*`.""")
 
 code(r'''# Marginal curves along the ×5 ray from the asymmetric ablation spectra (no new data):
-# LER fractions per code + 1/Λ deficit shares. The full mix is the reference; the y-range is
-# clamped — low-p excursions beyond it are onset-bin sampling noise, not physics (the §8 boxes
-# at p* carry the ±σ). fill_spectrum: §8.4's stride-2 tail pooling, needed at high p only.
-L18 = {m: reweight_spectrum(fill_spectrum(asym[(m, "18")]), p_grid).P_logical for m in ["full"] + list(ABLATED)}
-L72 = {m: reweight_spectrum(fill_spectrum(asym[(m, "72")]), p_grid).P_logical for m in ["full"] + list(ABLATED)}
-e18 = {m: per_round(L18[m], ROUNDS) for m in L18}
-e72 = {m: per_round(L72[m], ROUNDS72) for m in L72}
-inv = {m: np.maximum(e72[m], TINY) / np.maximum(e18[m], TINY) for m in L18}
+# LER fractions per code + 1/Λ deficit shares, with ±1σ bands — binomial errors propagated
+# exactly as in the §8 boxes (hypot of the two relative errors; the full-mix/ablation
+# correlation is neglected, same convention). Bands are STATISTICAL only: the zero-bin
+# truncation exposure is not drawn — the boxes' [lo, hi] verdicts carry it. y-range clamped;
+# a band swallowing its curve = noise-dominated region (prep, and everything at low p).
+def _rw(m, code):
+    v = reweight_spectrum(fill_spectrum(asym[(m, code)]), p_grid)
+    return np.asarray(v.P_logical), np.asarray(v.P_logical_se)
+def _eps(L, se, rounds):
+    Lc = np.clip(L, 0.0, 1.0 - 1e-12)
+    g = (1.0 - Lc) ** (1.0 / rounds - 1.0) / rounds
+    return 1.0 - (1.0 - Lc) ** (1.0 / rounds), g * se
+MIX = ["full"] + list(ABLATED)
+L18 = {m: _rw(m, "18") for m in MIX}
+L72 = {m: _rw(m, "72") for m in MIX}
+E18 = {m: _eps(*L18[m], ROUNDS) for m in MIX}
+E72 = {m: _eps(*L72[m], ROUNDS72) for m in MIX}
+INV = {}
+for m in MIX:
+    (e1, s1), (e2, s2) = E18[m], E72[m]
+    iv = np.maximum(e2, TINY) / np.maximum(e1, TINY)
+    INV[m] = (iv, iv * np.hypot(s1 / np.maximum(e1, TINY), s2 / np.maximum(e2, TINY)))
 
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(13, 5))
 for ch in CHANNELS:
     # legend: plain channel names — every curve here is the LEAVE-ONE-OUT (no-i) marginal for
     # that channel, not the isolated "<ch> only" model the §8.4 panels plot.
     a, col, lbl = ABL_OF[ch], COLORS[ch], ch.replace(" only", "")
-    axL.plot(p_grid, 1.0 - L18[a] / L18["full"], "-", color=col, lw=2, label=lbl)
-    axL.plot(p_grid, 1.0 - L72[a] / L72["full"], "--", color=col, lw=1.2)
-    axR.plot(p_grid, (inv["full"] - inv[a]) / inv["full"], "-", color=col, lw=2, label=lbl)
+    for (Lf, sLf), (La, sLa), ls, lw, lab in [
+        (L18["full"], L18[a], "-", 2.0, lbl),
+        (L72["full"], L72[a], "--", 1.2, None),
+    ]:
+        frac = 1.0 - La / Lf
+        sfrac = (La / Lf) * np.hypot(sLa / np.maximum(La, TINY), sLf / np.maximum(Lf, TINY))
+        axL.plot(p_grid, frac, ls, color=col, lw=lw, label=lab)
+        axL.fill_between(p_grid, frac - sfrac, frac + sfrac, color=col, alpha=0.12, lw=0)
+    (ivf, sivf), (iva, siva) = INV["full"], INV[a]
+    share = (ivf - iva) / ivf
+    sshare = np.hypot(sivf, siva) / ivf
+    axR.plot(p_grid, share, "-", color=col, lw=2, label=lbl)
+    axR.fill_between(p_grid, share - sshare, share + sshare, color=col, alpha=0.12, lw=0)
 axL.plot([], [], "-", color="gray", label="[[18,4,4]]")
 axL.plot([], [], "--", color="gray", label="[[72,4,8]]")
 for ax, ylab, title in [
