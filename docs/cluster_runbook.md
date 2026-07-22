@@ -102,5 +102,36 @@ first (sizing probe sets walltime), channels after that op's own partition test.
 ships without: zero-noise determinism + TableauSimulator logical correctness + mini-scale
 three-way (MC/IS/Tech-II) budget agreement.
 
+**W5 local pilot LANDED 2026-07-21** (user-driven; Tech I+II only, adaptive_shots_max=3000):
+`lpu_idle` (fail-fast §2.4 memory: 12 noisy + 1 fault-free cycle, K=12), `joint_pauli` = Ȳ1
+(Tour de Gross App A.1: FULL LPU, one uniform convention — X-vertex/Z-cycle checks on edges,
+|0⟩ edge init, Z readout, two-qubit Bell check with CY→x⁴R, CZ deformation on the X-check
+side; the X̄1/Z̄1 half-LPU branches are Hadamard-duals and CANNOT compose into Ȳ1), and
+`automorphism` (δ=y default: 6-step swap + syndrome cycle per instruction, ×C=10,
+shifted-label detectors, observables through the GF(2)-recomputed δ^C action).
+Configs: `experiments/configs/gross_lpu_{idle,y1}.yaml`, `gross_automorphism.yaml` —
+paper-faithful `lpu_idle_noise: true` (NOT comparable to Wave-1b x1/z1, which predate the
+flag), shared analysis grid p ∈ [1e-4, 5e-3], cheap tuned Relay (num_sets=20/stop_nconv=5;
+runner default 600 = paper settings). Idle noise dominates the deep circuits' fault mass
+(μ(p_ref): idle 175 / automorphism 569 / Y1 979) — hence the capped grid + strided windows.
+Known gaps: Y1 memory observables are the 11-element Z-logical commuting-subgroup basis
+(the paper's K=24 X-rows need a second basis); module-style layering, not the paper's
+12-timestep coloring schedule (fault counts differ from the paper's N). Gate battery at
+landing: p=0 determinism ×5 builders, Tableau Ȳ1-eigenstate + automorphism-action checks,
+DEM builds (idle M=1872 / Y1 M=5456 / automorphism M=7776, all K=12), RelayBP setup,
+single-fault decoder-floor probe, smoke runs. Tests: `tests/test_lpu_circuits.py`.
+**2026-07-22 status:** idle + automorphism floors CLEAN (0/70416, 0/208512) — production
+launched (Tech II on idle: D=10, w0=5, matching the paper's BB(12)-circuit ≤10). Tech II
+dropped from the Y1/automorphism configs (~2 h per BP-OSD decode at 210k columns; the
+paper's Table 2 likewise has no Y1 row — w0 from first observed failure). **Y1 BENCHED:**
+floor probe found 128 weight-1 fails (weighted 4.4e-4) that survive 600-set Relay; root
+cause = 46 same-syndrome different-action single-fault groups, ALL differing in observable
+0 — the outcome bit as framed (MPP ⊕ last-round vertex product) is not closed by the
+detector set (the paper's per-round m̄ chain + return-boundary anchoring is the missing
+structure). Fix in progress. The weight-1 degeneracy scan (full DEM, zero
+same-syndrome-different-action groups) is now a MANDATORY Wave-5 gate for every new
+operation builder — it catches informationally-unresolvable floors that no decoder probe
+can attribute.
+
 ## Wave 6 — double-gross LPU                    open-ended
 Blocked on derive_lpu_layout at (12,12). First job = sizing probe, then mirror W1b→W3.

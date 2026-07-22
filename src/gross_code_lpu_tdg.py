@@ -37,6 +37,7 @@ from bb_code_sim import (
     ErrorModel,
     RelayBPDecoder,
     SimulationResult,
+    find_logical_ops,
     _poly_matrix,
     _gf2_nullspace,
     _gf2_rref,
@@ -741,15 +742,33 @@ def _append_noise(circuit: stim.Circuit, op: str, targets: List[int], p: float) 
         circuit.append(op, targets, p)
 
 
+def _append_idle(circuit: stim.Circuit, pool: Optional[List[int]],
+                 active: Set[int], p: float) -> None:
+    """DEPOLARIZE1(p) on every pool qubit not active in the current sub-layer.
+
+    The fail-fast paper's standard circuit noise model (arXiv:2511.15177 §2.4): a
+    qubit left idle during a gate sub-layer suffers X/Y/Z each with p/3. `pool` is
+    the full set of physical qubits alive in this circuit region (None = disabled),
+    so the same helper serves bare rounds (288 gross qubits) and LPU rounds
+    (gross + edge/vertex/cycle qubits).
+    """
+    if pool is not None and p > 0:
+        idle = [q for q in pool if q not in active]
+        if idle:
+            circuit.append("DEPOLARIZE1", idle, p)
+
+
 def build_bb_syndrome_cycle(
     circuit: stim.Circuit,
     error_model: ErrorModel,
     deformation_edges_per_zcheck: Optional[Dict[int, List[int]]] = None,
     deformation_edges_per_xcheck: Optional[Dict[int, List[int]]] = None,
+    deformation_x_gate: str = "CX",
     reset_data: bool = False,
     reset_ancilla: bool = True,
     skip_x_checks: bool = False,
     skip_z_checks: bool = False,
+    idle_pool: Optional[List[int]] = None,
 ) -> None:
     """
     Append one round of gross-code stabilizer measurement to `circuit`.
@@ -761,6 +780,13 @@ def build_bb_syndrome_cycle(
 
     deformation_edges_per_xcheck: same for X-checks.
 
+    deformation_x_gate: 2-qubit gate coupling the X-ancilla to its deformation
+        edges.  "CX" (default, anc→edge) gives the deformed X-check X-support
+        on the edge — the Hadamard-dual convention of the standalone Z1 branch.
+        "CZ" gives it Z-support (the X-ancilla sits in the |+⟩ frame between
+        its Hadamards, so CZ(anc, edge) picks up Z_e) — the paper's uniform
+        convention, required by the full-LPU Ȳ₁ measurement (Layer 7b).
+
     reset_data: if True, reset all 144 data qubits in |0⟩ at the start.
     reset_ancilla: if True (default), reset all ancilla at the start.
 
@@ -768,6 +794,11 @@ def build_bb_syndrome_cycle(
     syndrome-extraction circuit entirely (no CNOTs, no measurements for that
     ancilla block).  Used during LPU rounds where one check-type would
     anticommute with the vertex checks and randomize them.
+
+    idle_pool: if given, every qubit in the pool that is inactive during a
+    sub-layer picks up DEPOLARIZE1(p_phys) — the fail-fast paper's standard
+    circuit noise model (idle X/Y/Z each p/3). None (default) preserves the
+    original lighter no-idle-noise convention used by the Wave-1b runs.
     """
     p = error_model.p_phys
     pm = error_model.p_meas
@@ -779,16 +810,22 @@ def build_bb_syndrome_cycle(
         data_all = list(range(N_DATA))
         circuit.append("R", data_all)
         _append_noise(circuit, "X_ERROR", data_all, pm)
+        _append_idle(circuit, idle_pool, set(data_all), p)
 
     if reset_ancilla:
+        reset_active: Set[int] = set()
         if not skip_x_checks:
             circuit.append("R", x_anc_all)
             _append_noise(circuit, "X_ERROR", x_anc_all, pm)
             circuit.append("H", x_anc_all)
             _append_noise(circuit, "DEPOLARIZE1", x_anc_all, p)
+            reset_active |= set(x_anc_all)
         if not skip_z_checks:
             circuit.append("R", z_anc_all)
             _append_noise(circuit, "X_ERROR", z_anc_all, pm)
+            reset_active |= set(z_anc_all)
+        if reset_active:
+            _append_idle(circuit, idle_pool, reset_active, p)
 
     # X-check CNOT layers: X-ancilla -> data
     if not skip_x_checks:
@@ -796,8 +833,10 @@ def build_bb_syndrome_cycle(
             flat = [q for pair in layer for q in pair]
             circuit.append("CX", flat)
             _append_noise(circuit, "DEPOLARIZE2", flat, p)
+            _append_idle(circuit, idle_pool, set(flat), p)
 
-        # Deformation X-CNOTs: extra CNOTs from X-ancilla -> edge qubits
+        # Deformation X-couplings: extra CX (Hadamard-dual) or CZ (uniform
+        # convention) from X-ancilla -> edge qubits
         if deformation_edges_per_xcheck:
             extra_flat: List[int] = []
             for xc_id, edge_qs in deformation_edges_per_xcheck.items():
@@ -805,8 +844,9 @@ def build_bb_syndrome_cycle(
                 for eq in edge_qs:
                     extra_flat.extend([xa, eq])
             if extra_flat:
-                circuit.append("CX", extra_flat)
+                circuit.append(deformation_x_gate, extra_flat)
                 _append_noise(circuit, "DEPOLARIZE2", extra_flat, p)
+                _append_idle(circuit, idle_pool, set(extra_flat), p)
 
     if not skip_z_checks:
         # Z-check CNOT layers: data -> Z-ancilla
@@ -814,6 +854,7 @@ def build_bb_syndrome_cycle(
             flat = [q for pair in layer for q in pair]
             circuit.append("CX", flat)
             _append_noise(circuit, "DEPOLARIZE2", flat, p)
+            _append_idle(circuit, idle_pool, set(flat), p)
 
         # Deformation Z-CNOTs: extra CNOTs from edge qubits -> Z-ancilla
         if deformation_edges_per_zcheck:
@@ -825,18 +866,24 @@ def build_bb_syndrome_cycle(
             if extra_flat:
                 circuit.append("CX", extra_flat)
                 _append_noise(circuit, "DEPOLARIZE2", extra_flat, p)
+                _append_idle(circuit, idle_pool, set(extra_flat), p)
 
     # Measure X-ancilla (Hadamard back, then M)
+    meas_active: Set[int] = set()
     if not skip_x_checks:
         circuit.append("H", x_anc_all)
         _append_noise(circuit, "DEPOLARIZE1", x_anc_all, p)
         _append_noise(circuit, "X_ERROR", x_anc_all, pm)
         circuit.append("M", x_anc_all)
+        meas_active |= set(x_anc_all)
 
     # Measure Z-ancilla
     if not skip_z_checks:
         _append_noise(circuit, "X_ERROR", z_anc_all, pm)
         circuit.append("M", z_anc_all)
+        meas_active |= set(z_anc_all)
+    if meas_active:
+        _append_idle(circuit, idle_pool, meas_active, p)
 
 
 # ---------------------------------------------------------------------------
@@ -1104,6 +1151,392 @@ def build_lpu_cycle(
         _append_noise(circuit, "DEPOLARIZE1", cycle_qs, p)
         _append_noise(circuit, "X_ERROR", cycle_qs, pm)
         circuit.append("M", cycle_qs)
+
+
+# ---------------------------------------------------------------------------
+# Layer 7b — Full LPU (both halves at once, uniform convention) for Ȳ₁
+# ---------------------------------------------------------------------------
+#
+# The half-LPU branches above use per-branch conventions (the Z1 branch is the
+# global Hadamard dual of the paper's).  Ȳ₁ needs BOTH halves in the SAME
+# round, sharing the 11 bridge edges and the U_B cycles, so ONE graph-wide
+# edge-basis convention is mandatory.  This layer implements the paper's
+# uniform convention (App. A.4, line 282): checks acting as X on edge qubits
+# sit on vertices, Z checks sit on cycles, all 47 edges are initialized |0⟩,
+# and the return step reads every edge in the Z basis.  Only the vertex→code
+# coupling Pauli varies per check class:
+#   V_l vertex γ : X on code qubit γ ∈ supp(X̄₁)           (CX anc→γ)
+#   V_r vertex γ : Z on code qubit xy·γᵀ ∈ supp(Z̄₁)       (CZ anc, xyγᵀ)
+#   v_Bell       : Y on the overlap qubit x⁴R, coupled ONCE from the left
+#                  Bell qubit (CY l→x⁴R); the right side's x⁹yL (Ȳ₇-side)
+#                  coupling is inactive for Ȳ₁.
+# Deformations (both simultaneously active, each adding Z_e support):
+#   E_l edge → its Z-check via CX(edge→Z-anc)   (as the X1 branch)
+#   E_r edge → its X-check via CZ(X-anc, edge)  (NOT the Hadamard-dual CX of
+#              the standalone Z1 branch)
+# Product identity: every edge qubit has both endpoints among the 23 active
+# vertices, so the edge X's cancel pairwise in the product of all vertex
+# checks; what remains is X on supp(X̄₁)\{x⁴R}, Z on supp(Z̄₁)\{x⁴R}, Y on
+# x⁴R = Ȳ₁ exactly.
+
+
+def _full_vertex_keys() -> List[Tuple[Tuple[str, int, int], str]]:
+    """The 24 VERTEX_QUBIT keys of the full LPU, in measurement order.
+
+    Order follows V_ALL with the Bell pair expanded in place ('l' then 'r'),
+    which makes the corresponding physical qubit indices ascending
+    (VERTEX_QUBIT was assigned by the same walk)."""
+    keys: List[Tuple[Tuple[str, int, int], str]] = []
+    for v in V_ALL:
+        if v == IDENTIFIED_L_SIDE:
+            keys.append((v, 'l'))
+            keys.append((v, 'r'))
+        else:
+            keys.append((v, 's'))
+    assert len(keys) == 24
+    return keys
+
+
+def _vertex_incident_edges_by_kind(
+    v: Tuple[str, int, int],
+) -> Dict[str, List[int]]:
+    """Edge-qubit indices incident to vertex v, split by edge kind L/R/B."""
+    cv = _canonical_vertex(v)
+    out: Dict[str, List[int]] = {'L': [], 'R': [], 'B': []}
+    for e in E_ALL:
+        a, b, _, kind = e
+        if a == cv or b == cv:
+            out[kind].append(EDGE_QUBIT[_frozen_edge_key(e)])
+    return out
+
+
+@dataclass
+class FullLPU:
+    """Bundle of indices for the full LPU (both halves, uniform convention).
+
+    vertex_kind classifies each of the 24 vertex-check qubits:
+      'VL'     — non-Bell V_l vertex: CX to code qubit γ + CX to all incident
+                 edges (E_l + bridge)
+      'VR'     — non-Bell V_r vertex: CZ to code qubit xy·γᵀ + CX to all
+                 incident edges (E_r + bridge)
+      'BELL_L' — left Bell qubit: CY to x⁴R + CX to its 3 E_l edges
+      'BELL_R' — right Bell qubit: CX to its 3 E_r edges (no code coupling
+                 for Ȳ₁ — the x⁹yL link is the Ȳ₇ side)
+    """
+    vertex_keys: List[Tuple[Tuple[str, int, int], str]]
+    vertex_kind: Dict[Tuple[Tuple[str, int, int], str], str]
+    vertex_data: Dict[Tuple[Tuple[str, int, int], str], List[int]]
+    vertex_edges: Dict[Tuple[Tuple[str, int, int], str], List[int]]
+    deformation_z: Dict[int, List[int]]   # z_check_id -> [E_l edge qubit]
+    deformation_x: Dict[int, List[int]]   # x_check_id -> [E_r edge qubit]
+
+
+def _full_lpu() -> FullLPU:
+    """Build the FullLPU descriptor for the Ȳ₁ measurement.
+
+    Reuses the two half-LPU deformation computations: E_l edges deform the 18
+    Z-checks (from the X1 half) and E_r edges deform the 18 X-checks (from the
+    Z1-half math — the (E_r edge → X-check) pairs are not listed in the paper;
+    they follow from the construction and are uniqueness-asserted there)."""
+    n_vl = len(V_L_RAW)
+    vertex_keys = _full_vertex_keys()
+    vertex_kind: Dict[Tuple[Tuple[str, int, int], str], str] = {}
+    vertex_data: Dict[Tuple[Tuple[str, int, int], str], List[int]] = {}
+    vertex_edges: Dict[Tuple[Tuple[str, int, int], str], List[int]] = {}
+
+    for pos, v in enumerate(V_ALL):
+        if v == IDENTIFIED_L_SIDE:
+            by_kind = _vertex_incident_edges_by_kind(v)
+            # "Each side of the Bell pair has degree five": 3 edges + code
+            # qubit + Bell partner (left), 3 edges + [inactive] + partner.
+            assert len(by_kind['L']) == 3 and len(by_kind['R']) == 3, by_kind
+            assert not by_kind['B'], "Bell vertex must not touch bridge edges"
+            kl, kr = (v, 'l'), (v, 'r')
+            vertex_kind[kl] = 'BELL_L'
+            vertex_kind[kr] = 'BELL_R'
+            vertex_data[kl] = [_vertex_data_idx(v)]   # x⁴R, coupled once (CY)
+            vertex_data[kr] = []                      # Ȳ₇-side link inactive
+            vertex_edges[kl] = by_kind['L']
+            vertex_edges[kr] = by_kind['R']
+        else:
+            key = (v, 's')
+            if pos < n_vl:
+                vertex_kind[key] = 'VL'
+                vertex_data[key] = vertex_data_qubits_X1(v)
+            else:
+                vertex_kind[key] = 'VR'
+                vertex_data[key] = vertex_data_qubits_Z1(v)
+            vertex_edges[key] = vertex_incident_edges(v)
+
+    deformation_z = {zc: list(eqs)
+                     for zc, eqs in _half_lpu('X1').deformation_z.items()}
+    deformation_x = {xc: list(eqs)
+                     for xc, eqs in _half_lpu('Z1').deformation_x.items()}
+    # Basis property: each of the 36 deformed gross checks picks up exactly
+    # one edge (18 Z-checks / 18 X-checks, one E_l / E_r edge each).
+    assert len(deformation_z) == 18 and len(deformation_x) == 18
+    assert all(len(v) == 1 for v in deformation_z.values())
+    assert all(len(v) == 1 for v in deformation_x.values())
+
+    return FullLPU(
+        vertex_keys=vertex_keys,
+        vertex_kind=vertex_kind,
+        vertex_data=vertex_data,
+        vertex_edges=vertex_edges,
+        deformation_z=deformation_z,
+        deformation_x=deformation_x,
+    )
+
+
+def build_full_lpu_cycle(
+    circuit: stim.Circuit,
+    error_model: ErrorModel,
+    full: FullLPU,
+    idle_pool: Optional[List[int]] = None,
+) -> None:
+    """Append ONE full-LPU (Ȳ₁) syndrome round to `circuit`.
+
+    Measurement order (187 records): [X-anc 72] [Z-anc 72] [vertex 24, in
+    _full_vertex_keys order] [cycle 19, in U_ALL order].
+
+    Order per round (module-style layering — NOT the paper's 12-timestep
+    graph-coloring schedule; see build_joint_pauli_circuit docstring):
+      1. Deformed BB syndrome: Z-checks pick up Z_e via CX(edge→Z-anc),
+         X-checks pick up Z_e via CZ(X-anc, edge).
+      2. Vertex checks (all 24 ancillas): R; H on all but the right Bell
+         qubit; Bell prep CX(l→r) BEFORE any data gate (App. A.5 constraint);
+         per-check couplings (see FullLPU.vertex_kind); H on all; M all.
+         The Bell CHECK value is the XOR of the two Bell records — each
+         individual Bell record carries a fresh random bit every round (the
+         new Bell pair), so detectors must pair them (23 vertex detectors).
+      3. Cycle checks (all 19): R, CX(edge→cycle-anc), M — Z-type on edges.
+
+    idle_pool: as in build_bb_syndrome_cycle — DEPOLARIZE1(p_phys) on every
+    pool qubit inactive in each sub-layer.
+    """
+    p = error_model.p_phys
+    pm = error_model.p_meas
+
+    # Step 1: deformed gross-code syndrome (both deformations active).
+    build_bb_syndrome_cycle(
+        circuit, error_model,
+        deformation_edges_per_zcheck=full.deformation_z,
+        deformation_edges_per_xcheck=full.deformation_x,
+        deformation_x_gate="CZ",
+        reset_data=False,
+        reset_ancilla=True,
+        idle_pool=idle_pool,
+    )
+
+    # Step 2: vertex checks.
+    v_qs = [VERTEX_QUBIT[k] for k in full.vertex_keys]
+    bell_l = VERTEX_QUBIT[(IDENTIFIED_L_SIDE, 'l')]
+    bell_r = VERTEX_QUBIT[(IDENTIFIED_L_SIDE, 'r')]
+    circuit.append("R", v_qs)
+    _append_noise(circuit, "X_ERROR", v_qs, pm)
+    _append_idle(circuit, idle_pool, set(v_qs), p)
+    # |+⟩ frame everywhere except the right Bell qubit (prepped by CX below).
+    h_qs = [q for q in v_qs if q != bell_r]
+    circuit.append("H", h_qs)
+    _append_noise(circuit, "DEPOLARIZE1", h_qs, p)
+    _append_idle(circuit, idle_pool, set(h_qs), p)
+    # Bell-pair preparation — scheduled before all data gates.
+    circuit.append("CX", [bell_l, bell_r])
+    _append_noise(circuit, "DEPOLARIZE2", [bell_l, bell_r], p)
+    _append_idle(circuit, idle_pool, {bell_l, bell_r}, p)
+    # Couplings, one gate group per check (module-style layering).
+    for key in full.vertex_keys:
+        anc = VERTEX_QUBIT[key]
+        kind = full.vertex_kind[key]
+        gate_groups: List[Tuple[str, List[int]]] = []
+        if kind == 'VL':
+            flat: List[int] = []
+            for dq in full.vertex_data[key]:
+                flat += [anc, dq]
+            for eq in full.vertex_edges[key]:
+                flat += [anc, eq]
+            gate_groups.append(("CX", flat))
+        elif kind == 'VR':
+            czf: List[int] = []
+            for dq in full.vertex_data[key]:
+                czf += [anc, dq]
+            gate_groups.append(("CZ", czf))
+            cxf: List[int] = []
+            for eq in full.vertex_edges[key]:
+                cxf += [anc, eq]
+            gate_groups.append(("CX", cxf))
+        elif kind == 'BELL_L':
+            gate_groups.append(("CY", [anc, full.vertex_data[key][0]]))
+            cxf = []
+            for eq in full.vertex_edges[key]:
+                cxf += [anc, eq]
+            gate_groups.append(("CX", cxf))
+        else:  # 'BELL_R'
+            cxf = []
+            for eq in full.vertex_edges[key]:
+                cxf += [anc, eq]
+            gate_groups.append(("CX", cxf))
+        for gname, flat in gate_groups:
+            if flat:
+                circuit.append(gname, flat)
+                _append_noise(circuit, "DEPOLARIZE2", flat, p)
+                _append_idle(circuit, idle_pool, set(flat), p)
+    # Back to the Z frame (Bell pair: both sides measured in the X basis).
+    circuit.append("H", v_qs)
+    _append_noise(circuit, "DEPOLARIZE1", v_qs, p)
+    _append_idle(circuit, idle_pool, set(v_qs), p)
+    _append_noise(circuit, "X_ERROR", v_qs, pm)
+    circuit.append("M", v_qs)
+    _append_idle(circuit, idle_pool, set(v_qs), p)
+
+    # Step 3: cycle checks (Z-type on edges), all 19 at once.
+    cycle_qs = [CYCLE_QUBIT[c] for c in range(len(U_ALL))]
+    flat = []
+    for c_idx in range(len(U_ALL)):
+        cq = CYCLE_QUBIT[c_idx]
+        for eq in CYCLE_EDGES[c_idx]:
+            flat += [eq, cq]
+    circuit.append("R", cycle_qs)
+    _append_noise(circuit, "X_ERROR", cycle_qs, pm)
+    _append_idle(circuit, idle_pool, set(cycle_qs), p)
+    circuit.append("CX", flat)
+    _append_noise(circuit, "DEPOLARIZE2", flat, p)
+    _append_idle(circuit, idle_pool, set(flat), p)
+    _append_noise(circuit, "X_ERROR", cycle_qs, pm)
+    circuit.append("M", cycle_qs)
+    _append_idle(circuit, idle_pool, set(cycle_qs), p)
+
+
+def _op_vec(L_part: List[Tuple[int, int]],
+            R_part: List[Tuple[int, int]]) -> np.ndarray:
+    """Length-144 GF(2) support vector of a monomial-list Pauli operator."""
+    v = np.zeros(N_DATA, dtype=np.uint8)
+    for (i, j) in L_part:
+        v[Mon('L', i, j).qubit_index()] ^= 1
+    for (i, j) in R_part:
+        v[Mon('R', i, j).qubit_index()] ^= 1
+    return v
+
+
+def _lpu_correction_paths() -> Dict[Tuple[Tuple[str, int, int], str], Set[int]]:
+    """BFS spanning-tree paths in the LPU graph, v_Bell split into its two
+    physical check qubits.
+
+    Returns, for every one of the 24 vertex-check keys, the edge-qubit set of
+    the tree path from a fixed root.  Used to express the paper's software
+    correction (App. A.4 step 4: paths μ_v with ∏ m_e deciding a Pauli-frame
+    update) as measurement records in the observables.  The Bell vertex must
+    be split because its Ȳ₁ code coupling (Y on x⁴R) hangs off the LEFT Bell
+    qubit only: a correction path terminating at v_Bell has to arrive through
+    an E_l edge of the left side, not an E_r edge of the right.
+    """
+    keys = _full_vertex_keys()
+
+    def node_of(v: Tuple[str, int, int], kind: str):
+        cv = _canonical_vertex(v)
+        if cv == IDENTIFIED_L_SIDE:
+            assert kind != 'B', "Bell vertex must not touch bridge edges"
+            return (cv, 'l' if kind == 'L' else 'r')
+        return (cv, 's')
+
+    adj: Dict[Tuple[Tuple[str, int, int], str],
+              List[Tuple[Tuple[Tuple[str, int, int], str], int]]] = {
+        k: [] for k in keys}
+    for e in E_ALL:
+        a, b, _, kind = e
+        eq = EDGE_QUBIT[_frozen_edge_key(e)]
+        na, nb = node_of(a, kind), node_of(b, kind)
+        adj[na].append((nb, eq))
+        adj[nb].append((na, eq))
+
+    root = keys[0]
+    paths: Dict[Tuple[Tuple[str, int, int], str], Set[int]] = {root: set()}
+    queue = [root]
+    while queue:
+        n = queue.pop(0)
+        for (m, eq) in adj[n]:
+            if m not in paths:
+                paths[m] = paths[n] ^ {eq}
+                queue.append(m)
+    assert len(paths) == 24, "split-Bell LPU graph must be connected"
+    return paths
+
+
+def _y1_observable_recipe() -> Tuple[
+    List[int], List[Tuple[np.ndarray, List[int]]]
+]:
+    """The 11 Z-type memory observables of the Ȳ₁ circuit, with corrections.
+
+    Returns (S, recipe) where S is the set of canonical logical classes k with
+    Z̄ₖ anticommuting with X(p,q), and recipe is a list of 11 pairs
+    (Z-support vector over the 144 data qubits, list of edge qubits whose
+    return-step Z-readouts m_e must be XOR'd in).
+
+    Basis choice (documented deviation from the coset-test recipe): the
+    canonical find_logical_ops basis is NOT aligned with the LPU polynomials —
+    empirically X(p,q) ≡ X̄₂X̄₃ and Z(xy·sᵀ, xy·rᵀ) ≡ Z̄₃Z̄₇Z̄₈Z̄₉ mod
+    stabilizers, so no single canonical class "matches Z̄₁".  The right
+    invariant object is the index-2 subgroup of Z-type logicals commuting with
+    Ȳ₁ (⇔ even overlap with supp(X̄₁)); we take the basis
+    {Z̄ₖ : k ∉ S} ∪ {Z̄_{s₀}Z̄_s : s ∈ S \\ {s₀}} — 11 operators, reducing to
+    the spec's "the 11 Z̄ₖ with k ≠ k*" whenever |S| = 1.
+
+    Correction (why the edge records are needed): the gauging measurement is
+    only Ȳ₁ up to the App.-A.4 software Pauli update, whose X-type part flips
+    Z-basis readouts.  A logical W in the subgroup anticommutes with the
+    individual vertex checks at T_W = {V_l vertices with γ ∈ supp(W)} ∪
+    {Bell-left if x⁴R ∈ supp(W)} (|T_W| even); the deformed representative
+    W·Z(E_W) with ∂E_W = T_W commutes with everything, and the edge factors
+    become the recorded m_e at the return readout.
+    """
+    log_Z, _ = _tdg_logical_ops()
+    v_x1 = _op_vec(P, Q)
+    S = [k for k in range(12) if int(log_Z[k] @ v_x1) % 2 == 1]
+    assert S, "X(p,q) must be a nontrivial logical"
+
+    ops: List[np.ndarray] = [log_Z[k] for k in range(12) if k not in S]
+    for s in S[1:]:
+        ops.append((log_Z[S[0]] ^ log_Z[s]).astype(np.uint8))
+    assert len(ops) == 11
+
+    paths = _lpu_correction_paths()
+    full = _full_lpu()
+    recipe: List[Tuple[np.ndarray, List[int]]] = []
+    for w in ops:
+        supp = set(int(q) for q in np.where(w)[0])
+        e_set: Set[int] = set()
+        n_ends = 0
+        for key in full.vertex_keys:
+            if (full.vertex_kind[key] in ('VL', 'BELL_L')
+                    and full.vertex_data[key][0] in supp):
+                e_set ^= paths[key]
+                n_ends += 1
+        assert n_ends % 2 == 0, "W must commute with Ȳ₁ (even overlap)"
+        recipe.append((w, sorted(e_set)))
+    return S, recipe
+
+
+class _MeasTracker:
+    """Absolute-index measurement bookkeeping for the framing builders.
+
+    add(k) reserves k just-appended measurement records and returns the
+    absolute index of the first; rec(abs_idx) converts an absolute index to a
+    stim rec target relative to the CURRENT end of the record.  Using absolute
+    indices removes the per-round negative-offset arithmetic that made the
+    original _build_circuit detector code error-prone.
+    """
+
+    def __init__(self) -> None:
+        self.n = 0
+
+    def add(self, k: int) -> int:
+        start = self.n
+        self.n += k
+        return start
+
+    def rec(self, abs_idx: int) -> stim.GateTarget:
+        assert 0 <= abs_idx < self.n
+        return stim.target_rec(abs_idx - self.n)
 
 
 # ---------------------------------------------------------------------------
@@ -1484,33 +1917,688 @@ def build_logical_z1_circuit(
 # rest of the framework (configs, SLURM launcher, techniques) needs no changes.
 # ---------------------------------------------------------------------------
 
+_LOGICAL_OPS_CACHE: Optional[Tuple[List[np.ndarray], List[np.ndarray]]] = None
+
+
+def _tdg_logical_ops() -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """The 12 canonical (Z̄ₖ, X̄ₖ) logical pairs of the gross code, tdg convention.
+
+    Computed once from build_HX_HZ() via bb_code_sim.find_logical_ops and cached.
+    NB the ordering of the 12 classes is find_logical_ops' canonical GF(2) choice —
+    it does NOT automatically align class 0 with the LPU's hardcoded X̄₁/Z̄₁ (P/Q,
+    Z1_L/Z1_R). Builders that must name "logical 1" (the Y̅1 measurement) align via
+    a stabilizer-coset membership test at build time.
+    """
+    global _LOGICAL_OPS_CACHE
+    if _LOGICAL_OPS_CACHE is None:
+        H_X, H_Z = build_HX_HZ()
+        log_Z, log_X = find_logical_ops(H_X, H_Z)
+        log_Z = [np.asarray(v, dtype=np.uint8) for v in log_Z]
+        log_X = [np.asarray(v, dtype=np.uint8) for v in log_X]
+        assert len(log_Z) == 12 and len(log_X) == 12, "gross code has k=12"
+        for k in range(12):
+            assert not np.any((H_X @ log_Z[k]) % 2), "Z̄ must commute with X-checks"
+            assert not np.any((H_Z @ log_X[k]) % 2), "X̄ must commute with Z-checks"
+        for j in range(12):
+            for k in range(12):
+                par = int(np.dot(log_Z[j].astype(int), log_X[k].astype(int)) % 2)
+                assert par == (1 if j == k else 0), "canonical anticommutation violated"
+        _LOGICAL_OPS_CACHE = (log_Z, log_X)
+    return _LOGICAL_OPS_CACHE
+
+
+def build_idle_memory_circuit(
+    error_model: ErrorModel,
+    rounds: int = 12,
+    idle_noise: bool = False,
+) -> stim.Circuit:
+    """Gross-code Z-memory (idle) experiment in the tdg convention.
+
+    Fail-fast §2.4 recipe: |0̄⟩ init → `rounds` NOISY QEC cycles → ONE fault-free
+    cycle → noiseless transversal Z measurement of all data. Detectors: round-0
+    Z-checks deterministic ([0,s,0]); later rounds compare both check types to the
+    previous round ([1,s,r] X / [0,s,r] Z); final data reconstruction of each
+    Z-check tagged [8,s,rounds+1]. K=12 observables = the canonical Z̄ₖ parities
+    over the final data measurements (this module's A/B convention — deliberately
+    NOT bb_code_sim's Bravyi-convention memory circuit, so results compare
+    apples-to-apples with the LPU operation circuits built here).
+
+    idle_noise: emit DEPOLARIZE1(p) on inactive gross qubits per sub-layer
+    (fail-fast standard circuit noise model).
+    """
+    pool = list(range(N_GROSS)) if idle_noise else None
+
+    circuit = stim.Circuit()
+    data_all = list(range(N_DATA))
+    circuit.append("R", data_all)
+    _append_noise(circuit, "X_ERROR", data_all, error_model.p_meas)
+
+    def _round_detectors(r: int) -> None:
+        if r == 0:
+            for s in range(N_C):
+                off = _z_anc_rec_offsets_from_end_of_round(2 * N_C)[s]
+                circuit.append("DETECTOR", [stim.target_rec(off)], [0, s, 0])
+        else:
+            for s in range(N_C):
+                cur_x = _x_anc_rec_offsets_from_end_of_round()[s]
+                circuit.append("DETECTOR",
+                               [stim.target_rec(cur_x), stim.target_rec(cur_x - 2 * N_C)],
+                               [1, s, r])
+            for s in range(N_C):
+                cur_z = _z_anc_rec_offsets_from_end_of_round(2 * N_C)[s]
+                circuit.append("DETECTOR",
+                               [stim.target_rec(cur_z), stim.target_rec(cur_z - 2 * N_C)],
+                               [0, s, r])
+
+    for r in range(rounds):
+        build_bb_syndrome_cycle(circuit, error_model, reset_data=False,
+                                reset_ancilla=True, idle_pool=pool)
+        circuit.append("TICK")
+        _round_detectors(r)
+
+    # One fault-free cycle (the fail-fast paper's memory-experiment convention).
+    build_bb_syndrome_cycle(circuit, ErrorModel(0.0, 0.0), reset_data=False,
+                            reset_ancilla=True)
+    circuit.append("TICK")
+    _round_detectors(rounds)
+
+    # Noiseless transversal Z readout of all data qubits.
+    circuit.append("M", data_all)
+
+    # Reconstruction detectors: each Z-check's data-support parity vs its last
+    # (fault-free-cycle) ancilla outcome.
+    _, H_Z = build_HX_HZ()
+    for s in range(N_C):
+        recs = [stim.target_rec(-(N_DATA - q)) for q in np.where(H_Z[s])[0]]
+        recs.append(stim.target_rec(_z_anc_rec_offsets_from_end_of_round(2 * N_C)[s] - N_DATA))
+        circuit.append("DETECTOR", recs, [8, s, rounds + 1])
+
+    log_Z, _ = _tdg_logical_ops()
+    for k in range(12):
+        recs = [stim.target_rec(-(N_DATA - q)) for q in np.where(log_Z[k])[0]]
+        circuit.append("OBSERVABLE_INCLUDE", recs, k)
+
+    return circuit
+
+
+# ---------------------------------------------------------------------------
+# Layer 8b — Shift-automorphism circuit (App. A.2 / Sec. 2 of the paper)
+# ---------------------------------------------------------------------------
+#
+# A shift automorphism δ = xᵃyᵇ acts as the global monomial permutation
+# (L,α)→(L,δα), (R,α)→(R,δα); checks co-shift the same way.  It is NOT a
+# relabeling: each data qubit is physically moved through an adjacent check
+# ancilla with two 2-CNOT swaps (data→check, then check→new data), the
+# vacated qubit measured (deterministic |0⟩ — free error detection) after
+# each hop.  6 swap timesteps + one full syndrome cycle = 14 timesteps per
+# instruction.  Routes (which check type carries which side) follow the
+# polynomial structure: an X-check β is adjacent to L_β and L_{βδ} whenever
+# δ is a monomial-ratio of A (δ ∈ {A_iA_jᵀ}); the mirrored statement with
+# B / Z-checks covers the other basic shifts.
+
+# Route table: delta exponents (di, dj), and which check type moves the L / R
+# side.  δ=y is an A-route (L via X-checks, R via Z-checks); δ=x is a B-route
+# (L via Z-checks, R via X-checks).  X-check routes use ancilla label β
+# (adjacent to data β and βδ); Z-check routes use ancilla label βδ (same
+# adjacency, from the transposed polynomial).
+_SHIFT_ROUTES: Dict[str, Tuple[Tuple[int, int], str, str]] = {
+    'y': ((0, 1), 'X', 'Z'),
+    'x': ((1, 0), 'Z', 'X'),
+}
+
+_SHIFT_ACTION_CACHE: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+
+
+def _shift_data_perm(shift: str, power: int = 1) -> np.ndarray:
+    """Length-144 permutation: data-qubit q's CONTENT moves to perm[q] under
+    δ^power (δ = the monomial of `shift`)."""
+    (di, dj), _, _ = _SHIFT_ROUTES[shift]
+    perm = np.zeros(N_DATA, dtype=np.int64)
+    for side in ('L', 'R'):
+        for i in range(L_):
+            for j in range(M_):
+                perm[Mon(side, i, j).qubit_index()] = (
+                    Mon(side, i + di * power, j + dj * power).qubit_index())
+    return perm
+
+
+def _shift_check_perm(shift: str) -> List[int]:
+    """Length-72 permutation of check labels: check α ↦ check δα (both check
+    types shift identically — the circulant structure is δ-invariant)."""
+    (di, dj), _, _ = _SHIFT_ROUTES[shift]
+    perm = [0] * N_C
+    for i in range(L_):
+        for j in range(M_):
+            perm[i * M_ + j] = ((i + di) % L_) * M_ + (j + dj) % M_
+    return perm
+
+
+def _shift_swap_layers(shift: str) -> Tuple[
+    List[Tuple[int, int]], List[Tuple[int, int]],
+    List[Tuple[int, int]], List[Tuple[int, int]],
+]:
+    """The four CNOT layers (t1, t2, t4, t5) of one shift instruction.
+
+    Each data qubit β hops β → anc(β) → βδ, where anc is the route ancilla
+    (X-check β or Z-check βδ, per _SHIFT_ROUTES).  t1/t2 swap data into the
+    (|0⟩-reset) ancilla, t4/t5 swap it out into the δ-shifted data position.
+    All four layers are 144 disjoint CNOT pairs (both check types are used,
+    one per side).  Pairs are (control, target).
+    """
+    (di, dj), l_via, r_via = _SHIFT_ROUTES[shift]
+    t1: List[Tuple[int, int]] = []
+    t2: List[Tuple[int, int]] = []
+    t4: List[Tuple[int, int]] = []
+    t5: List[Tuple[int, int]] = []
+    for side, via in (('L', l_via), ('R', r_via)):
+        for i in range(L_):
+            for j in range(M_):
+                src = Mon(side, i, j).qubit_index()
+                dst = Mon(side, i + di, j + dj).qubit_index()
+                anc = (_x_check_idx(i, j) if via == 'X'
+                       else _z_check_idx(i + di, j + dj))
+                t1.append((src, anc))
+                t2.append((anc, src))
+                t4.append((anc, dst))
+                t5.append((dst, anc))
+    return t1, t2, t4, t5
+
+
+def shift_logical_action(shift: str, power: int = 1
+                         ) -> Tuple[np.ndarray, np.ndarray]:
+    """Logical action (A_Z, A_X) ∈ GF(2)^{12×12} of δ^power on the canonical
+    logical classes: pushed Z̄ₖ ≡ ∏ⱼ Z̄ⱼ^{A_Z[k,j]} · stabilizers (same for X).
+
+    Recomputed directly from the qubit permutation by GF(2) reduction against
+    the canonical basis + stabilizer rowspace — the paper's printed A_x/A_y
+    matrices (App. A.2) leave the row/column and X̄-vs-Z̄ convention unstated,
+    so they are not trusted here.  Asserts the paper-stated group structure:
+    both generators have order 6, and the symplectic pairing is preserved
+    (A_X A_Zᵀ = 1)."""
+    if shift not in _SHIFT_ROUTES:
+        raise ValueError(f"shift must be one of {sorted(_SHIFT_ROUTES)}, "
+                         f"got {shift!r}")
+    if shift not in _SHIFT_ACTION_CACHE:
+        log_Z, log_X = _tdg_logical_ops()
+        perm = _shift_data_perm(shift, 1)
+
+        def _act(logs: List[np.ndarray], H: np.ndarray) -> np.ndarray:
+            basis = np.vstack([np.vstack(logs), H]).astype(np.uint8).T
+            A = np.zeros((12, 12), dtype=np.uint8)
+            for k in range(12):
+                v = np.zeros(N_DATA, dtype=np.uint8)
+                v[perm[np.where(logs[k])[0]]] = 1
+                x = _gf2_solve(basis, v)
+                assert x is not None, "pushed logical left the logical group"
+                A[k] = x[:12]
+            return A
+
+        Az = _act(log_Z, H_Z)
+        Ax = _act(log_X, H_X)
+        eye = np.eye(12, dtype=np.uint8)
+        Mp = eye.copy()
+        order = 0
+        for t in range(1, 7):
+            Mp = (Mp @ Az) % 2
+            if np.array_equal(Mp, eye):
+                order = t
+                break
+        assert order == 6, f"shift {shift!r}: logical order {order}, expected 6"
+        assert np.array_equal((Ax @ Az.T) % 2, eye), "symplectic pairing broken"
+        _SHIFT_ACTION_CACHE[shift] = (Az, Ax)
+
+    Az, Ax = _SHIFT_ACTION_CACHE[shift]
+
+    def _mpow(A: np.ndarray, t: int) -> np.ndarray:
+        R = np.eye(12, dtype=np.uint8)
+        for _ in range(t % 6):
+            R = (R @ A) % 2
+        return R
+
+    return _mpow(Az, power), _mpow(Ax, power)
+
+
 def build_automorphism_circuit(
     error_model: ErrorModel,
+    shift: str = "y",
     C: int = 10,
     d_init: int = 12,
+    idle_noise: bool = False,
 ) -> stim.Circuit:
-    """SEAM: gross-code automorphism (logical-Clifford-by-permutation) circuit via the LPU.
+    """Gross-code shift-automorphism benchmark circuit (paper Sec. 2 / A.2).
 
-    Not yet implemented. The half-LPU machinery (HalfLPU, build_lpu_cycle, _build_circuit) is the
-    intended foundation — an automorphism applies a qubit/check permutation realised through the
-    same gauging-measurement rounds. Implement here and register in CIRCUIT_BUILDERS['automorphism'].
+    Structure (the paper's C-repeat benchmark convention, App. A.6: LER is the
+    reported failure probability divided by C):
+      |0̄⟩ init → d_init bare rounds → C shift instructions → d_init bare
+      rounds → noiseless transversal Z readout.
+    One shift instruction = the 6-timestep swap circuit (t1/t2: swap every
+    data qubit into its route check ancilla; t3: MR the vacated data,
+    deterministic-0 detectors; t4/t5: swap into the δ-shifted position; t6: MR
+    the vacated check ancillas, deterministic-0 detectors) + one bare syndrome
+    cycle whose detectors compare check δα (post) with check α (pre) — the
+    stabilizer labels co-shift with the data.
+
+    K = 12 observables: the canonical Z̄ₖ supports pushed through δ^C over the
+    final data readout.  The logical action itself is δ-order-6 and verified
+    at build time via shift_logical_action (GF(2) recomputation — the paper's
+    A_x/A_y matrix convention is not trusted).
+
+    Choices the paper leaves open (App./sec refs in the module header spec):
+    which δ was benchmarked (default 'y' here; 'x' = the other route class),
+    which A/B terms route each swap (ours: the (0,0) and δ terms), CNOT
+    directions, and MR vs M+tracked-frame for the mid-instruction
+    measurements (ours: MR).  The layering is module-style, not the paper's
+    14-timestep table, so fault-location counts differ from tab. N=483840.
+
+    idle_noise: DEPOLARIZE1(p_phys) on inactive gross qubits per sub-layer
+    (fail-fast standard circuit noise model); pool = the 288 gross qubits.
     """
-    raise NotImplementedError("build_automorphism_circuit: LPU automorphism circuit not yet built")
+    if shift not in _SHIFT_ROUTES:
+        raise ValueError(f"shift must be one of {sorted(_SHIFT_ROUTES)}, "
+                         f"got {shift!r}")
+    assert C >= 1 and d_init >= 1
+    shift_logical_action(shift)  # build-time order-6 / symplectic assertions
+
+    p = error_model.p_phys
+    pm = error_model.p_meas
+    pool = list(range(N_GROSS)) if idle_noise else None
+    t1, t2, t4, t5 = _shift_swap_layers(shift)
+    cperm = _shift_check_perm(shift)
+    x_anc_all = list(range(X_ANC_BASE, X_ANC_BASE + N_C))
+    z_anc_all = list(range(Z_ANC_BASE, Z_ANC_BASE + N_C))
+    anc_all = x_anc_all + z_anc_all
+    data_all = list(range(N_DATA))
+
+    circuit = stim.Circuit()
+    trk = _MeasTracker()
+    circuit.append("R", data_all)
+    _append_noise(circuit, "X_ERROR", data_all, pm)
+
+    # ---- d_init bare rounds ([0,s,0] Z-init; [1,s,r]/[0,s,r] compares) ----
+    prev_x: Optional[int] = None
+    prev_z: Optional[int] = None
+    for r in range(d_init):
+        build_bb_syndrome_cycle(circuit, error_model, reset_data=False,
+                                reset_ancilla=True, idle_pool=pool)
+        x0 = trk.add(N_C)
+        z0 = trk.add(N_C)
+        circuit.append("TICK")
+        if r == 0:
+            for s in range(N_C):
+                circuit.append("DETECTOR", [trk.rec(z0 + s)], [0, s, 0])
+        else:
+            for s in range(N_C):
+                circuit.append("DETECTOR",
+                               [trk.rec(x0 + s), trk.rec(prev_x + s)],
+                               [1, s, r])
+            for s in range(N_C):
+                circuit.append("DETECTOR",
+                               [trk.rec(z0 + s), trk.rec(prev_z + s)],
+                               [0, s, r])
+        prev_x, prev_z = x0, z0
+
+    # ---- C shift instructions ----
+    for c in range(C):
+        # t0: reset the route ancillas (left collapsed by the last syndrome M)
+        circuit.append("R", anc_all)
+        _append_noise(circuit, "X_ERROR", anc_all, pm)
+        _append_idle(circuit, pool, set(anc_all), p)
+        # t1, t2: swap data → check ancilla (data vacated to |0⟩)
+        for layer in (t1, t2):
+            flat = [q for pair in layer for q in pair]
+            circuit.append("CX", flat)
+            _append_noise(circuit, "DEPOLARIZE2", flat, p)
+            _append_idle(circuit, pool, set(flat), p)
+        # t3: MR the vacated data qubits — deterministic-0 detectors [9,q,c]
+        _append_noise(circuit, "X_ERROR", data_all, pm)
+        circuit.append("MR", data_all)
+        d3 = trk.add(N_DATA)
+        _append_noise(circuit, "X_ERROR", data_all, pm)   # reset fault
+        _append_idle(circuit, pool, set(data_all), p)
+        for q in range(N_DATA):
+            circuit.append("DETECTOR", [trk.rec(d3 + q)], [9, q, c])
+        # t4, t5: swap check ancilla → δ-shifted data position
+        for layer in (t4, t5):
+            flat = [q for pair in layer for q in pair]
+            circuit.append("CX", flat)
+            _append_noise(circuit, "DEPOLARIZE2", flat, p)
+            _append_idle(circuit, pool, set(flat), p)
+        # t6: MR the vacated check ancillas — deterministic-0 detectors [10,q,c]
+        _append_noise(circuit, "X_ERROR", anc_all, pm)
+        circuit.append("MR", anc_all)
+        d6 = trk.add(2 * N_C)
+        _append_noise(circuit, "X_ERROR", anc_all, pm)    # reset fault
+        _append_idle(circuit, pool, set(anc_all), p)
+        for q in range(2 * N_C):
+            circuit.append("DETECTOR", [trk.rec(d6 + q)], [10, q, c])
+        circuit.append("TICK")
+        # syndrome cycle: compare check δα (post-shift) with check α (pre)
+        build_bb_syndrome_cycle(circuit, error_model, reset_data=False,
+                                reset_ancilla=True, idle_pool=pool)
+        xc = trk.add(N_C)
+        zc = trk.add(N_C)
+        circuit.append("TICK")
+        for s in range(N_C):
+            circuit.append("DETECTOR",
+                           [trk.rec(xc + cperm[s]), trk.rec(prev_x + s)],
+                           [11, s, c])
+        for s in range(N_C):
+            circuit.append("DETECTOR",
+                           [trk.rec(zc + cperm[s]), trk.rec(prev_z + s)],
+                           [12, s, c])
+        prev_x, prev_z = xc, zc
+
+    # ---- d_init trailing bare rounds (plain compares [6,s,r]/[7,s,r]) ----
+    for r in range(d_init):
+        build_bb_syndrome_cycle(circuit, error_model, reset_data=False,
+                                reset_ancilla=True, idle_pool=pool)
+        x0 = trk.add(N_C)
+        z0 = trk.add(N_C)
+        circuit.append("TICK")
+        for s in range(N_C):
+            circuit.append("DETECTOR",
+                           [trk.rec(x0 + s), trk.rec(prev_x + s)], [6, s, r])
+        for s in range(N_C):
+            circuit.append("DETECTOR",
+                           [trk.rec(z0 + s), trk.rec(prev_z + s)], [7, s, r])
+        prev_x, prev_z = x0, z0
+
+    # ---- noiseless transversal Z readout + reconstruction detectors ----
+    circuit.append("M", data_all)
+    f0 = trk.add(N_DATA)
+    for s in range(N_C):
+        recs = [trk.rec(f0 + int(q)) for q in np.where(H_Z[s])[0]]
+        recs.append(trk.rec(prev_z + s))
+        circuit.append("DETECTOR", recs, [8, s, d_init + 1])
+
+    # ---- K = 12 observables: Z̄ₖ supports pushed through δ^C ----
+    dperm = _shift_data_perm(shift, power=C)
+    log_Z, _ = _tdg_logical_ops()
+    for k in range(12):
+        recs = [trk.rec(f0 + int(dperm[q])) for q in np.where(log_Z[k])[0]]
+        circuit.append("OBSERVABLE_INCLUDE", recs, k)
+
+    return circuit
 
 
 def build_joint_pauli_circuit(
     error_model: ErrorModel,
-    operators: str = "X1X2",
+    operators: str = "Y1",
     C: int = 10,
     d_init: int = 12,
+    include_memory_observables: bool = True,
+    idle_noise: bool = False,
 ) -> stim.Circuit:
-    """SEAM: joint multi-logical Pauli measurement (e.g. X̄₁X̄₂) via the LPU.
+    """Ȳ₁ in-module measurement through the FULL LPU (paper "BB(12)-circuit-Y1").
 
-    Not yet implemented. Generalises build_logical_x1/z1 (single-logical measurement) to a joint
-    measurement of several logicals through one gauging-measurement protocol. Implement here and
-    register in CIRCUIT_BUILDERS['joint_pauli'].
+    Ȳ₁ (the Hermitian version of X̄₁Z̄₁, overlapping on the single qubit x⁴R)
+    is one of the ⟨X̄₁,X̄₇,Z̄₁,Z̄₇⟩ elements that need BOTH LPU halves at once:
+    all 23 vertices (24 check qubits — v_Bell is a physical pair), all 47
+    edges, all 19 cycles, with the uniform convention and per-class couplings
+    of Layer 7b (V_l: CX to γ; V_r: CZ to xy·γᵀ; Bell-left: CY to x⁴R; both
+    deformations Z_e-type simultaneously).  The standalone Z1 branch's
+    Hadamard-dual convention CANNOT be composed here — the two halves share
+    bridge edges and U_B cycles, so one graph-wide edge basis must hold.
+
+    Framing (minimal module framing — differs from the paper's k-Bell-pair
+    harness with K = 23, so rates are not directly comparable):
+      |0⟩^144 init → one NOISELESS MPP of the Ȳ₁ Pauli string (reference
+      bit, anchored BEFORE any noise — see below) → one NOISELESS encoding
+      round (state-prep anchor for the X-check chain, the paper's
+      noiseless-prep harness) → d_init noisy bare rounds → edges |0⟩ →
+      C noisy full-LPU rounds → Z-basis edge readout + 1 bare return cycle →
+      d_init trailing bare rounds → noiseless transversal Z readout of all
+      data.
+
+    Detectors (all deterministic at p=0):
+      [0/1,s,r]  bare rounds (round 0 = the noiseless encoding round:
+                 Z-checks single-record; X compares start at r=1 against
+                 its noise-free records);
+      [4/5,s,c]  LPU BB checks vs previous round — ALL 144 including the 36
+                 deformed ones (boundary c=0 valid because the added Z_e
+                 support acts on just-initialized |0⟩ edges);
+      [2,u,c]    cycle checks (round 1: deterministic single-record; c=C:
+                 cycle(C) ⊕ XOR of m_e around the cycle);
+      [3,v,c]    the 23 vertex checks from round 2 on (round-1 outcomes are
+                 individually random; v_Bell contributes ONE detector over
+                 its two records per round — each Bell record alone carries a
+                 fresh random bit);
+      [6/7,s,r]  return boundary (bare(return) ⊕ deformed(C) ⊕ its m_e for
+                 deformed checks) and trailing compares;
+      [8,s,·]    final-data Z-check reconstruction (idle-builder pattern).
+
+    Observables: 0 = MPP reference ⊕ the 24 vertex records of the LAST LPU
+    round (the per-round vertex detectors make any round equivalent; round-1
+    vertex outcomes deliberately carry no single-round detector, so obs 0 is
+    linearly independent of the detector set).  The reference MPP must sit
+    BEFORE every noise location: a noiseless MPP inside a noisy syndrome
+    window is informationally unresolvable — for each of the 23 Ȳ₁-string
+    support qubits, the 2 single-qubit Paulis anticommuting with the string
+    give one fault before the MPP (flips reference AND gauged outcome — obs 0
+    unchanged) and one after it (flips the gauged outcome only — obs 0 flips)
+    with IDENTICAL detector footprints: 46 single-fault degenerate pairs that
+    would floor the outcome bit for any decoder.  Anchored at t=0, every
+    mechanism is "after", obs 0 has a well-defined action for all faults, and
+    the framing matches the idle/automorphism anchoring (noiseless init →
+    noiseless final readout).  The t=0 anchor in turn requires the noiseless
+    encoding round (see the in-body comment): the stretch between the anchor
+    and the first ANCHORED X-check round must contain no noise, or Z-type
+    faults there flip the Ȳ₁ frame without a localizable syndrome start.
+    If include_memory_observables,
+    observables 1..11 span the Z-type logical subgroup commuting with Ȳ₁ over
+    the final data readout, each XOR'd with its m_e correction records — see
+    _y1_observable_recipe for the basis choice (the canonical classes are NOT
+    aligned with the LPU polynomials: X(p,q) ≡ X̄₂X̄₃) and the path
+    construction (the paper's App.-A.4 software correction).
+
+    Scheduling: module-style layering (one gate group per check per round),
+    NOT the paper's 12-timestep graph-coloring schedule — fault-location
+    counts differ from the paper's N = 400117 / M = 2144.  C = 10 default is
+    the paper's choice (C = d_circ upper bound, not d = 12).
+
+    idle_noise: DEPOLARIZE1(p_phys) on inactive pool qubits per sub-layer;
+    pool = 288 gross qubits in bare rounds, all 378 (gross + 47 edge + 24
+    vertex + 19 cycle) during LPU rounds.
     """
-    raise NotImplementedError("build_joint_pauli_circuit: LPU joint-Pauli circuit not yet built")
+    if operators != "Y1":
+        raise NotImplementedError(
+            f"build_joint_pauli_circuit: only operators='Y1' is implemented "
+            f"(got {operators!r})")
+    assert C >= 1 and d_init >= 1
+    full = _full_lpu()
+
+    p = error_model.p_phys
+    pm = error_model.p_meas
+    bare_pool = list(range(N_GROSS)) if idle_noise else None
+    lpu_pool = list(range(N_TOTAL_QUBITS)) if idle_noise else None
+
+    circuit = stim.Circuit()
+    trk = _MeasTracker()
+    data_all = list(range(N_DATA))
+    circuit.append("R", data_all)
+
+    # ---- noiseless MPP reference of the Ȳ₁ Pauli string ----
+    # Y on the overlap qubit x⁴R, X on the other 11 supp(X̄₁) qubits, Z on the
+    # other 11 supp(Z̄₁) qubits — the exact operator the vertex product equals.
+    # Placed BEFORE the reset noise, i.e. before ANY noise location: the
+    # projection commutes with every stabilizer check, so the Ȳ₁ eigenvalue it
+    # pins survives the bare rounds and p=0 determinism of obs 0 holds; any
+    # later placement leaves a noisy window straddling the reference and makes
+    # the 46 straddle-pair mechanisms unresolvable (see docstring).
+    yq = _vertex_data_idx(IDENTIFIED_L_SIDE)
+    x1_rest = sorted(set(int(q) for q in np.where(_op_vec(P, Q))[0]) - {yq})
+    z1_rest = sorted(set(int(q) for q in np.where(_op_vec(Z1_L, Z1_R))[0])
+                     - {yq})
+    assert len(x1_rest) == 11 and len(z1_rest) == 11
+    mpp_targets = [stim.target_y(yq)]
+    for q in x1_rest:
+        mpp_targets += [stim.target_combiner(), stim.target_x(q)]
+    for q in z1_rest:
+        mpp_targets += [stim.target_combiner(), stim.target_z(q)]
+    circuit.append("MPP", mpp_targets)
+    mpp_idx = trk.add(1)
+    circuit.append("TICK")
+
+    _append_noise(circuit, "X_ERROR", data_all, pm)
+
+    # ---- noiseless encoding round (anchors the X-check chain) ----
+    # Projects |0…0⟩ into the code space with zero fault locations — the
+    # paper's noiseless-state-prep harness (App. A.6).  Without it, the first
+    # NOISY round's X-check outcomes are the first ever measured (individually
+    # random), so a mid-round Z-type fault only shows the compares of its
+    # already-coupled checks: on a Ȳ₁-support qubit it is then syndrome-
+    # identical to the same-position fault on a partner qubit of the same
+    # X-check (or to a partial-X-stabilizer ancilla fault) while differing in
+    # obs 0 — 58 unresolvable single-fault pairs.  With the anchor, the
+    # post-fault couplings of the same round fire against the noise-free
+    # round-0 records and the signatures separate.
+    build_bb_syndrome_cycle(circuit, ErrorModel(p_phys=0.0, p_meas=0.0),
+                            reset_data=False, reset_ancilla=True)
+    prev_x = trk.add(N_C)
+    prev_z = trk.add(N_C)
+    circuit.append("TICK")
+    for s in range(N_C):
+        circuit.append("DETECTOR", [trk.rec(prev_z + s)], [0, s, 0])
+
+    # ---- d_init noisy bare rounds ----
+    for r in range(1, d_init + 1):
+        build_bb_syndrome_cycle(circuit, error_model, reset_data=False,
+                                reset_ancilla=True, idle_pool=bare_pool)
+        x0 = trk.add(N_C)
+        z0 = trk.add(N_C)
+        circuit.append("TICK")
+        for s in range(N_C):
+            circuit.append("DETECTOR",
+                           [trk.rec(x0 + s), trk.rec(prev_x + s)],
+                           [1, s, r])
+        for s in range(N_C):
+            circuit.append("DETECTOR",
+                           [trk.rec(z0 + s), trk.rec(prev_z + s)],
+                           [0, s, r])
+        prev_x, prev_z = x0, z0
+
+    # ---- edge init: all 47 in |0⟩ (uniform convention — no |+⟩ anywhere) ----
+    edge_all = sorted(EDGE_QUBIT.values())
+    circuit.append("R", edge_all)
+    _append_noise(circuit, "X_ERROR", edge_all, pm)
+    _append_idle(circuit, lpu_pool, set(edge_all), p)
+
+    # ---- C noisy full-LPU rounds ----
+    n_v = len(full.vertex_keys)       # 24 records / round
+    n_u = len(U_ALL)                  # 19 records / round
+    # Vertex detector groups: one per LOGICAL check (23) — the Bell pair's two
+    # records enter a single detector together.
+    v_groups: List[List[int]] = []
+    for i, key in enumerate(full.vertex_keys):
+        if full.vertex_kind[key] == 'BELL_L':
+            pass  # grouped with BELL_R below
+        elif full.vertex_kind[key] == 'BELL_R':
+            v_groups.append([i - 1, i])
+        else:
+            v_groups.append([i])
+    assert len(v_groups) == 23
+
+    x_lpu: List[int] = []
+    z_lpu: List[int] = []
+    v_lpu: List[int] = []
+    u_lpu: List[int] = []
+    for c in range(C):
+        build_full_lpu_cycle(circuit, error_model, full, idle_pool=lpu_pool)
+        x_lpu.append(trk.add(N_C))
+        z_lpu.append(trk.add(N_C))
+        v_lpu.append(trk.add(n_v))
+        u_lpu.append(trk.add(n_u))
+        circuit.append("TICK")
+        px = x_lpu[c - 1] if c else prev_x
+        pz = z_lpu[c - 1] if c else prev_z
+        for s in range(N_C):
+            circuit.append("DETECTOR",
+                           [trk.rec(x_lpu[c] + s), trk.rec(px + s)],
+                           [4, s, c])
+        for s in range(N_C):
+            circuit.append("DETECTOR",
+                           [trk.rec(z_lpu[c] + s), trk.rec(pz + s)],
+                           [5, s, c])
+        if c == 0:
+            for u in range(n_u):
+                circuit.append("DETECTOR", [trk.rec(u_lpu[0] + u)], [2, u, 0])
+        else:
+            for u in range(n_u):
+                circuit.append("DETECTOR",
+                               [trk.rec(u_lpu[c] + u),
+                                trk.rec(u_lpu[c - 1] + u)],
+                               [2, u, c])
+            for g, grp in enumerate(v_groups):
+                recs = [trk.rec(v_lpu[c] + i) for i in grp]
+                recs += [trk.rec(v_lpu[c - 1] + i) for i in grp]
+                circuit.append("DETECTOR", recs, [3, g, c])
+
+    # ---- return: Z-basis readout of all 47 edges ----
+    _append_noise(circuit, "X_ERROR", edge_all, pm)
+    circuit.append("M", edge_all)
+    e0 = trk.add(len(edge_all))
+    _append_idle(circuit, lpu_pool, set(edge_all), p)
+    circuit.append("TICK")
+    edge_rec = {q: e0 + i for i, q in enumerate(edge_all)}
+
+    # ---- 1 bare return cycle + boundary detectors ----
+    build_bb_syndrome_cycle(circuit, error_model, reset_data=False,
+                            reset_ancilla=True, idle_pool=bare_pool)
+    xr = trk.add(N_C)
+    zr = trk.add(N_C)
+    circuit.append("TICK")
+    for s in range(N_C):
+        recs = [trk.rec(xr + s), trk.rec(x_lpu[C - 1] + s)]
+        recs += [trk.rec(edge_rec[e]) for e in full.deformation_x.get(s, [])]
+        circuit.append("DETECTOR", recs, [6, s, 0])
+    for s in range(N_C):
+        recs = [trk.rec(zr + s), trk.rec(z_lpu[C - 1] + s)]
+        recs += [trk.rec(edge_rec[e]) for e in full.deformation_z.get(s, [])]
+        circuit.append("DETECTOR", recs, [7, s, 0])
+    # "all cycles should satisfy ∏ m_e = +1": cycle(C) ⊕ XOR of its m_e.
+    for u in range(n_u):
+        recs = [trk.rec(u_lpu[C - 1] + u)]
+        recs += [trk.rec(edge_rec[e]) for e in CYCLE_EDGES[u]]
+        circuit.append("DETECTOR", recs, [2, u, C])
+    prev_x, prev_z = xr, zr
+
+    # ---- d_init trailing bare rounds ----
+    for r in range(1, d_init + 1):
+        build_bb_syndrome_cycle(circuit, error_model, reset_data=False,
+                                reset_ancilla=True, idle_pool=bare_pool)
+        x0 = trk.add(N_C)
+        z0 = trk.add(N_C)
+        circuit.append("TICK")
+        for s in range(N_C):
+            circuit.append("DETECTOR",
+                           [trk.rec(x0 + s), trk.rec(prev_x + s)], [6, s, r])
+        for s in range(N_C):
+            circuit.append("DETECTOR",
+                           [trk.rec(z0 + s), trk.rec(prev_z + s)], [7, s, r])
+        prev_x, prev_z = x0, z0
+
+    # ---- noiseless transversal Z readout + reconstruction detectors ----
+    circuit.append("M", data_all)
+    f0 = trk.add(N_DATA)
+    for s in range(N_C):
+        recs = [trk.rec(f0 + int(q)) for q in np.where(H_Z[s])[0]]
+        recs.append(trk.rec(prev_z + s))
+        circuit.append("DETECTOR", recs, [8, s, d_init + 1])
+
+    # ---- observable 0: MPP reference ⊕ 24 vertex records of the last round ----
+    obs0 = [trk.rec(mpp_idx)]
+    obs0 += [trk.rec(v_lpu[C - 1] + i) for i in range(n_v)]
+    circuit.append("OBSERVABLE_INCLUDE", obs0, 0)
+
+    # ---- observables 1..11: commuting Z-logical memory, m_e-corrected ----
+    if include_memory_observables:
+        _, recipe = _y1_observable_recipe()
+        for k, (w, e_list) in enumerate(recipe, start=1):
+            recs = [trk.rec(f0 + int(q)) for q in np.where(w)[0]]
+            recs += [trk.rec(edge_rec[e]) for e in e_list]
+            circuit.append("OBSERVABLE_INCLUDE", recs, k)
+
+    return circuit
 
 
 # ---------------------------------------------------------------------------
@@ -1660,6 +2748,62 @@ if __name__ == "__main__":
         print(f"  DEM num_detectors    = {dem.num_detectors}")
         print(f"  DEM num_observables  = {dem.num_observables}")
         print()
+
+    for branch_name, builder in [
+        ("Ȳ₁ joint-Pauli (full LPU)",
+         lambda em, **kw: build_joint_pauli_circuit(em, **kw)),
+        ("shift-y automorphism",
+         lambda em, **kw: build_automorphism_circuit(em, **kw)),
+    ]:
+        print("="*68)
+        print(f"Building {branch_name} circuit (p=0)...")
+        c0 = builder(em0)
+        print(f"  num_qubits      = {c0.num_qubits}")
+        print(f"  num_detectors   = {c0.num_detectors}")
+        print(f"  num_observables = {c0.num_observables}")
+        print(f"  num_measurements= {c0.num_measurements}")
+        print(f"Sampling 100 shots at p=0...")
+        sampler = c0.compile_detector_sampler()
+        dets, obs = sampler.sample(100, separate_observables=True)
+        n_det_fired = int(dets.sum())
+        n_obs_set = int(obs.sum())
+        print(f"  total detector firings across all 100 shots = {n_det_fired}")
+        print(f"  observable flips across 100 shots           = {n_obs_set}")
+        assert n_det_fired == 0, (
+            f"At p=0 no detector should fire, got {n_det_fired}"
+        )
+        assert n_obs_set == 0, (
+            f"At p=0 no observable should flip, got {n_obs_set}"
+        )
+        print()
+
+        print(f"Building {branch_name} circuit (p=1e-3)...")
+        c1 = builder(em1)
+        print(f"Building DEM for {branch_name} at p=1e-3...")
+        dem = c1.detector_error_model(decompose_errors=False)
+        n_mechs = sum(1 for inst in dem if inst.type == "error")
+        print(f"  num error mechanisms = {n_mechs}")
+        print(f"  DEM num_detectors    = {dem.num_detectors}")
+        print(f"  DEM num_observables  = {dem.num_observables}")
+        if "joint" in branch_name.lower() or "Ȳ" in branch_name:
+            # Paper's BB(12)-circuit-Y1 row: M=2144, Ñ=79591 distinct
+            # mechanisms, N=400117 fault locations (different framing +
+            # schedule — ours has 2·d_init extra bare rounds and module-style
+            # layering, so a direct match is not expected).
+            print(f"  paper comparison: M {dem.num_detectors}/2144 = "
+                  f"{dem.num_detectors/2144:.2f}x, "
+                  f"mechanisms {n_mechs}/79591 = {n_mechs/79591:.2f}x")
+        print()
+
+    print("="*68)
+    print("Verifying shift-automorphism logical actions (order-6 group)...")
+    for sh in ('y', 'x'):
+        Az, Ax = shift_logical_action(sh)
+        Az6, _ = shift_logical_action(sh, power=6)
+        assert np.array_equal(Az6, np.eye(12, dtype=np.uint8))
+        print(f"  δ={sh}: A_Z nontrivial={not np.array_equal(Az, np.eye(12, dtype=np.uint8))}, "
+              f"A_Z⁶=1 OK, A_X A_Zᵀ=1 OK")
+    print()
 
     print("="*68)
     print("All checks passed.")

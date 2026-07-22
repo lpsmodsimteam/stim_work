@@ -82,13 +82,26 @@ def test_unknown_config_key_rejected(tmp_path):
         assert "not_a_field" in str(e)
 
 
-def test_circuit_stub_raises():
-    cfg = er.Config.smoke(code_name="bb144", experiment="automorphism")
-    try:
-        er.build_circuit(cfg)
-        assert False, "expected NotImplementedError from the automorphism seam"
-    except NotImplementedError as e:
-        assert "automorphism" in str(e)
+def test_lpu_circuit_kinds_build():
+    """The former automorphism/joint_pauli stubs are now real builders wired to
+    the cfg.lpu_* fields; tiny C/d_init keeps this seconds-scale."""
+    for kind, expect_k in (("joint_pauli", 12), ("automorphism", 12)):
+        cfg = er.Config.smoke(code_name="bb144", experiment=kind,
+                              lpu_C=2, lpu_d_init=2)
+        circuit = er.build_circuit(cfg)
+        assert circuit.num_observables == expect_k
+        assert circuit.num_detectors > 0
+
+
+def test_joint_pauli_config_knobs():
+    """lpu_include_memory_obs drops the 11 memory observables; lpu_shift routes
+    the automorphism (None -> builder default 'y')."""
+    cfg = er.Config.smoke(code_name="bb144", experiment="joint_pauli",
+                          lpu_C=2, lpu_d_init=2, lpu_include_memory_obs=False)
+    assert er.build_circuit(cfg).num_observables == 1
+    cfg_x = er.Config.smoke(code_name="bb144", experiment="automorphism",
+                            lpu_C=2, lpu_d_init=2, lpu_shift="x")
+    assert er.build_circuit(cfg_x).num_observables == 12
 
 
 def test_bb6_smoke_all_techniques(tmp_path):

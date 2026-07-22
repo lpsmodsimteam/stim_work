@@ -1,0 +1,37 @@
+# Wave 5: gross-code IDLE baseline in the tdg convention (fail-fast §2.4 memory recipe:
+# 12 noisy QEC cycles + 1 fault-free cycle + noiseless transversal readout, K=12 Z̄ observables).
+# Paper-faithful idle depolarizing is ON (lpu_idle_noise) — NOT comparable to the Wave-1b
+# lpu_x1/z1 runs, which predate the flag. Decoder: the tuned cheap Relay ensemble (num_sets=20,
+# stop_nconv=5 — deliberately below the paper's 600-leg config; the single-fault decoder-floor
+# probe is a mandatory pre-launch gate). Technique II runs on the full DEM without symmetry
+# (LPU-family circuits lack the toric perms; expect an odd-D bound and an unpinned onset).
+# Analysis grid capped at p_hi = p_ref for cross-case comparability with the Y1/automorphism
+# configs (their idle-noise-dominated windows force the cap; one shared grid for the ladder).
+# weights_range frozen from the sizing probe: mu(p_hi=5e-3) = 175 -> w_hi = 228.
+label: gross_lpu_idle
+code_name: bb144
+experiment: lpu_idle
+decoder_name: relay
+techniques: [II, IS, I]
+
+p_ref: 0.005
+p_lo: 1.0e-4
+p_hi: 0.005
+rounds: 12
+lpu_idle_noise: true
+ansatz_model: f5
+pin_onset: false
+
+relay_num_sets: 20
+relay_stop_nconv: 5
+
+mw_single_sector: false
+mw_use_symmetry: false
+mw_max_trials: 500
+mw_workers: 16
+
+weights_range: [1, 228]
+adaptive: true
+adaptive_failures: 20
+adaptive_shots_min: 4
+adaptive_shots_max: 3000

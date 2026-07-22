@@ -1,0 +1,39 @@
+# Wave 5: shift-automorphism instruction on the gross code (Tour de Gross §2.2/App A.1):
+# each instruction = the 6-step swap circuit (data→check→shifted-data, MR'd vacated qubits
+# with deterministic-0 detectors) + one syndrome cycle with shifted-label detectors; C=10
+# consecutive instructions (per-instruction LER convention: divide by C downstream).
+# δ = y by default (paper does not name its benchmark shift); K=12 observables = Z̄k pushed
+# through δ^C with the GF(2)-recomputed logical action. Paper-faithful idle noise ON;
+# sizing probe: mu(p_ref=5e-3)=569 -> w_hi ≈ 664 at p_hi = p_ref (grid capped like the Y1
+# config). Decoder: tuned cheap Relay (20 sets) — single-fault floor probe before launch.
+# NOTE (2026-07-22): Technique II dropped — same full-DEM BP-OSD wall as the Y1 config
+# (~2 h/decode at 208k columns). w0 = first observed failure weight; onset fitted, not pinned.
+label: gross_automorphism
+code_name: bb144
+experiment: automorphism
+decoder_name: relay
+techniques: [IS, I]
+
+p_ref: 0.005
+p_lo: 1.0e-4
+p_hi: 0.005
+lpu_C: 10
+lpu_d_init: 12
+lpu_idle_noise: true
+ansatz_model: f5
+pin_onset: false
+
+relay_num_sets: 20
+relay_stop_nconv: 5
+
+mw_single_sector: false
+mw_use_symmetry: false
+mw_max_trials: 500
+mw_workers: 16
+
+weights_range: [1, 664]
+weight_stride: 4
+adaptive: true
+adaptive_failures: 20
+adaptive_shots_min: 4
+adaptive_shots_max: 3000

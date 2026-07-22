@@ -159,8 +159,12 @@ def test_k4_lambda_regression():
     inv = inv_lambda_stats(spec_of("tech1__full_symmetric"), spec_of("tech1_72__full_symmetric"),
                            5e-4, rounds_small=2, rounds_large=4)
     lam = 1.0 / inv.value
-    # value pinned from the 2026-07-09 report execution (Λ_full = 102 ± 53); regression band
-    # is deliberately tight — the cache is frozen data, so only CODE changes can move this.
-    assert lam == pytest.approx(102.0, rel=0.02)
-    assert 1.0 / (inv.value + 2 * inv.se) < 60           # ±σ is large: the known noise floor
+    # Value pinned from the 2026-07-21 cache: full resample under the calibrated decoder
+    # (num_sets=20, priors frozen at DECODER_P=5e-4 — see run_error_model_comparison.py and
+    # commit 86f0abab). The p_ref-prior era pin was Λ_full = 102 ± 53 (2026-07-09); the
+    # calibrated decoder removes the low-weight miscorrection floor, moving Λ_full to ~2377.
+    # The cache is frozen BETWEEN decoder-convention migrations — re-pin only on a deliberate
+    # resample, never to accommodate a code change.
+    assert lam == pytest.approx(2377.0, rel=0.02)
+    assert 1.0 / (inv.value + 2 * inv.se) > 1000         # σ no longer noise-floor-dominated
     assert inv.lo <= inv.value <= inv.hi

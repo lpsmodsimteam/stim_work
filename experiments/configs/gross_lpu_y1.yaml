@@ -1,0 +1,45 @@
+# Wave 5: Ȳ1 in-module joint-Pauli measurement on the gross code (fail-fast "BB(12)-circuit-Y1",
+# circuit schedule per Tour de Gross App A.1: full LPU, uniform X-vertex/Z-cycle convention,
+# two-qubit Bell check with CY→x⁴R, CZ deformation on the X-check side). K=12 observables:
+# outcome bit + an 11-element basis of the Z-logical subgroup commuting with Ȳ1 (the paper's
+# K=24 X-action rows are not stim-expressible in a single basis — documented gap).
+# Paper-faithful idle noise ON; it dominates the fault mass of this deep circuit
+# (mu(p_ref=5e-3) ≈ 979), so: analysis grid capped at p_hi = p_ref and the weight window is
+# strided — sub-onset bins are all-zero at the 3000-shot cap regardless, and the f5 fit only
+# needs density through the transition band. Sizing probe: mu(5e-3)=979 -> w_hi ≈ 1110.
+# Decoder: tuned cheap Relay (20 sets) — run the single-fault decoder-floor probe before launch.
+# NOTE (2026-07-22): Technique II dropped — a single BP-OSD decode on this 212k-column full
+# DEM takes ~1.5-2 h (smoke stalled at L(D) trial 6/50 after 10 h). The paper made the same
+# call: Table 2 has no Y1 row; its w0 came from splitting. w0 here = first observed failure
+# weight in the IS sweep; the f5 fit leaves the onset free (pin_onset: false).
+label: gross_lpu_y1
+code_name: bb144
+experiment: joint_pauli
+decoder_name: relay
+techniques: [IS, I]
+
+p_ref: 0.005
+p_lo: 1.0e-4
+p_hi: 0.005
+lpu_C: 10
+lpu_d_init: 12
+lpu_operators: "Y1"
+lpu_idle_noise: true
+lpu_include_memory_obs: true
+ansatz_model: f5
+pin_onset: false
+
+relay_num_sets: 20
+relay_stop_nconv: 5
+
+mw_single_sector: false
+mw_use_symmetry: false
+mw_max_trials: 500
+mw_workers: 16
+
+weights_range: [1, 1110]
+weight_stride: 6
+adaptive: true
+adaptive_failures: 20
+adaptive_shots_min: 4
+adaptive_shots_max: 3000

@@ -10,7 +10,7 @@ This generalises the proven BB(6) Figure-10 driver (``experiments/bravyi/bb6_fig
 code/circuit/decoder-agnostic runner via three registries:
 
   * CODES            — bivariate-bicycle codes (bb6, bb144 active; bb18, bb288 seams)
-  * CIRCUIT_BUILDERS — circuit kinds (memory active; lpu_x1/lpu_z1 wired; automorphism/joint_pauli stubs)
+  * CIRCUIT_BUILDERS — circuit kinds (memory, lpu_x1/lpu_z1/lpu_idle, joint_pauli (Y1), automorphism)
   * DECODERS         — decoders (relay active; bposd, pymatching seams)
 
 The three "fail-fast" techniques are library calls:
@@ -83,20 +83,42 @@ def _build_lpu_circuit(cfg: "Config", operator: str):
     return fn(em, C=cfg.lpu_C, d_init=cfg.lpu_d_init)
 
 
-def _circuit_stub(kind: str):
-    def _stub(cfg: "Config"):
-        raise NotImplementedError(
-            f"circuit kind {kind!r} is a registered seam — implement build_{kind}_circuit in "
-            f"src/gross_code_lpu_tdg.py and wire it into CIRCUIT_BUILDERS.")
-    return _stub
+def _build_lpu_idle_circuit(cfg: "Config"):
+    # Gross-code memory in the tdg convention (fail-fast §2.4: rounds noisy + 1 fault-free
+    # cycle) — the apples-to-apples idle baseline for the LPU operation circuits.
+    import gross_code_lpu_tdg as tdg
+    em = ErrorModel(p_phys=cfg.p_ref, p_meas=cfg.p_ref * cfg.p_meas_factor)
+    rounds = cfg.rounds if cfg.rounds is not None else 12
+    return tdg.build_idle_memory_circuit(em, rounds=rounds, idle_noise=cfg.lpu_idle_noise)
+
+
+def _build_joint_pauli_circuit(cfg: "Config"):
+    # Full-LPU in-module joint-Pauli measurement (Y1: both halves, uniform convention).
+    import gross_code_lpu_tdg as tdg
+    em = ErrorModel(p_phys=cfg.p_ref, p_meas=cfg.p_ref * cfg.p_meas_factor)
+    return tdg.build_joint_pauli_circuit(
+        em, operators=cfg.lpu_operators, C=cfg.lpu_C, d_init=cfg.lpu_d_init,
+        include_memory_observables=cfg.lpu_include_memory_obs,
+        idle_noise=cfg.lpu_idle_noise)
+
+
+def _build_automorphism_circuit(cfg: "Config"):
+    # Shift-automorphism benchmark (C repeated shift instructions, paper A.6 convention).
+    import gross_code_lpu_tdg as tdg
+    em = ErrorModel(p_phys=cfg.p_ref, p_meas=cfg.p_ref * cfg.p_meas_factor)
+    shift = cfg.lpu_shift if cfg.lpu_shift is not None else "y"
+    return tdg.build_automorphism_circuit(
+        em, shift=shift, C=cfg.lpu_C, d_init=cfg.lpu_d_init,
+        idle_noise=cfg.lpu_idle_noise)
 
 
 CIRCUIT_BUILDERS = {
     "memory":       _build_memory_circuit,
     "lpu_x1":       lambda cfg: _build_lpu_circuit(cfg, "X1"),
     "lpu_z1":       lambda cfg: _build_lpu_circuit(cfg, "Z1"),
-    "automorphism": _circuit_stub("automorphism"),
-    "joint_pauli":  _circuit_stub("joint_pauli"),
+    "lpu_idle":     _build_lpu_idle_circuit,
+    "automorphism": _build_automorphism_circuit,
+    "joint_pauli":  _build_joint_pauli_circuit,
 }
 
 
@@ -139,6 +161,10 @@ class Config:
     rounds: Optional[int] = None          # default: code distance
     lpu_C: int = 10                       # LPU repeated-measurement rounds (lpu_* experiments)
     lpu_d_init: int = 12
+    lpu_operators: str = "Y1"             # joint_pauli experiment: which joint Pauli to measure
+    lpu_idle_noise: bool = False          # paper-faithful idle DEPOLARIZE1 in tdg builders
+    lpu_include_memory_obs: bool = True   # joint_pauli: outcome + 11 commuting Z̄ memory obs
+    lpu_shift: Optional[str] = None       # automorphism experiment: 'x' or 'y' (None = builder default 'y')
     # Five-channel budget campaigns: isolate ONE channel (noise_channel) or drop one channel,
     # keeping the rest (ablate_channel = leave-one-out marginal). Mutually exclusive; applied to
     # the built circuit AFTER the experiment builder — the full-noise path (both None) returns the
@@ -306,7 +332,7 @@ def _atomic_write_json(path: pathlib.Path, obj: dict, *, retries: int = 8) -> No
     """Write JSON to a temp file then rename (atomic). Retries the rename on Windows
     PermissionError (AV/indexer holding the dest), so a transient lock can't kill a long run."""
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w") as fh:
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(obj, fh, indent=2)
         fh.flush()
         os.fsync(fh.fileno())
@@ -323,7 +349,7 @@ def _atomic_write_json(path: pathlib.Path, obj: dict, *, retries: int = 8) -> No
 def _load_json(path: pathlib.Path) -> Optional[dict]:
     if not path.exists():
         return None
-    with open(path) as fh:
+    with open(path, encoding="utf-8") as fh:
         return json.load(fh)
 
 
@@ -763,7 +789,7 @@ def config_to_dict(cfg: Config) -> dict:
 def load_config(path: pathlib.Path) -> Config:
     """Build a Config from a YAML file: keys must match Config dataclass fields."""
     import yaml
-    with open(path) as fh:
+    with open(path, encoding="utf-8") as fh:
         data = yaml.safe_load(fh) or {}
     # YAML-friendly convenience: weights_range: [lo, hi] -> weights = range(lo, hi+1) (explicit).
     wr = data.pop("weights_range", None)

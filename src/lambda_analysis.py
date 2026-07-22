@@ -127,11 +127,14 @@ def eps_stats(spec: FailureSpectrum, p: float, rounds: float) -> tuple:
 def cycles_of(config: dict) -> int:
     """THE per-op ε convention: cycles that normalize ε for a run's experiment kind.
 
-    memory → QEC rounds; lpu_* (and future LPU operations) → the repeated-measurement rounds
-    ``lpu_C``. Keep every ladder/budget script on this one function so conventions can't fork.
+    memory / lpu_idle → QEC rounds; lpu_* measurement ops, automorphism, joint_pauli → the
+    repeated-measurement rounds ``lpu_C``. Keep every ladder/budget script on this one function
+    so conventions can't fork.
     """
-    if str(config.get("experiment", "memory")).startswith("lpu") or \
-       str(config.get("experiment", "")) in ("automorphism", "joint_pauli"):
+    exp = str(config.get("experiment", "memory"))
+    if exp == "lpu_idle":
+        return int(config["rounds"] if config.get("rounds") is not None else 12)
+    if exp.startswith("lpu") or exp in ("automorphism", "joint_pauli"):
         return int(config["lpu_C"])
     return int(config["rounds"])
 
