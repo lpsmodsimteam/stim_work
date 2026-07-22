@@ -172,3 +172,26 @@ def test_bb_72_4_8_registry_params():
     assert n == 72
     assert not (HX @ HZ.T % 2).any()                      # CSS commutation
     assert n - _gf2_rank(HX) - _gf2_rank(HZ) == 4         # k = 4
+
+
+def test_symmetry_prune_matches_full_sweep():
+    """Symmetry-pruned systematic L(D) sweep (one functional per translation orbit) must
+    reproduce the full 2^K-1 sweep's L(D) EXACTLY on a toric BB code. Guards the ~orbit-size
+    speedup used by run_technique_ii (mw_symmetry_prune)."""
+    from bb_code_sim import BBCodeParams, BBCodeSimulator
+    from min_weight import build_circuit_translation_perms, symmetry_orbit_representatives
+
+    P = BBCodeParams(l=3, m=3, a_exps=[(1, 0), (0, 0), (0, 2)],
+                     b_exps=[(0, 1), (0, 0), (2, 0)], distance=4)
+    circ = BBCodeSimulator(P).build_circuit(ErrorModel.symmetric(0.005), rounds=2)
+    H, A, mult, priors = dem_check_action_matrices(circ, sector=None)
+    perms = build_circuit_translation_perms(circ, H, l=3, m=3, verbose=False)
+    D = compute_distance(circ, priors=priors, sector=None).distance
+
+    reps = symmetry_orbit_representatives(H, A, perms)
+    assert 0 < len(reps) < (1 << A.shape[0]) - 1, "orbit reps should be a strict subset of all classes"
+
+    kw = dict(D=D, max_trials=0, priors=priors, sector=None, symmetry_perms=perms, workers=1)
+    L_full = find_min_weight_logicals(circ, **kw)
+    L_prun = find_min_weight_logicals(circ, systematic_masks=reps, **kw)
+    assert L_prun == L_full and len(L_full) > 0, "pruned systematic sweep != full sweep L(D)"

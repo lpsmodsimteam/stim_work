@@ -211,6 +211,7 @@ class Config:
     mw_workers: int = 1
     mw_systematic: bool = True
     mw_use_symmetry: bool = True
+    mw_symmetry_prune: bool = True        # decode 1 functional/orbit (needs mw_use_symmetry); exact
     mw_single_sector: bool = True
     mw_sector_type: int = 0
     mw_f0_override: Optional[float] = None   # bb6 exact pin lives in the bb6 YAML, not the default
@@ -495,7 +496,7 @@ def run_technique_ii(cfg: Config, outdir: pathlib.Path) -> dict:
     """Circuit fault distance D, onset w0=ceil(D/2), and exact onset fraction f0 (even D)."""
     from min_weight import (dem_check_action_matrices, single_sector_dem, compute_distance,
                             find_min_weight_logicals, min_weight_fail_count, expanded_logical_count,
-                            build_circuit_translation_perms)
+                            build_circuit_translation_perms, symmetry_orbit_representatives)
 
     # Exact onset pin (e.g. bb6 reference enumeration): skip the BP-OSD search.
     if cfg.mw_f0_override is not None:
@@ -552,11 +553,28 @@ def run_technique_ii(cfg: Config, outdir: pathlib.Path) -> dict:
             print(f"  [II.2] WARNING: toric sym build failed ({exc}); no symmetry", flush=True)
             sym_perms = None
 
+    # Symmetry-prune the systematic sweep: decode one functional per translation orbit instead
+    # of all 2^K-1. Proven to reproduce the full sweep's L(D) exactly (translation preserves
+    # weight; orbit-expansion fills the rest). One-time GF(2) preimage solve up front.
+    sys_masks = None
+    if sym_perms is not None and cfg.mw_symmetry_prune and cfg.mw_systematic and K_obs <= 20:
+        try:
+            t_orb = time.perf_counter()
+            sys_masks = symmetry_orbit_representatives(H, A, sym_perms)
+            print(f"  [II.2] symmetry-pruned systematic: {n_sys} -> {len(sys_masks)} orbit reps "
+                  f"({n_sys/max(len(sys_masks),1):.1f}x fewer decodes, {time.perf_counter()-t_orb:.0f}s)",
+                  flush=True)
+            n_sys = len(sys_masks)
+        except (ValueError, AssertionError) as exc:
+            print(f"  [II.2] WARNING: orbit-rep prune failed ({exc}); full systematic sweep", flush=True)
+            sys_masks = None
+
     print(f"  [II.2] L(D) search: {n_sys} systematic + up to {cfg.mw_max_trials} random ...", flush=True)
     logicals, search_trace = find_min_weight_logicals(
         circuit, D, max_trials=cfg.mw_max_trials, osd_order=cfg.mw_osd_order, max_iter=cfg.mw_max_iter,
         priors=priors, seed=cfg.seed, progress_every=max(max(n_sys, cfg.mw_max_trials) // 40, 1),
-        workers=cfg.mw_workers, systematic=cfg.mw_systematic, symmetry_perms=sym_perms, sector=sector,
+        workers=cfg.mw_workers, systematic=cfg.mw_systematic, systematic_masks=sys_masks,
+        symmetry_perms=sym_perms, sector=sector,
         decimate=cfg.mw_decimate, decimate_max_odd=cfg.mw_decimate_max_odd, return_trace=True)
     ld_comp = len(logicals)
     _atomic_write_json(outdir / "search_convergence.json", {

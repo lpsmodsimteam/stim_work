@@ -818,6 +818,115 @@ def compute_distance(
     return DistanceResult(distance=D, onset=onset, per_logical_weight=weights, witnesses=witnesses)
 
 
+def _gf2_inv_small(M: np.ndarray) -> Optional[np.ndarray]:
+    """Inverse of a small (K x K) F2 matrix, or None if singular."""
+    K = M.shape[0]
+    aug = np.concatenate([M.astype(np.uint8) & 1, np.eye(K, dtype=np.uint8)], axis=1)
+    r = 0
+    for c in range(K):
+        piv = next((i for i in range(r, K) if aug[i, c]), None)
+        if piv is None:
+            return None
+        aug[[r, piv]] = aug[[piv, r]]
+        for i in range(K):
+            if i != r and aug[i, c]:
+                aug[i] ^= aug[r]
+        r += 1
+    return aug[:, K:]
+
+
+def _solve_action_preimages(H: np.ndarray, A: np.ndarray) -> List[np.ndarray]:
+    """K logical supports chi_i with H@chi_i=0 and A@chi_i=e_i (any weight), via GF(2) RREF on
+    [H;A]@chi = [0;e_i], all K RHS carried through one reduction (rows as Python big-ints)."""
+    M, N = H.shape
+    K = A.shape[0]
+    stack = np.vstack([H, A]).astype(np.uint8) & 1
+    R = M + K
+
+    def row_int(bits):
+        return int.from_bytes(np.packbits(bits, bitorder="little").tobytes(), "little")
+
+    rows = [[row_int(stack[r]), (0 if r < M else 1 << (r - M))] for r in range(R)]
+    pivot_col_of_row = [-1] * R
+    r = 0
+    for c in range(N):                       # full RREF: pivot per column, eliminate from all rows
+        piv = next((i for i in range(r, R) if (rows[i][0] >> c) & 1), None)
+        if piv is None:
+            continue
+        rows[r], rows[piv] = rows[piv], rows[r]
+        for i in range(R):
+            if i != r and ((rows[i][0] >> c) & 1):
+                rows[i][0] ^= rows[r][0]
+                rows[i][1] ^= rows[r][1]
+        pivot_col_of_row[r] = c
+        r += 1
+        if r == R:
+            break
+    chis = []
+    for i in range(K):
+        chi = np.zeros(N, dtype=np.uint8)
+        for rr in range(r):
+            pc = pivot_col_of_row[rr]
+            if pc >= 0 and ((rows[rr][1] >> i) & 1):
+                chi[pc] = 1
+        Achi = (A @ chi) % 2
+        assert not (H @ chi % 2).any() and Achi[i] == 1 and Achi.sum() == 1, \
+            "action preimage solve produced wrong logical"
+        chis.append(np.flatnonzero(chi))
+    return chis
+
+
+def symmetry_orbit_representatives(H: np.ndarray, A: np.ndarray,
+                                   symmetry_perms: List[np.ndarray]) -> List[int]:
+    """Orbit-representative masks for the systematic L(D) sweep under toric symmetry.
+
+    The systematic sweep forces functional f (=mask): <f, A@corr>=1. A mechanism-perm sp
+    (translation) sends a logical chi to a logical with action A[:,sp]@chi, so the action
+    space carries a rep T_sp (built from preimages of the e_i), and the FUNCTIONALS transform
+    by the contragredient T_sp^{-T}. Forcing f and forcing (T_sp^{-T} f) yield translate-
+    related min-weight logicals (translation preserves weight), so decoding ONE functional
+    per orbit of {T_sp^{-T}} and symmetry-expanding reproduces the full sweep's L(D) exactly
+    (validated: [[18,4,4]] pruned==full; idle 4095->155 masks). Returns one mask per orbit.
+    """
+    K = A.shape[0]
+    chis = _solve_action_preimages(H, A)
+    duals = []
+    for sp in symmetry_perms:
+        T = np.zeros((K, K), dtype=np.uint8)
+        for i in range(K):
+            col = np.zeros(K, dtype=np.uint8)
+            for mprime in sp[chis[i]]:
+                col ^= A[:, mprime]
+            T[:, i] = col % 2
+        Tinv = _gf2_inv_small(T)
+        if Tinv is None:
+            raise ValueError("symmetry action rep T_sp is singular — perms are not valid automorphisms")
+        duals.append((Tinv.T) % 2)
+
+    def to_vec(mask):
+        return np.array([(mask >> i) & 1 for i in range(K)], dtype=np.uint8)
+    def to_mask(v):
+        return int(sum(int(v[i]) << i for i in range(K)))
+
+    seen = np.zeros(1 << K, dtype=bool)
+    reps: List[int] = []
+    for mask in range(1, 1 << K):
+        if seen[mask]:
+            continue
+        reps.append(mask)
+        orbit, frontier = {mask}, [mask]
+        while frontier:
+            v = to_vec(frontier.pop())
+            for Dm in duals:
+                nm = to_mask((Dm @ v) % 2)
+                if nm not in orbit:
+                    orbit.add(nm); frontier.append(nm)
+        for mm in orbit:
+            seen[mm] = True
+    assert not seen[0] and seen[1:].all(), "orbit reps do not cover F_2^K\\{0} — invalid symmetry"
+    return reps
+
+
 def find_min_weight_logicals(
     circuit: Optional[stim.Circuit] = None,
     D: Optional[int] = None,
@@ -831,6 +940,7 @@ def find_min_weight_logicals(
     progress_every: int = 0,
     workers: int = 1,
     systematic: bool = True,
+    systematic_masks: Optional[List[int]] = None,
     symmetry_perms: Optional[List[np.ndarray]] = None,
     sector: Optional[int] = None,
     matrices: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
@@ -886,7 +996,15 @@ def find_min_weight_logicals(
                              priors=priors, workers=workers, sector=sector,
                              matrices=matrices).distance
 
-    n_systematic = (1 << K) - 1 if (systematic and K <= 20) else 0
+    # Which syndrome classes (masks) the systematic phase decodes. Default: all 2^K-1 nonzero
+    # functionals. With symmetry_perms, the caller may pass `systematic_masks` = one representative
+    # per translation orbit (see symmetry_orbit_representatives) — decoding those + symmetry-
+    # expansion reproduces the full sweep's L(D) at ~(orbit-size)x fewer decodes.
+    if systematic and K <= 20:
+        sys_masks = list(systematic_masks) if systematic_masks is not None else list(range(1, 1 << K))
+    else:
+        sys_masks = []
+    n_systematic = len(sys_masks)
 
     def _expand_by_sym(support: FrozenSet[int], found_set: Set[FrozenSet[int]]) -> None:
         """Add all symmetry images of support to found_set (in-place)."""
@@ -911,7 +1029,7 @@ def find_min_weight_logicals(
                     print(f"      L(D) search [systematic x{nproc}]: "
                           f"{n_systematic} syndrome classes ...", flush=True)
                 for n, res in enumerate(
-                    pool.imap_unordered(_mw_systematic_task, range(1, n_systematic + 1), chunksize=16), 1
+                    pool.imap_unordered(_mw_systematic_task, sys_masks, chunksize=16), 1
                 ):
                     if res is not None and res[0] == D:
                         support = frozenset(res[1])
@@ -957,7 +1075,7 @@ def find_min_weight_logicals(
     if n_systematic > 0:
         if progress_every:
             print(f"      L(D) search [systematic]: {n_systematic} syndrome classes ...", flush=True)
-        for n, mask in enumerate(range(1, n_systematic + 1), 1):
+        for n, mask in enumerate(sys_masks, 1):
             coeffs = np.array([(mask >> i) & 1 for i in range(K)], dtype=np.uint8)
             g = (coeffs @ A) % 2
             dec = _bposd(np.vstack([H, g[None, :]]), priors, osd_order, max_iter)
