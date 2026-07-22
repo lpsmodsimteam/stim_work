@@ -139,12 +139,15 @@ D=10, |L(D)| feeds the exact Prop.1 onset f0, and without orbit expansion |L(D)|
 f0) is 72x-loose. The Y1/automorphism circuits genuinely lack it (LPU checks / shift), keep
 false. GOTCHA: experiment_runner does NOT persist the found L(D) supports (only counts in
 distance.json), so a symmetry-off run's loose |L(D)|/f0 is UNRECOVERABLE — must re-run
-Tech II, can't post-expand. LATENT OPTIMIZATION (unimplemented, high value for
-gross/two-gross Tech II costing): find_min_weight_logicals only orbit-expands FOUND
-logicals; it still decodes all 2^K-1 systematic classes. With toric symmetry you need only
-ONE representative per orbit => ~(2^K-1)/72 ≈ 57 decodes instead of 4095, a ~72x cut to the
-Technique-II search cost. Would make the ~350 core-h/pass two-gross search (see
-bb144-exact-mitm-effort costing) dramatically cheaper.
+Tech II, can't post-expand. SYMMETRY-PRUNE (IMPLEMENTED 2026-07-22, commit 5cebce12): find_min_weight_logicals now takes
+`systematic_masks`; run_technique_ii computes one functional per translation orbit via
+`symmetry_orbit_representatives` (mw_symmetry_prune, default True) instead of all 2^K-1. Proven
+exact (translation preserves weight; functionals transform by the contragredient T_sp^{-T};
+test_symmetry_prune_matches_full_sweep asserts pruned==full L(D) on [[18,4,4]]). Gross idle:
+4095 -> 155 reps = 26.4x fewer decodes (orbits avg ~26, NOT the naive 72 — sizes 3..36). One-
+time GF(2) preimage solve up front (~4 min big-int on idle; O(N^2) — optimize for two-gross).
+Biggest win where a decode is expensive: two-gross (same K=12, ~15s/decode) systematic phase
+shrinks ~26x. Random-trial phase unchanged.
 
 ## Wave 6 — double-gross LPU                    open-ended
 Blocked on derive_lpu_layout at (12,12). First job = sizing probe, then mirror W1b→W3.
