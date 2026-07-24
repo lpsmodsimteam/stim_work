@@ -63,7 +63,7 @@ COPY src/ ./src/
 COPY experiments/ ./experiments/
 COPY tests/ ./tests/
 COPY test.py ./
-COPY container/requirements.txt ./container/requirements.txt
+COPY container/ ./container/
 RUN pip install --no-cache-dir -e . \
     && python -c "import experiment_runner, relay_bp, stim, ldpc, pymatching, yaml, scipy, matplotlib; print('imports OK')"
 

@@ -61,6 +61,46 @@ runner in `podman run`. It resolves the array-index → config from `experiments
 *inside* the container, so the host needs no python/pyyaml. Point your `submit.sh` at it (or
 `sbatch --array=<i> container/run.podman.sbatch`). Override the image with `QEC_IMAGE=...`.
 
+## Multi-node test scripts
+
+Both are SLURM array jobs — each array index is one podman container on one node, so a wide
+`--array` fans the work across the cluster. Run from the repo root after building the image.
+
+### `smoke.sbatch` — is the container working across nodes?
+
+Each task runs the preflight (`test.py --no-slurm`: imports + editable install + a real
+stim/relay_bp decode round-trip) then builds `[[18,4,4]]` and MC-decodes 2000 idle-memory shots
+(`smoke_decode.py`), printing one `SMOKE PASS host=<node> …` line. N green lines = N working nodes.
+
+```bash
+mkdir -p runs/slurm
+sbatch --array=0-3 container/smoke.sbatch          # 4 nodes; bump --array for more
+grep SMOKE runs/slurm/qec-smoke_*.out              # expect one PASS per array index
+```
+
+### `benchmark.sbatch` — reproduce all error models + measure the multi-node speedup
+
+Reproduces the full `[[18,4,4]]` + `[[72,4,8]]` error-model campaign
+(`experiments/methods/run_error_model_comparison.py`), partitioned into **19 self-contained
+`--only` groups** (validated to cover all ~78 tasks exactly once). The 16 expensive `[[72,4,8]]`
+spectra are isolated one-per-node, so the wall clock drops from the ~3 h single-process run toward
+the slowest single 72-code spectrum. All tasks share the `runs/` cache (must be on shared storage).
+
+```bash
+mkdir -p runs/slurm
+sbatch --array=0-18 container/benchmark.sbatch          # full run, 5x-boosted 72-code shots
+sbatch --array=0-18%6 container/benchmark.sbatch        # cap to 6 nodes at a time (same work)
+QEC_BOOST=0 sbatch --array=0-18 container/benchmark.sbatch   # quick: 1x shots (no --boost72)
+QEC_FORCE=1 sbatch --array=0-18 container/benchmark.sbatch   # re-time from scratch (ignore cache)
+
+grep -h "ran," runs/slurm/qec-bench_*.out              # per-node task counts + wall time
+# benchmark wall clock = the slowest task's time; compare to the ~3 h sequential baseline.
+```
+
+When it finishes, everything sits cached under `runs/error_model_comparison_18_4_4/`; re-execute
+`notebooks/methods/error_model_comparison_18_4_4.ipynb` to view the reproduced models. Note the
+cache makes a second submit instant — use `QEC_FORCE=1` (or clear the cache dir) to re-benchmark.
+
 ## Notes / gotchas
 
 - **`:Z`** on the bind mounts relabels for SELinux hosts. If your cluster isn't SELinux and
