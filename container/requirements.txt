@@ -1,0 +1,23 @@
+# Python dependencies for the fail-fast QEC container (headless cluster runs).
+# Mirrors the repo's requirements.txt minus the notebook tooling (jupyter/ipykernel), which the
+# cluster doesn't need. relay_bp has no PyPI release and is compiled from source (Rust) by the
+# Containerfile's builder stage — pin it to the exact commit the code was developed against.
+
+numpy>=2.0
+scipy>=1.10
+stim>=1.14
+pyyaml>=6.0
+matplotlib>=3.7
+tqdm>=4.0
+
+# Decoders: BP-OSD (ldpc; Technique-II min-weight search + the `bposd` decoder) and MWPM
+# (pymatching; the surface-code decoder, imported unconditionally by surface_code_sim).
+ldpc>=2.0
+pymatching>=2.2
+
+# Preflight + test suite (python test.py --no-slurm; pytest tests/). Optional but small.
+pytest>=8.0
+
+# Rust-native Relay-BP — the default `relay` decoder for BB/gross codes. Needs the Rust toolchain
+# in the builder stage. Pinned to the exact commit (no PyPI release).
+relay_bp[stim] @ git+https://github.com/trmue/relay.git@6cab93095187012138a35c656fec71c5aad38eae

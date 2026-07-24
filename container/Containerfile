@@ -1,0 +1,71 @@
+# Podman/OCI image for the fail-fast QEC framework (headless cluster runs).
+#
+# Build from the REPO ROOT (the build context must see src/ and experiments/):
+#     podman build -f container/Containerfile -t stim-work-qec:latest .
+#
+# The only slow/interesting step is building relay_bp: it is a Rust extension with no PyPI
+# release, so the builder stage carries a Rust toolchain. The runtime stage copies just the
+# finished virtualenv + the code — no Rust, no compilers — keeping the shipped image lean.
+#
+# Run (bind-mount experiments/ so edited shot counts take effect, and runs/ so output persists):
+#     podman run --rm --cpus 16 \
+#         -v "$PWD/experiments:/opt/stim_work/experiments:Z" \
+#         -v "$PWD/runs:/opt/stim_work/runs:Z" \
+#         stim-work-qec:latest \
+#         python -m experiment_runner --config experiments/configs/gross_lpu_idle.yaml --cpus 16
+
+# ---------------------------------------------------------------------------
+# Stage 1 — builder: compile relay_bp (Rust) and resolve every Python dep into a venv.
+# ---------------------------------------------------------------------------
+FROM python:3.11-slim-bookworm AS builder
+
+# Native-wheel toolchain + git/curl for the relay_bp source and rustup.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential git curl ca-certificates pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust (stable) — relay_bp is built via its PEP-517 backend (maturin), which needs cargo on PATH.
+ENV RUSTUP_HOME=/opt/rust CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain stable
+
+# Self-contained venv so it copies cleanly into the runtime stage.
+RUN python -m venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH
+RUN pip install --no-cache-dir --upgrade pip wheel
+
+# Install deps. This is the expensive layer (builds relay_bp from source); it is cached and only
+# re-runs when container/requirements.txt changes — so code edits below don't trigger a rebuild.
+COPY container/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# ---------------------------------------------------------------------------
+# Stage 2 — runtime: python + the built venv + the repo. No build tools.
+# ---------------------------------------------------------------------------
+FROM python:3.11-slim-bookworm AS runtime
+
+# git only for `git rev-parse` provenance from inside the container (drop if you don't want it).
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH=/opt/venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    MPLBACKEND=Agg
+
+# Bake the code in (explicit COPYs — NOT `COPY .`, so runs/, .git and notebooks stay out of the
+# image). `pip install -e .` puts the src/ modules on the path. At run time you normally bind-mount
+# the host experiments/ (for current configs) and runs/ (for output) over these baked copies.
+WORKDIR /opt/stim_work
+COPY pyproject.toml ./
+COPY src/ ./src/
+COPY experiments/ ./experiments/
+COPY tests/ ./tests/
+COPY test.py ./
+COPY container/requirements.txt ./container/requirements.txt
+RUN pip install --no-cache-dir -e . \
+    && python -c "import experiment_runner, relay_bp, stim, ldpc, pymatching, yaml, scipy, matplotlib; print('imports OK')"
+
+# Default shows the runner help; the cluster job overrides this with the real invocation.
+CMD ["python", "-m", "experiment_runner", "--help"]

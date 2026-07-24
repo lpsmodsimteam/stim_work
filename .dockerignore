@@ -1,0 +1,20 @@
+# Keep the container build context lean (podman reads this as .containerignore too). The
+# Containerfile COPYs only src/, experiments/, tests/, pyproject.toml, test.py, and
+# container/requirements.txt — everything else is excluded from the context sent to the daemon.
+.git
+.github
+runs
+**/__pycache__
+*.pyc
+.pytest_cache
+.ipynb_checkpoints
+notebooks
+docs
+*.pdf
+*.ipynb
+.venv
+venv
+env
+.claude
+.vscode
+.conda
