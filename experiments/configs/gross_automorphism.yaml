@@ -37,3 +37,7 @@ adaptive: true
 adaptive_failures: 20
 adaptive_shots_min: 4
 adaptive_shots_max: 3000
+
+# Stop the descending sweep after 3 consecutive full-budget zero-failure bins — the
+# deep tail contributes ~0 to the spectrum (carried by the f5 fit + Technique-II onset).
+adaptive_stop_zero_bins: 3

@@ -192,6 +192,9 @@ class Config:
     adaptive_shots_min: int = 4
     adaptive_shots_max: int = 20000
     adaptive_predict_window: int = 3
+    adaptive_stop_zero_bins: Optional[int] = None  # stop descending after N consecutive 0-failure
+                                                   # bins at the full shots_max (the deep tail
+                                                   # contributes ~0; the fit/Tech-II carry it).
     weight_stride: int = 1
     seed: int = 42
 
@@ -664,6 +667,7 @@ def run_is_sweep(cfg: Config, outdir: pathlib.Path, weights_plan: List[int]) -> 
 
     order = sorted(remaining, reverse=True) if cfg.adaptive else remaining
     t0 = time.perf_counter()
+    zero_run = 0
     for i, w in enumerate(order):
         rng = np.random.default_rng([cfg.seed, w])
         if cfg.adaptive:
@@ -684,6 +688,18 @@ def run_is_sweep(cfg: Config, outdir: pathlib.Path, weights_plan: List[int]) -> 
         print(f"[is] w={w:>4}: F/T={F:>4}/{T_w} = {F/T_w:.3f}"
               + (f"  (f_pred={f_pred:.2g})" if cfg.adaptive else "")
               + f"   ({len(failures_by_weight)}/{len(weights_plan)}, {elapsed:.0f}s, ETA {eta:.0f}s)", flush=True)
+
+        # Descending zero-bin early stop (adaptive only): once the sweep has passed below the
+        # samplable region, every lower weight is a full-budget zero bin that contributes ~0 to
+        # the reweighted spectrum (the f5 fit + Technique-II onset carry the deep tail). Skipping
+        # them is exactly importance_sample_adaptive's stop_after_zero_bins.
+        if cfg.adaptive and cfg.adaptive_stop_zero_bins:
+            zero_run = zero_run + 1 if (F == 0 and T_w >= cfg.adaptive_shots_max) else 0
+            if zero_run >= cfg.adaptive_stop_zero_bins:
+                print(f"[is] stop: {zero_run} consecutive zero-failure bins at shots_max="
+                      f"{cfg.adaptive_shots_max}; skipping {len(order) - i - 1} lower weights "
+                      f"(they contribute ~0 to the spectrum)", flush=True)
+                break
 
     if remaining:
         save()
